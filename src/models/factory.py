@@ -261,14 +261,25 @@ class ModelFactory:
         return ARCH_FSDP_LAYER_MAP.get(model_type, "LlamaDecoderLayer")
 
     @staticmethod
-    def estimate_model_size(arch: ModelArchitectureConfig) -> Dict[str, Any]:
+    def estimate_model_size(
+        arch: ModelArchitectureConfig,
+        tokenizer_or_vocab: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        vocab_size = arch.vocab_size
+        if tokenizer_or_vocab is not None:
+            if isinstance(tokenizer_or_vocab, PreTrainedTokenizerBase):
+                vocab_size = len(tokenizer_or_vocab)
+            elif isinstance(tokenizer_or_vocab, int):
+                vocab_size = tokenizer_or_vocab
+            elif isinstance(tokenizer_or_vocab, dict) and "vocab_size" in tokenizer_or_vocab:
+                vocab_size = int(tokenizer_or_vocab["vocab_size"])
+
         if arch.model_type == "nslt":
             nslt = arch.nslt
             d_model = arch.hidden_size
             d_state = nslt.d_state
             d_hidden = nslt.d_hidden
             n_ssm = nslt.n_ssm_layers
-            vocab_size = arch.vocab_size
 
             # Embedding
             embed = vocab_size * d_model
@@ -299,7 +310,6 @@ class ModelFactory:
                 "architecture": "nslt",
             }
 
-        vocab_size = arch.vocab_size
         hidden = arch.hidden_size
         layers = arch.num_hidden_layers
         heads = arch.num_attention_heads
