@@ -245,22 +245,14 @@ class TrainingPipeline:
         max_steps = overrides.get("max_steps", stage_cfg.max_steps)
         warmup = overrides.get("warmup_steps", getattr(stage_cfg, "warmup_steps", 200))
         weight_decay = overrides.get("weight_decay", getattr(stage_cfg, "weight_decay", 0.05))
-        optim = overrides.get("optimizer", getattr(stage_cfg, "optimizer", "adamw_fused"))
-
-        optim_map = {
-            "adamw": "adamw_torch",
-            "adamw_8bit": "paged_adamw_8bit" if torch.cuda.is_available() else "adamw_torch",
-            "adamw_fused": "adamw_torch_fused" if hasattr(torch.optim, "AdamW") else "adamw_torch",
-            "sgd": "sgd",
-        }
-        optim_name = optim_map.get(optim, "adamw_torch")
-
-        is_iterable = isinstance(dataset, IterableDataset)
-        num_workers = 0 if is_iterable else min(4, os.cpu_count() or 4)
 
         base_args = self.dist.get_training_args(str(output_dir))
         use_bf16 = base_args.get("bf16", False)
         use_fp16 = base_args.get("fp16", False)
+        optim_name = self._resolve_optimizer_name(stage_cfg, base_args, overrides)
+
+        is_iterable = isinstance(dataset, IterableDataset)
+        num_workers = 0 if is_iterable else min(4, os.cpu_count() or 4)
 
         # Update FSDP transformer layer for MoE models
         model_type = self.cfg.model.architecture.model_type
@@ -311,6 +303,24 @@ class TrainingPipeline:
             callbacks=callbacks,
             tokenizer=self.tokenizer,
         )
+
+    def _resolve_optimizer_name(
+        self,
+        stage_cfg: Any,
+        base_args: Dict[str, Any],
+        overrides: Dict[str, Any],
+    ) -> str:
+        optim = overrides.get("optimizer", getattr(stage_cfg, "optimizer", "adamw_fused"))
+        if optim == "adamw_fused":
+            if not torch.cuda.is_available() or base_args.get("fsdp") or base_args.get("deepspeed"):
+                return "adamw_torch"
+        optim_map = {
+            "adamw": "adamw_torch",
+            "adamw_8bit": "paged_adamw_8bit" if torch.cuda.is_available() else "adamw_torch",
+            "adamw_fused": "adamw_torch_fused" if hasattr(torch.optim, "AdamW") else "adamw_torch",
+            "sgd": "sgd",
+        }
+        return optim_map.get(optim, "adamw_torch")
 
     def staged_training(
         self,
