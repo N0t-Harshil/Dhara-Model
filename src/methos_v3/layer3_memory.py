@@ -165,7 +165,7 @@ class EpisodicMemory(nn.Module):
         count = min(int(self.episode_count.item()), self.max_episodes)
         if count == 0:
             return torch.zeros_like(query)
-        mem = self.episode_buffer[:, :count, :]
+        mem = self.episode_buffer[:, :count, :].clone()
         q = self.query_proj(query)
         k = self.key_proj(mem)
         v = self.value_proj(mem)
@@ -218,7 +218,9 @@ class MemoryManager(nn.Module):
         ep_out = self.episodic.retrieve(lc_out)
 
         importance = torch.sigmoid(self.importance(lc_out.mean(dim=1)))
-        decayed = self.forget_gate(self.episodic.episode_buffer, self.mem_age)
+        ep_buf = self.episodic.episode_buffer.clone()
+        m_age = self.mem_age.clone()
+        decayed = self.forget_gate(ep_buf, m_age)
         _, _, compression_loss = self.compressor(lc_out.mean(dim=1))
         priority = self.priority_scorer(decayed)
         retrieved = self.retriever(lc_out.mean(dim=1, keepdim=True), decayed, priority)
