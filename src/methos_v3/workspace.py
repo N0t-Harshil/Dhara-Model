@@ -35,6 +35,7 @@ class CognitiveWorkspace(nn.Module):
     def _get_device(self) -> torch.device:
         return self.goal_proj.weight.device
 
+    @torch.compiler.disable
     def reset(self, batch: int) -> None:
         self._cached_state = None
         self._store.clear()
