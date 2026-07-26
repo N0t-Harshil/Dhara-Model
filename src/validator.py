@@ -13,7 +13,6 @@ import logging
 import subprocess
 import sys
 import tempfile
-import textwrap
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -181,9 +180,16 @@ class CodeValidator:
             )
 
     def _execute_python(self, code: str, timeout: int) -> ValidationResult:
+        tmp_path: Optional[str] = None
         try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".py", delete=False, encoding="utf-8"
+            ) as tmp:
+                tmp.write(code)
+                tmp_path = tmp.name
+
             result = subprocess.run(
-                [sys.executable, "-c", code],
+                [sys.executable, tmp_path],
                 capture_output=True, text=True, timeout=timeout,
             )
             return ValidationResult(
@@ -199,6 +205,12 @@ class CodeValidator:
                 language="python",
                 error=f"Execution timed out after {timeout}s.",
             )
+        finally:
+            if tmp_path:
+                try:
+                    Path(tmp_path).unlink(missing_ok=True)
+                except OSError as e:
+                    logger.warning(f"Failed to delete temp file {tmp_path}: {e}")
 
     def _execute_javascript(self, code: str, timeout: int) -> ValidationResult:
         tmp_path: Optional[str] = None

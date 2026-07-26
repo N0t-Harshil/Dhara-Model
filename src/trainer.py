@@ -21,9 +21,11 @@ class _LoggingCallback(TrainerCallback):
     def on_log(self, args, state, control, logs=None, **kwargs):
         if state.is_world_process_zero and logs:
             step = state.global_step
-            loss = logs.get("loss", logs.get("train_loss", "N/A"))
-            lr = logs.get("learning_rate", "N/A")
-            logger.info("Step %d | loss=%.4f | lr=%.2e", step, float(loss) if loss != "N/A" else 0, float(lr) if lr != "N/A" else 0)
+            loss = logs.get("loss", logs.get("train_loss"))
+            lr = logs.get("learning_rate")
+            if loss is None:
+                return
+            logger.info("Step %d | loss=%.4f | lr=%.2e", step, float(loss), float(lr) if lr is not None else 0)
 
 
 class ModelTrainer:
@@ -53,6 +55,12 @@ class ModelTrainer:
             with open(path, "r", encoding="utf-8") as f:
                 raw = yaml.safe_load(f)
             return Config.model_validate(raw)
+
+    @property
+    def _unwrap_model(self):
+        if hasattr(self.model, "model") and isinstance(self.model.model, torch.nn.Module):
+            return self.model.model
+        return self.model
 
     @property
     def data_pipeline(self) -> DataPipeline:
@@ -89,10 +97,16 @@ class ModelTrainer:
             return rows
         output_count = len(examples.get("output", []))
         for i in range(output_count):
-            language = str(examples.get("language", ["python"] * output_count)[i] or "python")
-            problem = str(examples.get("instruction", [""] * output_count)[i] or "")
-            input_text = str(examples.get("input", [""] * output_count)[i] or "")
+            languages = examples.get("language")
+            language = str(languages[i] if languages and i < len(languages) else "python")
+            instructions = examples.get("instruction")
+            problem = str(instructions[i] if instructions and i < len(instructions) else "")
+            inputs = examples.get("input")
+            input_text = str(inputs[i] if inputs and i < len(inputs) else "")
             solution = str(examples["output"][i] or "")
+            if not solution:
+                logger.warning("Skipping example %d: empty output/solution", i)
+                continue
             if input_text:
                 problem = f"{problem}\n{input_text}"
             rows.append((self._format_prompt(language, problem), solution))
@@ -129,7 +143,10 @@ class ModelTrainer:
 
     def _preprocess_function(self, examples: Dict[str, List[Any]]) -> Dict[str, Any]:
         pairs = self._examples_to_prompt_response(examples)
-        return self._tokenize_supervised_batch(pairs) if pairs else {"input_ids": [], "attention_mask": [], "labels": []}
+        if not pairs:
+            logger.warning("No standard examples found in batch; returning empty tokenization.")
+            return {"input_ids": [], "attention_mask": [], "labels": []}
+        return self._tokenize_supervised_batch(pairs)
 
     def train(
         self,
@@ -143,8 +160,9 @@ class ModelTrainer:
         resume_from_checkpoint: Optional[bool | str] = None,
         _prebuilt_dataset: Optional[Any] = None,
     ) -> Dict[str, float]:
-        if not self.model.is_ready:
-            raise RuntimeError("Model is not loaded.")
+        if callable(getattr(self.model, "is_ready", False)):
+            if not self.model.is_ready:
+                raise RuntimeError("Model is not loaded.")
         train_dataset = self._train_dataset
         eval_dataset = self._eval_dataset
 
@@ -245,7 +263,7 @@ class ModelTrainer:
         )
 
         self._trainer = Trainer(
-            model=self.model.model,
+            model=self._unwrap_model,
             args=training_args,
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
@@ -273,5 +291,8 @@ class ModelTrainer:
 
     def save_checkpoint(self, path: Optional[str | Path] = None) -> None:
         save_dir = Path(path or self.cfg.output.checkpoint_dir)
-        self.model.save_model(save_dir)
+        if hasattr(self.model, "save_model"):
+            self.model.save_model(save_dir)
+        else:
+            self._unwrap_model.save_pretrained(save_dir)
         logger.info("Checkpoint saved to %s", save_dir)

@@ -85,7 +85,7 @@ class DataPipeline:
 
             attention_mask = [1] * len(full_ids)
             labels = list(full_ids)
-            prompt_len = min(len(prompt_ids), len(labels) - 1)
+            prompt_len = len(prompt_ids)
             labels[:prompt_len] = [-100] * prompt_len
 
             pad_len = max_length - len(full_ids)

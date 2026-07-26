@@ -299,7 +299,7 @@ class MassiveDataCollector:
 
         # Code + explanation (paired)
         if "code" in entry and "explanation" in entry:
-            return self._clean_text(entry["explanation"] or entry["description"]), "", self._clean_text(entry["code"])
+            return self._clean_text(entry.get("explanation") or entry.get("description", "")), "", self._clean_text(entry["code"])
 
         # NLU datasets: premise/hypothesis or sentence1/sentence2
         if "sentence1" in entry and "sentence2" in entry:

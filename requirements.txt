@@ -1,20 +1,37 @@
---extra-index-url https://download.pytorch.org/whl/cu121
-torch==2.2.2
-torchvision==0.17.2
-torchaudio==2.2.2
+# =============================================================================
+# Methos Class Model — Dependencies
+# =============================================================================
+# JupyterLab server (GPU training):
+#   pip install -r requirements.txt
+#
+# Windows PC (development, no GPU):
+#   pip install -r requirements-dev.txt
+# =============================================================================
+
+# PyTorch with CUDA 12.8+ (Blackwell / H100 / A100 / RTX 4090+)
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.6.0+cu128
+torchvision==0.21.0+cu128
+torchaudio==2.6.0+cu128
+
+# HuggingFace ecosystem
 transformers==4.43.3
 datasets>=2.14.4
 accelerate==0.33.0
 bitsandbytes>=0.43.0
 peft>=0.10.0
 tokenizers>=0.19.1
+
+# Core utilities
 pyyaml
 pydantic>=2.0.0
 tqdm
 sentencepiece
 scipy
 einops
-# flash-attn --no-build-isolation (Optional: ~2x attention speed on A100/H100)
+
+# Testing (required for `python main.py test`)
+pytest>=7.0
 
 # GraphRAG & Agentic Memory
 chromadb
@@ -24,11 +41,14 @@ networkx
 # Web Chat UI
 flask>=3.0.0
 
-# Experiment tracking (optional)
+# Optional: ~2x attention speed on A100/H100/Blackwell
+# flash-attn --no-build-isolation
+
+# Experiment tracking (optional — uncomment as needed)
 # wandb
 # mlflow
 # tensorboard
 
-# Evaluation (optional)
+# Evaluation (optional — uncomment as needed)
 # human-eval
 # pylint

@@ -27,8 +27,11 @@ def _sequence_logps(
     valid_mask = shift_labels != -100
     safe_labels = shift_labels.masked_fill(~valid_mask, 0)
 
-    per_token_logps = F.log_softmax(shift_logits, dim=-1)
-    per_token_logps = per_token_logps.gather(dim=-1, index=safe_labels.unsqueeze(-1)).squeeze(-1)
+    per_token_logps = -F.cross_entropy(
+        shift_logits.reshape(-1, shift_logits.size(-1)),
+        safe_labels.reshape(-1),
+        reduction='none',
+    ).reshape_as(shift_labels)
     return (per_token_logps * valid_mask.float()).sum(dim=-1)
 
 
@@ -141,10 +144,9 @@ class ORPOTrainer:
         chosen_logps: torch.Tensor,
         rejected_logps: torch.Tensor,
     ) -> torch.Tensor:
-        log_odds = (chosen_logps - rejected_logps)
-        log_ratio = log_odds.mean()
+        log_odds = chosen_logps - rejected_logps
         sft_loss = -chosen_logps.mean()
-        orpo_loss = sft_loss + self.beta * (-F.logsigmoid(log_ratio))
+        orpo_loss = sft_loss + self.beta * (-F.logsigmoid(log_odds)).mean()
         return orpo_loss
 
     def train_step(
@@ -180,8 +182,10 @@ class KTOtrainer:
         device: Optional[torch.device] = None,
         desirable_weight: float = 1.0,
         undesirable_weight: float = 1.0,
+        ref_model: Optional[PreTrainedModel] = None,
     ) -> None:
         self.model = model
+        self.ref_model = ref_model
         self.tokenizer = tokenizer
         self.beta = beta
         self.learning_rate = learning_rate
@@ -208,16 +212,28 @@ class KTOtrainer:
 
     def train_step(
         self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        labels: torch.Tensor,
-        is_desirable: torch.Tensor,
+        chosen_input_ids: torch.Tensor,
+        chosen_attention_mask: torch.Tensor,
+        chosen_labels: torch.Tensor,
+        rejected_input_ids: torch.Tensor,
+        rejected_attention_mask: torch.Tensor,
+        rejected_labels: torch.Tensor,
     ) -> Dict[str, float]:
         self.model.train()
+        batch_size = chosen_input_ids.shape[0]
+        input_ids = torch.cat([chosen_input_ids, rejected_input_ids], dim=0)
+        attention_mask = torch.cat([chosen_attention_mask, rejected_attention_mask], dim=0)
+        labels = torch.cat([chosen_labels, rejected_labels], dim=0)
+        is_desirable = torch.cat([
+            torch.ones(batch_size, device=input_ids.device, dtype=torch.bool),
+            torch.zeros(batch_size, device=input_ids.device, dtype=torch.bool),
+        ], dim=0)
+
         policy_logps = self._get_logps(self.model, input_ids, attention_mask, labels)
 
+        ref_model = self.ref_model if self.ref_model is not None else self.model
         with torch.no_grad():
-            ref_logps = self._get_logps(self.model, input_ids, attention_mask, labels).detach()
+            ref_logps = self._get_logps(ref_model, input_ids, attention_mask, labels).detach()
 
         loss = self.kto_loss(policy_logps, ref_logps, is_desirable)
         self.optimizer.zero_grad()

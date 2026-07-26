@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 from pathlib import Path
 from typing import Iterable, Optional
@@ -7,6 +8,7 @@ from typing import Iterable, Optional
 import yaml
 from tokenizers import ByteLevelBPETokenizer
 from src.data.streaming import MassiveDataCollector
+from src.config.schema import DatasetEntryConfig
 
 logger = logging.getLogger(__name__)
 
@@ -63,12 +65,12 @@ def _format_sample(sample: dict) -> str:
 
 
 def _iter_tokenizer_corpus(collector: MassiveDataCollector, max_samples: int, theme: str) -> Iterable[str]:
-    seen: set[int] = set()
+    seen: set[str] = set()
     for i, sample in enumerate(collector.stream_samples(limit=max_samples, theme=theme)):
         text = _format_sample(sample)
         if len(text) < 80:
             continue
-        fingerprint = hash(text)
+        fingerprint = hashlib.sha256(text.encode()).hexdigest()
         if fingerprint in seen:
             continue
         seen.add(fingerprint)
@@ -156,7 +158,9 @@ def train_custom_tokenizer(
         theme,
     )
 
-    collector = MassiveDataCollector(datasets_cfg=config.get("data", {}).get("datasets", []))
+    raw_datasets = config.get("data", {}).get("datasets", [])
+    datasets_cfg = [DatasetEntryConfig(**d) if isinstance(d, dict) else d for d in raw_datasets]
+    collector = MassiveDataCollector(datasets_cfg=datasets_cfg)
     samples = list(_iter_tokenizer_corpus(collector, max_samples=max_samples, theme=theme))
     if len(samples) < 100:
         raise RuntimeError(

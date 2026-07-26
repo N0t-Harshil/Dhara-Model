@@ -1,0 +1,169 @@
+# Small MethosV3 (~173M params) for single-GPU training
+project:
+  name: Methos Class Model (Small)
+  seed: 42
+
+model:
+  name: Methos Class Model (Small)
+  dtype: bfloat16
+  device: auto
+  train_from_scratch: true
+  architecture:
+    model_type: methos_v3
+    vocab_size: 128000
+    hidden_size: 576                    # d_model (scaled down from 10240)
+    gradient_checkpointing: false
+    activation_checkpointing: false
+
+    methos_v3:
+      d_state: 288
+      d_hidden: 576
+      n_ssm_layers: 3                   # Reduced SSM layers
+      n_hssm_levels: 2                  # Reduced hierarchy levels
+      n_ode_steps: 8
+      n_trajectories: 7
+      n_sim_steps: 16
+      use_efficient_sandbox: true
+      sparsity_pct: 1.0
+      n_token_categories: 8
+      n_languages: 8                    # Reduced from 16
+      n_doc_roles: 8
+      n_task_types: 8
+      n_difficulty_levels: 5
+      n_reasoning_types: 8
+      max_subgoals: 32                  # Reduced from 64
+      n_domains: 5
+      max_reasoning_steps: 16           # Reduced from 32
+      n_semantic_concepts: 1024         # Reduced from 4096
+      working_mem_capacity: 128         # Reduced from 512
+      max_episodes: 64                  # Reduced from 256
+      n_context_adapter_blocks: 2       # Reduced from 4
+      n_language_groups: 8
+      adaptive_top_k_min: 32
+      adaptive_top_k_max: 512           # Reduced from 2048
+      n_experts: 7
+      n_debate_rounds: 1                  # Reduced for training speed; inference uses more
+      max_refinement_passes: 3          # Reduced from 5
+      max_repair_iters: 2               # Reduced from 3
+      max_entities: 32                  # Reduced from 64
+      n_relation_types: 8               # Reduced from 16
+      max_events: 16                    # Reduced from 32
+      enable_executive: true
+      enable_world_model: true
+      enable_learning_controller: true
+      enable_tools: false                  # Tools are inference-only; disable during training
+      enable_curiosity: false              # Curiosity module is inference-only; disable during training
+      enable_aux_losses: true
+      executive_gate_threshold: 0.3
+      qa_max_passes: 1                  # Single pass during training; inference uses more
+      qa_converge_threshold: 0.05
+
+    max_position_embeddings: 4096       # Reduced from 16384
+    rope_theta: 10000000.0
+    rope_scaling:
+      type: yarn
+      factor: 16.0
+      target_max_length: 65536
+      original_max_position_embeddings: 4096
+
+training:
+  max_seq_length: 2048                  # Reduced from 4096
+  response_only_loss: true
+  ignore_data_skip: true
+  save_steps: 500
+  save_total_limit: 3
+  eval_strategy: "no"
+  logging_steps: 10
+
+  pretrain:
+    enabled: true
+    learning_rate: 3e-4
+    lr_scheduler_type: cosine
+    warmup_steps: 1000
+    weight_decay: 0.1
+    batch_size: 4                       # Per GPU (single-GPU: eff batch = 4 × 8 = 32)
+    gradient_accumulation_steps: 8
+    max_steps: 50000                    # ~3.3B tokens at 2048 seq_len — close to Chinchilla-optimal for 173M
+    optimizer: adamw_fused
+    # NOTE — Embedding param cost: vocab_size × hidden_size = 128000 × 576 = ~73.7M params.
+    # The embedding alone is ~42% of the ~173M total. If embedding > 40% is a concern,
+    # reduce vocab_size (e.g. vocab_size: 32000 → ~18.4M embed, ~2.5% total reduction in model size)
+    # or share embedding weights with the decoder head (tie_word_embeddings: true).
+    data_mix: {code: 0.3, web_text: 0.3, books: 0.1, math: 0.1, science: 0.1, other: 0.1}
+
+
+  sft:
+    enabled: false
+  instruction_tuning:
+    enabled: false
+  alignment:
+    enabled: false
+  safety:
+    enabled: false
+
+distributed:
+  strategy: none                        # Single GPU, no FSDP
+  fsdp:
+    enabled: false
+    activation_checkpointing: false
+
+data:
+  cache_dir: ./hf_cache
+  streaming: true
+  max_cache_gb: 50
+
+  quality:
+    min_length: 30
+    max_length: 500000
+    deduplication:
+      enabled: true
+      method: minhash
+      threshold: 0.85
+    contamination:
+      enabled: true
+      benchmarks: [human_eval, mbpp, mmlu, gsm8k, arc, hellaswag, truthfulqa]
+    quality_scoring:
+      enabled: true
+      method: heuristic
+    language_detection:
+      enabled: true
+    toxicity_filtering:
+      enabled: true
+
+  curriculum:
+    enabled: false
+    stages: []
+
+  datasets:
+    - path: codeparrot/codeparrot-clean
+      max_samples: 50000
+      category: code
+    - path: c4
+      name: en
+      max_samples: 100000
+      category: web_text
+
+tokenizer:
+  source: huggingface
+  huggingface_model: Xenova/claude-tokenizer
+  vocab_size: 128000
+  max_samples: 100000
+  type: bpe
+  force: false
+  add_bos_token: true
+  add_eos_token: true
+
+output:
+  model_dir: ./models/methos-small
+  data_dir: ./data
+  checkpoint_dir: ./models/methos-small/checkpoints
+  log_dir: ./logs
+  experiment_tracking:
+    enabled: false
+
+generation:
+  max_new_tokens: 4096
+  temperature: 0.7
+  top_p: 0.9
+  top_k: 40
+  do_sample: true

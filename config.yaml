@@ -22,21 +22,53 @@ model:
   load_in_8bit: false
   load_in_4bit: false
   architecture:
-    model_type: nslt
+    model_type: methos_v3
     vocab_size: 128000
     hidden_size: 10240          # d_model — embedding dimension (scaled for 4x A100 80GB)
 
-    # NSLT-specific parameters (read by schema.ModelArchitectureConfig.nslt)
-    nslt:
+    # MethosV3 architecture parameters
+    methos_v3:
       d_state: 4096
       d_hidden: 10240
-      n_ssm_layers: 12          # Stacked SSM blocks for hierarchical compression
-      n_ode_steps: 8            # RK4 integration steps in LTC layer
-      solver: rk4
-      n_trajectories: 8         # K parallel trajectories in Latent Sandbox
-      n_sim_steps: 16           # Energy descent steps per forward pass
+      n_ssm_layers: 6           # Hierarchical SSM layers
+      n_hssm_levels: 3          # Multi-scale memory levels
+      n_ode_steps: 8
+      n_trajectories: 7         # 7 specialist agents (programming, math, logic, planning, retrieval, creative, safety)
+      n_sim_steps: 16
       use_efficient_sandbox: true
-      sparsity_pct: 1.0         # Top-1% vocabulary per token
+      sparsity_pct: 1.0
+      n_token_categories: 8
+      n_languages: 16
+      n_doc_roles: 8
+      n_task_types: 8
+      n_difficulty_levels: 5
+      n_reasoning_types: 8
+      max_subgoals: 64
+      n_domains: 5
+      max_reasoning_steps: 32
+      n_semantic_concepts: 4096
+      working_mem_capacity: 512
+      max_episodes: 256
+      n_context_adapter_blocks: 4
+      n_language_groups: 8
+      adaptive_top_k_min: 32
+      adaptive_top_k_max: 2048
+      n_experts: 7
+      n_debate_rounds: 3
+      max_refinement_passes: 5
+      max_repair_iters: 3
+      max_entities: 64
+      n_relation_types: 16
+      max_events: 32
+      enable_executive: true
+      enable_world_model: true
+      enable_learning_controller: true
+      enable_tools: true
+      enable_curiosity: true
+      enable_aux_losses: true
+      executive_gate_threshold: 0.3
+      qa_max_passes: 5
+      qa_converge_threshold: 0.05
 
     # Position encoding — RoPE with 10M theta for long context
     max_position_embeddings: 16384
@@ -58,17 +90,21 @@ training:
   eval_strategy: "no"
   logging_steps: 10
 
-  # Stage 1: Pretraining (500K steps, cosine LR, LR=2e-4)
+  # Stage 1: Pretraining (1M steps, cosine LR, LR=2e-4)
   # 4 GPUs: per_device=2, gas=8 → effective batch = 2 × 4 × 8 = 64
+  # Tokens seen: 1M steps × 64 eff_batch × 4096 seq_len = 262B
+  # Chinchilla-optimal for ~100M params is ~2B tokens (~7,600 steps).
+  # This config intentionally overtrain by ~130× (1M steps) to measure the
+  # effects of extended pretraining on a fixed-size SSM state.
   pretrain:
     enabled: true
     learning_rate: 2e-4
     lr_scheduler_type: cosine
-    warmup_steps: 5000
+    warmup_steps: 10000
     weight_decay: 0.1
     batch_size: 2
     gradient_accumulation_steps: 8
-    max_steps: 500000
+    max_steps: 1000000
     optimizer: adamw_fused
     data_mix:
       code: 0.3
@@ -78,32 +114,36 @@ training:
       science: 0.1
       other: 0.1
 
-  # Stage 2: Supervised Fine-Tuning (50K steps, LR=5e-6)
+  # Stage 2: Supervised Fine-Tuning (100K steps, LR=5e-6)
   # 4 GPUs: per_device=1, gas=4 → effective batch = 1 × 4 × 4 = 16
+  # Tokens seen: 100K steps × 16 eff_batch × 4096 seq_len = ~6.5B (intentional extended SFT)
   sft:
     enabled: true
     learning_rate: 5e-6
     lr_scheduler_type: cosine
-    warmup_steps: 500
+    warmup_steps: 1000
     weight_decay: 0.05
     batch_size: 1
     gradient_accumulation_steps: 4
-    max_steps: 50000
+    max_steps: 100000
     optimizer: adamw_fused
     data_mix:
       sft_instructions: 0.5
       conversations: 0.3
       code_tasks: 0.2
 
-  # Stage 3: Instruction Tuning (20K steps)
+  # Stage 3: Instruction Tuning (50K steps, LR=1e-5)
   # 4 GPUs: per_device=1, gas=4 → effective batch = 1 × 4 × 4 = 16
   instruction_tuning:
     enabled: true
     learning_rate: 1e-5
+    lr_scheduler_type: cosine
     batch_size: 1
     gradient_accumulation_steps: 4
-    max_steps: 20000
-    warmup_steps: 200
+    max_steps: 50000
+    warmup_steps: 500
+    weight_decay: 0.05
+    optimizer: adamw_fused
 
   # Alignment & Safety disabled — pure training only
   alignment:
@@ -116,16 +156,17 @@ training:
 distributed:
   strategy: fsdp
   fsdp:
-    enabled: true
-    sharding_strategy: full_shard
-    transformer_layer_cls: NSLTModel
-    backward_prefetch: backward_pre
-    forward_prefetch: true
-    activation_checkpointing: true
-    use_orig_params: true
-    sync_module_states: true
-    limit_all_gathers: true
-    mixed_precision: bf16
+      enabled: true
+      sharding_strategy: full_shard
+      transformer_layer_cls: HierarchicalSSMStack
+      backward_prefetch: backward_pre
+      forward_prefetch: true
+      activation_checkpointing: true
+      use_orig_params: true
+      sync_module_states: true
+      limit_all_gathers: true
+      mixed_precision: bf16
+      cpu_offload: true
 
 # ── Data ────────────────────────────────────────────────────────────────────
 data:

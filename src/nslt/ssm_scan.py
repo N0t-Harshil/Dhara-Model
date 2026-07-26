@@ -302,15 +302,11 @@ class SSMScanFunction(torch.autograd.Function):
 
         if use_triton and _HAS_TRITON and x.is_cuda:
             y, h = selective_scan_triton(x, delta, A, B, C, dt_rank)
-        else:
-            y, h = selective_scan_sequential(x, delta, A, B, C, dt_rank)
-
-        if use_triton and _HAS_TRITON and x.is_cuda:
             h_final_h = h
             h_seq = None
         else:
+            y, h, h_seq = selective_scan_sequential(x, delta, A, B, C, dt_rank, return_h_seq=True)
             h_final_h = h
-            _, _, h_seq = selective_scan_sequential(x, delta, A, B, C, dt_rank, return_h_seq=True)
         ctx.h_seq = h_seq
         ctx.save_for_backward(x, delta, A, B, C, h_final_h, torch.tensor(use_triton))
         return y, h

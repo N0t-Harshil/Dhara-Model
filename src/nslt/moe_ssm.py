@@ -206,18 +206,18 @@ class MoE_SSM_Block(nn.Module):
             A_bar_e = torch.exp(delta_e * A_e.unsqueeze(0).unsqueeze(0))
             B_bar_e = (A_bar_e - 1.0) / (A_e + 1e-10) * B_e
 
-            b_e = B_bar_e * x_conv[:, :, :self.expert_d_state]
+            h_e = torch.zeros(batch, self.expert_d_state, device=device, dtype=x.dtype)
+            h_e_list = []
+            y_e_list = []
+            for t in range(seq_len):
+                h_e = A_bar_e[:, t, :] * h_e + B_bar_e[:, t, :] * x_conv[:, t, :self.expert_d_state]
+                h_e_list.append(h_e.unsqueeze(1))
+                y_t = torch.sum(C_e[:, t:t+1, :] * h_e.unsqueeze(1), dim=-1, keepdim=True)
+                y_e_list.append(y_t * e_weight[:, t:t+1].unsqueeze(-1))
+            h_e_full = torch.cat(h_e_list, dim=1)
+            y_e = torch.cat(y_e_list, dim=1)
 
-            log_A_bar_e = delta_e * A_e.unsqueeze(0).unsqueeze(0)
-            log_prefix_e = torch.cumsum(log_A_bar_e, dim=1)
-            scaled_e = b_e * torch.exp(-log_prefix_e)
-            cumulative_e = torch.cumsum(scaled_e, dim=1)
-            h_e = cumulative_e * torch.exp(log_prefix_e)
-
-            h_flat[:, :, e_idx * self.expert_d_state: (e_idx + 1) * self.expert_d_state] += h_e
-
-            y_e = torch.sum(C_e * h_e, dim=-1, keepdim=True)
-            y_e = y_e * e_weight.unsqueeze(-1)
+            h_flat[:, :, e_idx * self.expert_d_state: (e_idx + 1) * self.expert_d_state] += h_e_full
             y_flat = y_flat + y_e
 
         if d_inner > self.expert_d_state:

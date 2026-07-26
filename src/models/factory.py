@@ -30,6 +30,7 @@ ARCH_CONFIG_MAP = {
     "qwen2_moe": (AutoConfig, AutoModelForCausalLM),
     "deepseek_v2": (AutoConfig, AutoModelForCausalLM),
     "nslt": (None, None),
+    "methos_v3": (None, None),
 }
 
 ARCH_FSDP_LAYER_MAP = {
@@ -37,7 +38,8 @@ ARCH_FSDP_LAYER_MAP = {
     "mixtral": "MixtralDecoderLayer",
     "qwen2_moe": "Qwen2MoeDecoderLayer",
     "deepseek_v2": "DeepseekV2DecoderLayer",
-    "nslt": "NSLTModel",
+    "nslt": "SSMCompressionEngine",
+    "methos_v3": "HierarchicalSSMStack",
 }
 
 
@@ -165,6 +167,8 @@ class ModelFactory:
         if arch.model_type == "mixtral" or arch.model_type == "qwen2_moe":
             spec["num_local_experts"] = arch.moe.num_experts
             spec["num_experts_per_tok"] = arch.moe.top_k
+        if arch.model_type == "methos_v3":
+            spec["methos_v3"] = arch.methos_v3.model_dump(mode="python")
         return spec
 
     @staticmethod
@@ -221,6 +225,54 @@ class ModelFactory:
         model_type = cfg.model.architecture.model_type
         dtype = ModelFactory._resolve_dtype(cfg.model.dtype)
 
+        if model_type == "methos_v3":
+            from src.methos_v3 import MethosV3Model
+            from src.methos_v3.model import MethosV3Config as MethosV3ModelConfig
+            arch = cfg.model.architecture
+            v3 = arch.methos_v3
+            model_config = MethosV3ModelConfig(
+                vocab_size=len(tokenizer),
+                hidden_size=arch.hidden_size,
+                d_state=v3.d_state,
+                d_hidden=v3.d_hidden,
+                max_position_embeddings=arch.max_position_embeddings,
+                rope_theta=arch.rope_theta,
+                sparsity_pct=v3.sparsity_pct,
+                n_ssm_layers=v3.n_ssm_layers,
+                n_hssm_levels=v3.n_hssm_levels,
+                n_ode_steps=v3.n_ode_steps,
+                n_trajectories=v3.n_trajectories,
+                n_sim_steps=v3.n_sim_steps,
+                use_efficient_sandbox=v3.use_efficient_sandbox,
+                n_token_categories=v3.n_token_categories,
+                n_languages=v3.n_languages,
+                n_doc_roles=v3.n_doc_roles,
+                n_task_types=v3.n_task_types,
+                n_difficulty_levels=v3.n_difficulty_levels,
+                n_reasoning_types=v3.n_reasoning_types,
+                max_subgoals=v3.max_subgoals,
+                n_domains=v3.n_domains,
+                max_reasoning_steps=v3.max_reasoning_steps,
+                n_semantic_concepts=v3.n_semantic_concepts,
+                working_mem_capacity=v3.working_mem_capacity,
+                max_episodes=v3.max_episodes,
+                n_context_adapter_blocks=v3.n_context_adapter_blocks,
+                n_language_groups=v3.n_language_groups,
+                adaptive_top_k_min=v3.adaptive_top_k_min,
+                adaptive_top_k_max=v3.adaptive_top_k_max,
+                enable_executive=v3.enable_executive,
+                enable_world_model=v3.enable_world_model,
+                enable_tools=v3.enable_tools,
+                enable_curiosity=v3.enable_curiosity,
+                enable_aux_losses=v3.enable_aux_losses,
+                executive_gate_threshold=v3.executive_gate_threshold,
+                qa_max_passes=v3.qa_max_passes,
+                qa_converge_threshold=v3.qa_converge_threshold,
+            )
+            model_config.torch_dtype = dtype
+            model = MethosV3Model(config=model_config)
+            return model
+
         if model_type == "nslt":
             from src.nslt import NSLTModel
             arch = cfg.model.architecture
@@ -261,14 +313,17 @@ class ModelFactory:
         return ARCH_FSDP_LAYER_MAP.get(model_type, "LlamaDecoderLayer")
 
     @staticmethod
-    def estimate_model_size(arch: ModelArchitectureConfig) -> Dict[str, Any]:
+    def estimate_model_size(arch: ModelArchitectureConfig, tokenizer_or_vocab: Any = None) -> Dict[str, Any]:
         if arch.model_type == "nslt":
             nslt = arch.nslt
             d_model = arch.hidden_size
             d_state = nslt.d_state
             d_hidden = nslt.d_hidden
             n_ssm = nslt.n_ssm_layers
-            vocab_size = arch.vocab_size
+            if tokenizer_or_vocab is not None:
+                vocab_size = len(tokenizer_or_vocab) if hasattr(tokenizer_or_vocab, "__len__") else int(tokenizer_or_vocab)
+            else:
+                vocab_size = arch.vocab_size
 
             # Embedding
             embed = vocab_size * d_model
@@ -297,6 +352,33 @@ class ModelFactory:
                 "experts": 1,
                 "top_k": 1,
                 "architecture": "nslt",
+            }
+
+        if arch.model_type == "methos_v3":
+            v3 = arch.methos_v3
+            d_model = arch.hidden_size
+            d_hidden = v3.d_hidden
+            if tokenizer_or_vocab is not None:
+                vocab_size = len(tokenizer_or_vocab) if hasattr(tokenizer_or_vocab, "__len__") else int(tokenizer_or_vocab)
+            else:
+                vocab_size = arch.vocab_size
+            embed = vocab_size * d_model
+            ssm_params = v3.n_ssm_layers * (4 * d_model ** 2 + d_model * v3.d_state * 3 + d_model * v3.d_state)
+            memory_params = d_model * d_hidden * 4 + d_hidden * d_hidden * 2
+            intent_params = d_model * (v3.n_task_types + v3.n_difficulty_levels + v3.n_reasoning_types + 2)
+            planner_params = v3.max_subgoals * d_model * 4 + d_model * d_model
+            reasoning_params = v3.n_domains * ((v3.d_state + d_hidden) * d_hidden * 2 + d_hidden * d_hidden)
+            workspace_params = d_hidden * d_hidden * 4
+            specialist_params = 7 * (d_hidden * d_hidden * 4 + d_hidden)
+            decoder_params = d_hidden * vocab_size + d_hidden * v3.n_language_groups
+            total = embed + ssm_params + memory_params + intent_params + planner_params + reasoning_params + workspace_params + specialist_params + decoder_params
+            return {
+                "total_params_b": round(total / 1e9, 2),
+                "active_params_b": round(total / 1e9, 2),
+                "layers": v3.n_ssm_layers,
+                "experts": 1,
+                "top_k": 1,
+                "architecture": "methos_v3",
             }
 
         vocab_size = arch.vocab_size
@@ -330,13 +412,18 @@ class ModelFactory:
         }
 
     @staticmethod
-    def load_tokenizer(path: str | Path = "models/tokenizer") -> PreTrainedTokenizerBase:
+    def load_tokenizer(path: str | Path = "models/tokenizer", cfg: Optional[Any] = None) -> PreTrainedTokenizerBase:
         path = Path(path)
         if not path.exists():
             raise RuntimeError(f"Tokenizer not found at {path}. Train it first.")
         tokenizer = ModelFactory._try_load_tokenizer(path)
         if tokenizer.pad_token is None:
             tokenizer.add_special_tokens({"pad_token": "<pad>"})
+        if not hasattr(tokenizer, "padding_side") or tokenizer.padding_side != "right":
+            tokenizer.padding_side = "right"
+        max_len = getattr(cfg, 'model', None) and getattr(cfg.model, 'architecture', None) and cfg.model.architecture.max_position_embeddings
+        if not hasattr(tokenizer, "model_max_length") or tokenizer.model_max_length > 1_000_000:
+            tokenizer.model_max_length = max_len or 4096
         return tokenizer
 
     @staticmethod
@@ -378,16 +465,65 @@ class ModelFactory:
     ) -> Tuple[PreTrainedModel, PreTrainedTokenizerBase]:
         path = Path(path)
         if tokenizer is None:
-            tokenizer = ModelFactory.load_tokenizer()
+            tokenizer = ModelFactory.load_tokenizer(cfg=cfg)
 
         config_file = path / "config.json"
+        saved_config = None
         model_type = None
         if config_file.exists():
             with open(config_file) as f:
                 saved_config = json.load(f)
             model_type = saved_config.get("model_type") or saved_config.get("architecture")
-        elif cfg.model.architecture.model_type == "nslt" and (path / "pytorch_model.bin").exists():
-            model_type = "nslt"
+        elif cfg.model.architecture.model_type in ("nslt", "methos_v3") and (path / "pytorch_model.bin").exists():
+            model_type = cfg.model.architecture.model_type
+
+        if model_type == "methos_v3":
+            from src.methos_v3 import MethosV3Model
+            from src.methos_v3.model import MethosV3Config as MethosV3ModelConfig
+            state_dict = torch.load(path / "pytorch_model.bin", map_location="cpu", weights_only=True)
+            arch = cfg.model.architecture
+            v3 = arch.methos_v3
+            model_config = MethosV3ModelConfig(
+                vocab_size=len(tokenizer),
+                hidden_size=arch.hidden_size,
+                d_state=v3.d_state,
+                d_hidden=v3.d_hidden,
+                max_position_embeddings=arch.max_position_embeddings,
+                rope_theta=arch.rope_theta,
+                sparsity_pct=v3.sparsity_pct,
+                n_ssm_layers=v3.n_ssm_layers,
+                n_hssm_levels=v3.n_hssm_levels,
+                n_ode_steps=v3.n_ode_steps,
+                n_trajectories=v3.n_trajectories,
+                n_sim_steps=v3.n_sim_steps,
+                use_efficient_sandbox=v3.use_efficient_sandbox,
+                n_token_categories=v3.n_token_categories,
+                n_languages=v3.n_languages,
+                n_doc_roles=v3.n_doc_roles,
+                n_task_types=v3.n_task_types,
+                n_difficulty_levels=v3.n_difficulty_levels,
+                n_reasoning_types=v3.n_reasoning_types,
+                max_subgoals=v3.max_subgoals,
+                n_domains=v3.n_domains,
+                max_reasoning_steps=v3.max_reasoning_steps,
+                n_semantic_concepts=v3.n_semantic_concepts,
+                working_mem_capacity=v3.working_mem_capacity,
+                max_episodes=v3.max_episodes,
+                n_context_adapter_blocks=v3.n_context_adapter_blocks,
+                n_language_groups=v3.n_language_groups,
+                adaptive_top_k_min=v3.adaptive_top_k_min,
+                adaptive_top_k_max=v3.adaptive_top_k_max,
+            )
+            model_config.torch_dtype = ModelFactory._resolve_dtype(cfg.model.dtype)
+            model = MethosV3Model(config=model_config)
+            missing, unexpected = model.load_state_dict(state_dict, strict=True)
+            if missing:
+                logger.warning("Missing keys: %d — %s", len(missing), missing[:5])
+            if unexpected:
+                logger.warning("Unexpected keys: %d — %s", len(unexpected), unexpected[:5])
+            for param in model.parameters():
+                param.requires_grad = True
+            return model, tokenizer
 
         if model_type == "nslt":
             from src.nslt import NSLTModel

@@ -22,10 +22,18 @@ class DistributedSetup:
         self.local_rank = int(os.environ.get("LOCAL_RANK", "0"))
         self.rank = int(os.environ.get("RANK", "0"))
         self.is_distributed = self.world_size > 1
-        if self.is_distributed:
+
+        use_fsdp = cfg.distributed.strategy == "fsdp"
+        if self.is_distributed or use_fsdp:
             if torch.cuda.is_available():
                 torch.cuda.set_device(self.local_rank)
             if not dist.is_initialized():
+                if not self.is_distributed:
+                    os.environ.setdefault("MASTER_ADDR", "localhost")
+                    os.environ.setdefault("MASTER_PORT", "29500")
+                    os.environ.setdefault("WORLD_SIZE", "1")
+                    os.environ.setdefault("RANK", "0")
+                    os.environ.setdefault("LOCAL_RANK", "0")
                 backend = "nccl" if torch.cuda.is_available() else "gloo"
                 dist.init_process_group(backend=backend)
 
@@ -59,10 +67,10 @@ class DistributedSetup:
         elif self.cfg.model.dtype == "float16" and torch.cuda.is_available():
             args["fp16"] = True
 
-        if self.dist_cfg.strategy == "fsdp" and self.is_distributed:
+        if self.dist_cfg.strategy == "fsdp":
             fsdp_cfg = self.dist_cfg.fsdp
-            args["fsdp"] = "full_shard auto_wrap"
-            args["fsdp_config"] = {
+            fsdp_args = [fsdp_cfg.sharding_strategy, "auto_wrap"]
+            fsdp_config: Dict[str, Any] = {
                 "transformer_layer_cls_to_wrap": [fsdp_cfg.transformer_layer_cls],
                 "backward_prefetch": fsdp_cfg.backward_prefetch,
                 "forward_prefetch": fsdp_cfg.forward_prefetch,
@@ -70,8 +78,15 @@ class DistributedSetup:
                 "use_orig_params": fsdp_cfg.use_orig_params,
                 "sync_module_states": fsdp_cfg.sync_module_states,
                 "limit_all_gathers": fsdp_cfg.limit_all_gathers,
-                "fsdp_mixed_precision": fsdp_cfg.mixed_precision,
+                "mixed_precision": fsdp_cfg.mixed_precision,
             }
+            if fsdp_cfg.cpu_offload:
+                fsdp_args.append("offload")
+                fsdp_config["cpu_offload"] = True
+            if not self.is_distributed:
+                fsdp_args.append("no_shard")
+            args["fsdp"] = " ".join(fsdp_args)
+            args["fsdp_config"] = fsdp_config
             if not args.get("bf16") and fsdp_cfg.mixed_precision == "bf16":
                 args["bf16"] = True
 

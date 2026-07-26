@@ -4,13 +4,72 @@ import argparse
 import json
 import logging
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
 from typing import Optional
 
+# ── GPU selection: must run before import torch ──────────────────────
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+_top_cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+_skip_gpu_init = _top_cmd == "reserved-training"
+
+
+def _resolve_gpu() -> str | None:
+    """Parse --gpu from CLI, or auto-detect best GPU, return device index string."""
+    existing = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if existing:
+        return None
+    if os.environ.get("LOCAL_RANK"):
+        return None
+    early = argparse.ArgumentParser(add_help=False)
+    early.add_argument("--gpu", type=str, default=None)
+    known, _ = early.parse_known_args()
+    if known.gpu is not None:
+        return str(known.gpu)
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+            encoding="utf-8",
+        )
+        free_mems = [int(x) for x in out.strip().split("\n")]
+        best_idx = free_mems.index(max(free_mems))
+        return str(best_idx)
+    except Exception as e:
+        print(f"[!] GPU auto-detection failed: {e}")
+        return None
+
+
+if not _skip_gpu_init:
+    _gpu_selected = _resolve_gpu()
+    if _gpu_selected is not None:
+        cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+        if not cvd:
+            os.environ["CUDA_VISIBLE_DEVICES"] = _gpu_selected
+            try:
+                out = subprocess.check_output(
+                    ["nvidia-smi", f"--id={_gpu_selected}", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+                    encoding="utf-8",
+                )
+                free_mb = out.strip()
+                print(f"[*] Single-GPU: physical GPU {_gpu_selected} ({free_mb}MB free)")
+            except Exception:
+                print(f"[*] Single-GPU: CUDA_VISIBLE_DEVICES={_gpu_selected}")
+
 import yaml
 import torch
+
+if torch.cuda.is_available() and not _skip_gpu_init:
+    try:
+        for i in range(torch.cuda.device_count()):
+            props = torch.cuda.get_device_properties(i)
+            free, total = torch.cuda.mem_get_info(i)
+            print(f"[*] Visible GPU {i}: {props.name} ({free/1e9:.1f}/{total/1e9:.1f} GB free)")
+    except RuntimeError:
+        pass
 
 os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
@@ -43,7 +102,8 @@ def cmd_full_training(args: argparse.Namespace) -> None:
     from src.infrastructure.distributed import DistributedSetup
     from src.tokenizer_trainer import ensure_tokenizer
 
-    cfg = load_config(args.config)
+    config_path = os.path.join(_PROJECT_DIR, args.config)
+    cfg = load_config(config_path)
     dist = DistributedSetup(cfg)
 
     if dist.is_main_process():
@@ -52,7 +112,7 @@ def cmd_full_training(args: argparse.Namespace) -> None:
         import torch.distributed as dist_pkg
         dist_pkg.barrier()
 
-    pipeline = TrainingPipeline(cfg)
+    pipeline = TrainingPipeline(cfg, dist_setup=dist)
     try:
         pipeline.initialize(fresh_start=args.fresh_start)
         results = pipeline.full_training_sequence()
@@ -68,7 +128,8 @@ def cmd_config_validate(args: argparse.Namespace) -> None:
     from src.models.factory import ModelFactory
     from pydantic import ValidationError
     try:
-        cfg = load_config(args.config)
+        config_path = os.path.join(_PROJECT_DIR, args.config)
+        cfg = load_config(config_path)
         print("Configuration is valid!")
         print(f"  Model: {cfg.model.name}")
         arch = cfg.model.architecture
@@ -100,8 +161,9 @@ def cmd_generate(args: argparse.Namespace) -> None:
     from src.models.factory import ModelFactory
     from transformers import AutoTokenizer
 
-    cfg = load_config(args.config)
-    tokenizer = ModelFactory.load_tokenizer(args.tokenizer)
+    config_path = os.path.join(_PROJECT_DIR, args.config)
+    cfg = load_config(config_path)
+    tokenizer = ModelFactory.load_tokenizer(args.tokenizer, cfg)
     model, _ = ModelFactory.load_model(args.checkpoint, cfg, tokenizer)
     model.eval()
     if torch.cuda.is_available():
@@ -171,8 +233,9 @@ def cmd_benchmark(args: argparse.Namespace) -> None:
     from src.evaluation.benchmarks import BenchmarkRunner
     from src.models.factory import ModelFactory
 
-    cfg = load_config(args.config)
-    tokenizer = ModelFactory.load_tokenizer(args.tokenizer)
+    config_path = os.path.join(_PROJECT_DIR, args.config)
+    cfg = load_config(config_path)
+    tokenizer = ModelFactory.load_tokenizer(args.tokenizer, cfg)
     model, _ = ModelFactory.load_model(args.checkpoint, cfg, tokenizer)
     model.eval()
     if torch.cuda.is_available():
@@ -185,51 +248,178 @@ def cmd_benchmark(args: argparse.Namespace) -> None:
         print(f"{r.name}: {r.score:.2%}")
 
 
+# ── GPU Wait + Reserve System ─────────────────────────────────────────
+
+
+def _gpu_free_mb(gpu_idx: str) -> int:
+    """Query free memory (MB) for a specific GPU via nvidia-smi."""
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", f"--id={gpu_idx}", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+            encoding="utf-8",
+        )
+        return int(out.strip())
+    except (subprocess.CalledProcessError, ValueError, OSError) as e:
+        raise RuntimeError(f"Failed to query GPU memory for {gpu_idx}: {e}")
+
+
+def _wait_for_gpu(
+    min_free_gb: float,
+    poll_interval: int = 30,
+    timeout: Optional[int] = None,
+) -> str:
+    """Poll nvidia-smi until a GPU has >= min_free_gb free, return its index."""
+    start = time.time()
+    while True:
+        try:
+            out = subprocess.check_output(
+                ["nvidia-smi", "--query-gpu=index,memory.free", "--format=csv,noheader,nounits"],
+                encoding="utf-8",
+            )
+            for line in out.strip().split("\n"):
+                idx, free_mb = line.split(", ")
+                free_gb = int(free_mb) / 1024
+                if free_gb >= min_free_gb:
+                    return idx
+        except Exception as e:
+            print(f"[!] GPU query failed: {e}")
+
+        elapsed = time.time() - start
+        if timeout is not None and elapsed > timeout:
+            raise TimeoutError(
+                f"Waited {elapsed:.0f}s but no GPU with >= {min_free_gb} GB free became available."
+            )
+
+        mins, secs = divmod(int(elapsed), 60)
+        print(
+            f"[*] Waiting for GPU with >= {min_free_gb} GB free ... "
+            f"({mins}m {secs}s elapsed, checking every {poll_interval}s)"
+        )
+        time.sleep(poll_interval)
+
+
+def cmd_reserved_training(args: argparse.Namespace) -> None:
+    """
+    Wait until a GPU has enough free memory, lock it via a reservation
+    tensor, then run full training.
+    """
+    # 1 ── Wait for a GPU with enough free memory ──────────────────────
+    min_free = args.min_free_gb
+    if min_free < 0 or args.reserve_gb < 0:
+        print("[!] Invalid arguments: min-free-gb and reserve-gb must be non-negative")
+        sys.exit(1)
+    if args.gpu is not None:
+        gpu_idx = str(args.gpu)
+        free_gb = _gpu_free_mb(gpu_idx) / 1024
+        if free_gb < min_free:
+            print(f"[*] GPU {gpu_idx} has {free_gb:.1f} GB free (need {min_free}). Waiting...")
+            gpu_idx = _wait_for_gpu(min_free, args.poll_interval, args.timeout)
+        else:
+            print(f"[*] Using GPU {gpu_idx} ({free_gb:.1f} GB free)")
+    else:
+        gpu_idx = _wait_for_gpu(min_free, args.poll_interval, args.timeout)
+
+    # 2 ── Set env var and lock the GPU ────────────────────────────────
+    os.environ["CUDA_VISIBLE_DEVICES"] = gpu_idx
+    reservation = None
+    if args.reserve_gb > 0:
+        num_elements = int(args.reserve_gb * 1024 ** 3 / 4)  # fp32 = 4 bytes
+        for attempt in range(5):
+            try:
+                torch.cuda.empty_cache()
+                reservation = torch.empty(num_elements, device="cuda:0", dtype=torch.float32)
+                break
+            except RuntimeError:
+                if attempt < 4:
+                    print(f"[!] Reservation attempt {attempt+1} failed, retrying...")
+                    time.sleep(2)
+                else:
+                    print(f"[!] Reservation failed after 5 attempts — training without lock")
+        if reservation is not None:
+            free_after = _gpu_free_mb(gpu_idx) / 1024
+            print(
+                f"[*] Reserved GPU {gpu_idx} ({free_after:.1f} GB free after "
+                f"{args.reserve_gb:.1f} GB reservation)"
+            )
+
+    # 3 ── Run training ────────────────────────────────────────────────
+    try:
+        cmd_full_training(args)
+    except (TimeoutError, RuntimeError) as e:
+        print(f"[!] Training failed: {e}")
+        sys.exit(1)
+    finally:
+        if reservation is not None:
+            del reservation
+            torch.cuda.empty_cache()
+        print(f"[*] Released GPU {gpu_idx} reservation")
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="zmodel", description="Methos Class Model - Neural-State Liquid Transformer")
-    parser.add_argument("--config", default="config.yaml")
+    main_parent_parser = argparse.ArgumentParser(add_help=False)
+    main_parent_parser.add_argument("--config", default="config.yaml", help="Path to config file (default: config.yaml)")
+    main_parent_parser.add_argument("--gpu", type=str, default=argparse.SUPPRESS, help="GPU index to use (e.g. '0', '3'). Overrides auto-detection.")
+
+    sub_parent_parser = argparse.ArgumentParser(add_help=False)
+    sub_parent_parser.add_argument("--config", default=argparse.SUPPRESS, help="Path to config file")
+    sub_parent_parser.add_argument("--gpu", type=str, default=argparse.SUPPRESS, help="GPU index to use (e.g. '0', '3'). Overrides auto-detection.")
+
+    parser = argparse.ArgumentParser(prog="main.py", description="Methos Class Model - Neural-State Liquid Transformer", parents=[main_parent_parser])
 
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_full = sub.add_parser("full-training", help="Run full training (pretrain -> SFT -> instruction tuning)")
-    p_full.add_argument("--fresh-start", action="store_true", help="Ignore existing checkpoints")
-    p_full.add_argument("--config", default="config.yaml")
+    p_full = sub.add_parser("full-training", help="Run full training (pretrain -> SFT -> instruction tuning)", parents=[sub_parent_parser])
+    p_full.add_argument("--fresh-start", action="action_true" if False else "store_true", help="Ignore existing checkpoints")
 
-    p_config = sub.add_parser("config-validate", help="Validate configuration file")
-    p_config.add_argument("--config", default="config.yaml", help="Path to config file")
-    sub.add_parser("info", help="Print system information")
+    p_res = sub.add_parser("reserved-training", help="Wait for a free GPU, lock it, then train", parents=[sub_parent_parser])
+    p_res.add_argument("--fresh-start", action="store_true", help="Ignore existing checkpoints")
+    p_res.add_argument("--min-free-gb", type=float, default=50.0, help="Minimum free GPU memory to wait for (GB)")
+    p_res.add_argument("--reserve-gb", type=float, default=1.0, help="GPU memory to hold as reservation (GB)")
+    p_res.add_argument("--poll-interval", type=int, default=30, help="Seconds between GPU availability checks")
+    p_res.add_argument("--timeout", type=int, default=None, help="Max seconds to wait (default: forever)")
 
-    p_gen = sub.add_parser("generate", help="Generate code from a prompt")
+    p_config = sub.add_parser("config-validate", help="Validate configuration file", parents=[sub_parent_parser])
+    sub.add_parser("info", help="Print system information", parents=[sub_parent_parser])
+
+    p_gen = sub.add_parser("generate", help="Generate code from a prompt", parents=[sub_parent_parser])
     p_gen.add_argument("--prompt", type=str, help="Prompt text (or pipe to stdin)")
     p_gen.add_argument("--checkpoint", type=str, default="models/methos", help="Model checkpoint path")
     p_gen.add_argument("--tokenizer", type=str, default="models/tokenizer", help="Tokenizer path")
-    p_gen.add_argument("--config", default="config.yaml", help="Path to config file")
     p_gen.add_argument("--max-new-tokens", type=int, default=1024)
     p_gen.add_argument("--temperature", type=float, default=0.7)
     p_gen.add_argument("--top-k", type=int, default=40)
     p_gen.add_argument("--top-p", type=float, default=0.9)
 
-    p_test = sub.add_parser("test", help="Run the test suite")
+    p_test = sub.add_parser("test", help="Run the test suite", parents=[sub_parent_parser])
     p_test.add_argument("--filter", type=str, help="Filter tests by keyword (-k)")
 
-    p_dl = sub.add_parser("download-tokenizer", help="Download a tokenizer from HuggingFace Hub")
+    p_dl = sub.add_parser("download-tokenizer", help="Download a tokenizer from HuggingFace Hub", parents=[sub_parent_parser])
     p_dl.add_argument("--model-id", type=str, default="", help="HuggingFace model ID (default: from config)")
     p_dl.add_argument("--output", type=str, default="models/tokenizer", help="Output directory")
-    p_dl.add_argument("--config", default="config.yaml", help="Path to config file")
     p_dl.add_argument("--force", action="store_true", help="Overwrite existing tokenizer")
 
-    p_bench = sub.add_parser("benchmark", help="Run coding benchmarks")
+    p_bench = sub.add_parser("benchmark", help="Run coding benchmarks", parents=[sub_parent_parser])
     p_bench.add_argument("--checkpoint", type=str, default="models/methos", help="Model checkpoint path")
     p_bench.add_argument("--tokenizer", type=str, default="models/tokenizer", help="Tokenizer path")
-    p_bench.add_argument("--config", default="config.yaml", help="Path to config file")
     p_bench.add_argument("--benchmarks", type=str, default="human_eval,mbpp", help="Comma-separated benchmark names")
 
     return parser
 
 
+def _setup_signal_handlers() -> None:
+    import signal
+    def _handler(signum, frame):
+        print(f"\n[*] Received signal {signum}, shutting down...")
+        sys.exit(128 + signum)
+    signal.signal(signal.SIGINT, _handler)
+    signal.signal(signal.SIGTERM, _handler)
+
+
 def main() -> None:
+    _setup_signal_handlers()
     cmd_map = {
         "full-training": cmd_full_training,
+        "reserved-training": cmd_reserved_training,
         "config-validate": cmd_config_validate,
         "info": cmd_info,
         "generate": cmd_generate,
@@ -245,21 +435,6 @@ def main() -> None:
         rank = int(os.environ.get("LOCAL_RANK", "0"))
         if rank == 0:
             print(f"[*] Distributed mode with FSDP ({world_size} GPUs)")
-    else:
-        import subprocess
-        try:
-            out = subprocess.check_output(
-                ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
-                encoding="utf-8",
-            )
-            free_mems = [int(x) for x in out.strip().split("\n")]
-            best = free_mems.index(max(free_mems))
-            if free_mems[best] < 10000:
-                print(f"[!] Warning: best GPU only has {free_mems[best]}MB free.")
-            os.environ["CUDA_VISIBLE_DEVICES"] = str(best)
-            print(f"[*] Single-GPU: GPU {best} ({free_mems[best]}MB free)")
-        except Exception as e:
-            print(f"[!] GPU selection failed: {e}")
 
     parser = build_parser()
     args = parser.parse_args()

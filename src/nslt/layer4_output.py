@@ -187,24 +187,26 @@ class SparseOutputSynthesizer(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
+        chunk_size: int = 512,
     ) -> torch.Tensor:
         batch = x.shape[0]
 
         h = self.hidden_proj(x)
         gate_values, top_indices, _ = self.gate(x)
 
-        selected_embeddings = F.embedding(top_indices, self.output_embedding)
+        logits = torch.zeros(batch, self.vocab_size, device=x.device, dtype=x.dtype)
+        for start in range(0, batch, chunk_size):
+            end = min(start + chunk_size, batch)
+            h_chunk = h[start:end]
+            gate_chunk = gate_values[start:end]
+            top_chunk = top_indices[start:end]
 
-        selected_logits = torch.sum(
-            selected_embeddings * h.unsqueeze(1), dim=-1
-        ) / (self.logit_temperature.abs() + 0.1)
-
-        selected_logits = gate_values * selected_logits
-
-        logits = torch.zeros(
-            batch, self.vocab_size, device=x.device, dtype=x.dtype
-        )
-        logits.scatter_(1, top_indices, selected_logits)
+            selected_embeddings = F.embedding(top_chunk, self.output_embedding)
+            selected_logits = torch.sum(
+                selected_embeddings * h_chunk.unsqueeze(1), dim=-1
+            ) / (self.logit_temperature.abs() + 0.1)
+            selected_logits = gate_chunk * selected_logits
+            logits[start:end].scatter_(1, top_chunk, selected_logits)
 
         return logits
 
@@ -212,25 +214,31 @@ class SparseOutputSynthesizer(nn.Module):
         self,
         x: torch.Tensor,
         target_ids: torch.LongTensor,
+        chunk_size: int = 512,
     ) -> torch.Tensor:
-        batch = x.shape[0]
+        total = x.shape[0]
         h = self.hidden_proj(x)
-
-        target_emb = F.embedding(target_ids, self.output_embedding)
         gate_values, top_indices, _ = self.gate(x)
 
-        target_logit = torch.sum(target_emb * h, dim=-1) / (self.logit_temperature.abs() + 0.1)
+        log_probs_list = []
+        for start in range(0, total, chunk_size):
+            end = min(start + chunk_size, total)
+            x_chunk = x[start:end]
+            h_chunk = h[start:end]
+            target_chunk = target_ids[start:end]
+            gate_chunk = gate_values[start:end] if gate_values is not None else None
+            top_chunk = top_indices[start:end]
 
-        selected_embeddings = F.embedding(top_indices, self.output_embedding)
-        selected_logits = torch.sum(
-            selected_embeddings * h.unsqueeze(1), dim=-1
-        ) / (self.logit_temperature.abs() + 0.1)
+            target_emb = F.embedding(target_chunk, self.output_embedding)
+            target_logit = torch.sum(target_emb * h_chunk, dim=-1) / (self.logit_temperature.abs() + 0.1)
 
-        all_logits = torch.cat([
-            selected_logits,
-            target_logit.unsqueeze(1)
-        ], dim=-1)
+            selected_embeddings = F.embedding(top_chunk, self.output_embedding)
+            selected_logits = torch.sum(
+                selected_embeddings * h_chunk.unsqueeze(1), dim=-1
+            ) / (self.logit_temperature.abs() + 0.1)
 
-        log_probs = F.log_softmax(all_logits, dim=-1)
+            all_logits = torch.cat([selected_logits, target_logit.unsqueeze(1)], dim=-1)
+            log_probs = F.log_softmax(all_logits, dim=-1)
+            log_probs_list.append(log_probs[:, -1])
 
-        return log_probs[:, -1]
+        return torch.cat(log_probs_list, dim=0)
