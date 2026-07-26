@@ -45,11 +45,10 @@ class HierarchicalSSM(nn.Module):
         bb = B_bar * B_stacked
 
         h_t = h_init.transpose(0, 1).contiguous()
-        h_lvl_out = []
+        h_lvl_out = torch.empty(self.n_levels, batch, seq_len, h_t.shape[-1], device=device, dtype=x.dtype)
         for t in range(seq_len):
             h_t = A_bar[:, :, t, :] * h_t + bb[:, :, t, :]
-            h_lvl_out.append(h_t.unsqueeze(2))
-        h_lvl_out = torch.cat(h_lvl_out, dim=2)
+            h_lvl_out[:, :, t, :] = h_t
 
         h = h_t.transpose(0, 1)
         y = torch.einsum("lbtk,lbtk->lbt", C_stacked, h_lvl_out).unsqueeze(-1)

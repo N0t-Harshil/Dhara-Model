@@ -64,9 +64,10 @@ class HierarchicalPlanner(nn.Module):
         self.depth_proj = nn.Linear(d_model, max_depth)
         self.subgoal_nodes = nn.ModuleList([SubgoalNode(d_model) for _ in range(max_subgoals)])
 
-    def forward(self, context: torch.Tensor, task_type: torch.Tensor = None) -> dict:
+    def forward(self, context: torch.Tensor, task_type: torch.Tensor = None, max_subgoals: int = None) -> dict:
         batch = context.shape[0]
         device = context.device
+        max_subgoals = max_subgoals or self.max_subgoals
         context_pooled = context.mean(dim=1)
         goal_embeds = self.goal_embed.unsqueeze(0).expand(batch, -1, -1)
         goal_bias = self.goal_bias(context_pooled).unsqueeze(1)
@@ -84,6 +85,7 @@ class HierarchicalPlanner(nn.Module):
             tree_level = self.hierarchical_attn(refined)
             goal_tree.append(tree_level * depth_scale)
         hierarchical_goals = sum(goal_tree) / max(len(goal_tree), 1)
+        hierarchical_goals = hierarchical_goals[:, :max_subgoals, :]
         dependencies = torch.sigmoid(self.dependency_head(hierarchical_goals))
         exec_graph = self.execution_head(hierarchical_goals)
         execution_order = torch.argsort(self.order_head(hierarchical_goals).squeeze(-1), dim=-1)
@@ -93,7 +95,7 @@ class HierarchicalPlanner(nn.Module):
         active_mask = gate_scores > 0.3
 
         subgoal_details = []
-        for i in range(self.max_subgoals):
+        for i in range(max_subgoals):
             sg = self.subgoal_nodes[i](hierarchical_goals[:, i:i+1, :])
             subgoal_details.append({
                 "cost": sg["cost"],

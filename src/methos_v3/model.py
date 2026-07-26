@@ -256,7 +256,7 @@ class MethosV3Model(PreTrainedModel):
         n_steps = self.difficulty_router(intent.get("difficulty"))
         self.workspace.write("intent", mem_out, intent)
 
-        plan = self.planner(mem_out, intent.get("task_type"))
+        plan = self.planner(mem_out, intent.get("task_type"), max_subgoals=8 if self.training else None)
         self.workspace.write("plan", mem_out, plan)
 
         h_ctx = self.state_to_context(h_pooled)
@@ -283,7 +283,7 @@ class MethosV3Model(PreTrainedModel):
             world_out = self.world_model(mem_out)
             self.workspace.write("world_model", world_out["world_state"])
 
-        specialist_out = self.specialists(workspace_repr)
+        specialist_out = self.specialists(workspace_repr, n_debate_rounds=1 if self.training else None)
         consensus = specialist_out["consensus"]
         self.workspace.write("specialists", consensus)
 

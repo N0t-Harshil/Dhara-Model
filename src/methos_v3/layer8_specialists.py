@@ -64,10 +64,11 @@ class DebateSandbox(nn.Module):
         self.repair_gate = nn.Linear(d_hidden, 1)
         self.norm = nn.LayerNorm(d_hidden)
 
-    def forward(self, workspace: torch.Tensor) -> dict:
+    def forward(self, workspace: torch.Tensor, n_debate_rounds: int = None) -> dict:
         proposals = []
         confidences = []
         critique_scores = []
+        n_debate_rounds = n_debate_rounds if n_debate_rounds is not None else self.n_debate_rounds
 
         for expert in self.experts:
             prop, conf = expert(workspace)
@@ -76,7 +77,7 @@ class DebateSandbox(nn.Module):
         proposals_t = torch.cat(proposals, dim=1)
         conf_t = torch.cat(confidences, dim=-1)
 
-        for round_idx in range(self.n_debate_rounds):
+        for round_idx in range(n_debate_rounds):
             new_proposals = []
             for i, expert in enumerate(self.experts):
                 own_prop = proposals_t[:, i, :]
