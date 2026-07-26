@@ -107,17 +107,6 @@ class TrainingPipeline:
             self.model = self.model.to(self.dist.auto_device())
             torch.cuda.empty_cache()
 
-        # Compile only the SSM scan — safe for torch.compile
-        # Do NOT compile the full model (episodic memory uses dynamic
-        # indexing that triggers PyTorch 2.2 TensorAlias bug in AOT autograd)
-        try:
-            if hasattr(self.model, 'memory') and hasattr(self.model.memory, 'long_context'):
-                ssm = self.model.memory.long_context
-                ssm.forward = torch.compile(ssm.forward, mode="reduce-overhead", fullgraph=False)
-                logger.info("torch.compile applied to SSM only")
-        except Exception as e:
-            logger.warning("torch.compile SSM skipped: %s", e)
-
         self.model.train()
         self.data_pipeline = DataPipeline(self.cfg, self.tokenizer)
         self.alignment = AlignmentPipeline(self.model, self.tokenizer, self.cfg)
