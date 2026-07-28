@@ -6,6 +6,8 @@ import unittest
 from unittest.mock import MagicMock
 
 from src.trainer import ModelTrainer
+from src.training.pipeline import TrainingPipeline
+from src.config.schema import Config
 
 
 class _TinyTokenizer:
@@ -63,6 +65,16 @@ class TestTrainerPreprocessing(unittest.TestCase):
 
         self.assertIn("Answer the following request", prompt)
         self.assertNotIn("Write a text solution", prompt)
+
+    def test_resolves_adamw_fused_to_safe_optimizer_for_fsdp(self):
+        cfg = Config()
+        pipeline = TrainingPipeline(cfg)
+        stage_cfg = cfg.training.pretrain
+        base_args = {"fsdp": "full_shard auto_wrap"}
+
+        optim_name = pipeline._resolve_optimizer_name(stage_cfg, base_args, {})
+
+        self.assertEqual(optim_name, "adamw_torch")
 
 
 if __name__ == "__main__":
