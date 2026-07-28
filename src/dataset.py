@@ -88,7 +88,7 @@ class SpecializedDataset:
         for item in data:
             problem = item.get("problem")
             if not problem:
-                problem = item.get("instruction", "")
+                problem = item.get("instruction") or ""
                 inp = item.get("input", "")
                 if inp:
                     problem = f"{problem}\n{inp}"
@@ -951,7 +951,7 @@ class LRUCache {
         ds.add_javascript_examples()
         
         # Also load from combined_dataset.json if it exists to get HF data
-        combined_path = Path("data/combined_dataset.json")
+        combined_path = Path(__file__).resolve().parent.parent / "data" / "combined_dataset.json"
         if combined_path.exists():
             logger.info("Loading additional examples from %s", combined_path)
             extra_ds = cls.load_from_json(combined_path)

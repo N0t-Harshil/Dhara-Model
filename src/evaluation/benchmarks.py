@@ -47,10 +47,12 @@ class HumanEvalBenchmark(BaseBenchmark):
 
     def run(self, model: PreTrainedModel, tokenizer: PreTrainedTokenizerBase, max_new_tokens: int = 512, **kwargs) -> BenchmarkResult:
         problems = self._get_problems()
+        limit = kwargs.get("limit", len(problems))
+        problems = problems[:limit]
         passed = 0
         start = time.time()
 
-        for problem in problems[:kwargs.get("limit", len(problems))]:
+        for problem in problems:
             prompt = f"### Instruction\nWrite a python solution for:\n{problem['prompt']}\n\n### Response\n"
             inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
             with torch.no_grad():
@@ -88,14 +90,15 @@ class HumanEvalBenchmark(BaseBenchmark):
         if not code or not test:
             return False
         try:
-            with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, encoding="utf-8") as f:
-                f.write(code + "\n" + test)
-                f.flush()
-                result = subprocess.run(
-                    ["python", f.name],
-                    capture_output=True, text=True, timeout=10,
-                )
-            Path(f.name).unlink(missing_ok=True)
+            f = tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, encoding="utf-8")
+            f.write(code + "\n" + test)
+            f.close()
+            fname = f.name
+            result = subprocess.run(
+                ["python", fname],
+                capture_output=True, text=True, timeout=10,
+            )
+            Path(fname).unlink(missing_ok=True)
             return result.returncode == 0
         except Exception:
             return False
@@ -107,7 +110,9 @@ class MBPPBenchmark(BaseBenchmark):
 
     def run(self, model: PreTrainedModel, tokenizer: PreTrainedTokenizerBase, **kwargs) -> BenchmarkResult:
         passed = 0
-        problems = self._get_problems()[:kwargs.get("limit", len(self._get_problems()))]
+        problems = self._get_problems()
+        limit = kwargs.get("limit", len(problems))
+        problems = problems[:limit]
         start = time.time()
 
         for problem in problems:
@@ -121,7 +126,7 @@ class MBPPBenchmark(BaseBenchmark):
                 passed += 1
 
         elapsed = time.time() - start
-        return BenchmarkResult(self.name, passed / max(len(problems), 1), {
+        return BenchmarkResult(self.name, passed / max(len(problems), 1) if len(problems) > 0 else 0.0, {
             "passed": passed, "total": len(problems), "time_seconds": elapsed,
         })
 
@@ -134,11 +139,12 @@ class MBPPBenchmark(BaseBenchmark):
     @staticmethod
     def _test_code(code: str, test_list: List[str]) -> bool:
         try:
-            with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, encoding="utf-8") as f:
-                f.write(code + "\n" + "\n".join(test_list))
-                f.flush()
-                result = subprocess.run(["python", f.name], capture_output=True, text=True, timeout=10)
-            Path(f.name).unlink(missing_ok=True)
+            f = tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, encoding="utf-8")
+            f.write(code + "\n" + "\n".join(test_list))
+            f.close()
+            fname = f.name
+            result = subprocess.run(["python", fname], capture_output=True, text=True, timeout=10)
+            Path(fname).unlink(missing_ok=True)
             return result.returncode == 0
         except Exception:
             return False
@@ -288,8 +294,14 @@ class GSM8KBenchmark(BaseBenchmark):
 
     @staticmethod
     def _extract_answer(text: str) -> Optional[float]:
-        nums = re.findall(r"-?\d+\.?\d*", text.replace(",", ""))
-        return float(nums[-1]) if nums else None
+        text_clean = text.replace(",", "").strip()
+        answer_match = re.search(r"(?:Answer|result|value|is)\s*:?\s*(-?\d+\.?\d*)", text_clean, re.IGNORECASE)
+        if answer_match:
+            return float(answer_match.group(1))
+        nums = re.findall(r"-?\d+\.?\d*", text_clean)
+        if nums:
+            return float(nums[-1])
+        return None
 
 
 class TruthfulQABenchmark(BaseBenchmark):

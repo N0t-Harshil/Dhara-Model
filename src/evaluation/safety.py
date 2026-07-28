@@ -44,7 +44,8 @@ class SafetyEvaluator:
 
     @torch.no_grad()
     def _query(self, prompt: str) -> str:
-        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
+        max_len = getattr(self.model.config, "max_position_embeddings", 2048) - self.max_new_tokens
+        inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=max_len).to(self.model.device)
         outputs = self.model.generate(
             **inputs,
             max_new_tokens=self.max_new_tokens,

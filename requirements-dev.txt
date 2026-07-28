@@ -1,0 +1,35 @@
+# =============================================================================
+# Methos Class Model — Windows Development Dependencies (no GPU)
+# =============================================================================
+# Install on Windows PC for editing / static analysis / unit tests that
+# do NOT require a GPU or torch CUDA builds:
+#
+#   pip install -r requirements-dev.txt
+#
+# For full GPU training on JupyterLab server use:
+#   pip install -r requirements.txt
+# =============================================================================
+
+# Config & validation
+pyyaml
+pydantic>=2.0.0
+
+# Testing
+pytest>=7.0
+
+# Progress bars
+tqdm
+
+# Graph utilities (knowledge graph)
+networkx
+
+# PEFT / LoRA (CPU-safe, no CUDA build required)
+peft
+
+# Transformers (CPU inference + tokenizer utilities)
+transformers>=4.43.0
+datasets>=2.14.4
+
+# Tokenizer backend
+tokenizers>=0.19.1
+sentencepiece

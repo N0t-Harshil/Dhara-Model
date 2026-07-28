@@ -1,0 +1,15 @@
+=====================================================================
+  PARAMETER AUDIT REPORT -- Methos Class Model (Small) (methos_v3)
+=====================================================================
+Config File:             config_small.yaml
+Vocab Size:              128,000
+Hidden Size:             576
+Total Parameters:        173,098,368 (173.10 M)
+Token Embedding Params:  73,728,000 (73.73 M)
+Embedding Share:         42.59% of total model
+---------------------------------------------------------------------
+[WARNING] Embedding parameters account for > 40% of total model size!
+   Currently 42.6%. Consider:
+   1. Reducing vocab_size in config (e.g. 128,000 -> 32,000)
+   2. Setting tie_word_embeddings: true
+=====================================================================

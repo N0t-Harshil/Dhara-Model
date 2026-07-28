@@ -90,9 +90,12 @@ class GraphMemory:
             return "No previous memory available."
 
         # 1. Semantic Search in Vector DB
+        n_results = min(top_k_nodes, self.collection.count())
+        if n_results <= 0:
+            return "No relevant memory found."
         results = self.collection.query(
             query_texts=[query],
-            n_results=min(top_k_nodes, self.collection.count())
+            n_results=n_results,
         )
         
         if not results['ids'] or not results['ids'][0]:

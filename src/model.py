@@ -58,6 +58,7 @@ class SpecializedCoderModel:
                 device = "cpu"
             self.model = self.model.to(device)
         if hasattr(self.model, "config"):
+            self._orig_use_cache = getattr(self.model.config, "use_cache", True)
             self.model.config.use_cache = False
         logger.info("Model initialized with %s parameters.",
                     f"{sum(p.numel() for p in self.model.parameters()):,}")
@@ -107,7 +108,7 @@ class SpecializedCoderModel:
     ) -> str:
         if self.model is None or self.tokenizer is None:
             raise RuntimeError("Model not loaded. Call load_base_model() first.")
-        config_max = self.config_dict.get("generation", {}).get("max_new_tokens", 8192)
+        config_max = int(self.config_dict.get("generation", {}).get("max_new_tokens", 8192))
         max_new_tokens = min(max_new_tokens, config_max)
         prompt = (
             f"### Instruction\n"
@@ -120,8 +121,6 @@ class SpecializedCoderModel:
         eos_ids = []
         if self.tokenizer.eos_token_id is not None:
             eos_ids.append(self.tokenizer.eos_token_id)
-        if self.tokenizer.pad_token_id is not None and self.tokenizer.pad_token_id not in eos_ids:
-            eos_ids.append(self.tokenizer.pad_token_id)
         gen_kwargs = dict(
             max_new_tokens=max_new_tokens,
             temperature=temperature,
@@ -130,6 +129,7 @@ class SpecializedCoderModel:
             do_sample=temperature > 0,
             repetition_penalty=self.config_dict.get("generation", {}).get("repetition_penalty", 1.1),
             pad_token_id=self.tokenizer.pad_token_id,
+            use_cache=getattr(self, "_orig_use_cache", True),
         )
         if eos_ids:
             gen_kwargs["eos_token_id"] = eos_ids
@@ -151,7 +151,8 @@ class SpecializedCoderModel:
             self.model.save_pretrained(path, safe_serialization=True)
         else:
             torch.save(self.model.state_dict(), str(path / "pytorch_model.bin"))
-        self.tokenizer.save_pretrained(path)
+        if self.tokenizer is not None:
+            self.tokenizer.save_pretrained(path)
         logger.info("Model saved to %s", path)
 
     def print_trainable_parameters(self) -> None:
@@ -160,7 +161,7 @@ class SpecializedCoderModel:
             return
         trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         all_param = sum(p.numel() for p in self.model.parameters())
-        print(f"trainable params: {trainable:,} || all params: {all_param:,} || trainable%: {100 * trainable / all_param:.4f}")
+        print(f"trainable params: {trainable:,} || all params: {all_param:,} || trainable%: {100 * trainable / max(all_param, 1):.4f}")
 
     @property
     def is_ready(self) -> bool:

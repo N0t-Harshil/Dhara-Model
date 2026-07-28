@@ -142,9 +142,6 @@ class LatentSandbox(nn.Module):
         # Energy function (learned)
         self.energy_fn = EnergyFunction(d_hidden=d_hidden, d_latent=d_latent)
 
-        # Cross-attention projection for context conditioning
-        self.context_proj = nn.Linear(d_hidden, d_hidden, bias=False)
-
         # Output projection
         self.out_proj = nn.Linear(d_hidden, d_hidden, bias=False)
 
@@ -166,9 +163,6 @@ class LatentSandbox(nn.Module):
         batch = z_ltc.shape[0]
         device = z_ltc.device
         dtype = z_ltc.dtype
-
-        # Project LTC output for context conditioning
-        context = self.context_proj(z_ltc)  # [batch, d_hidden]
 
         # Initialize K parallel trajectories by perturbing the LTC state
         # [batch, K, d_hidden]
@@ -260,8 +254,6 @@ class LatentSandboxEfficient(LatentSandbox):
         device = z_ltc.device
         dtype = z_ltc.dtype
 
-        context = self.context_proj(z_ltc)
-
         # Initialize best state
         z_best_all = torch.zeros(batch, self.d_hidden, device=device, dtype=dtype)
 
@@ -271,9 +263,10 @@ class LatentSandboxEfficient(LatentSandbox):
             # Initialize K trajectories
             z_k = z_single.expand(self.n_trajectories, -1).clone()
             z_k = z_k + self.noise_scale * torch.randn_like(z_k)
-            z_k.requires_grad_(True)
-
             for step in range(self.n_sim_steps):
+                z_k = z_k.detach()
+                z_k.requires_grad_(True)
+
                 energy, grad = self.energy_fn(z_k)
 
                 with torch.no_grad():
@@ -288,7 +281,6 @@ class LatentSandboxEfficient(LatentSandbox):
                             z_k[k] = z_best + self.noise_scale * torch.randn(
                                 self.d_hidden, device=device, dtype=dtype
                             )
-                    z_k.requires_grad_(True)
 
             # Select best
             with torch.no_grad():

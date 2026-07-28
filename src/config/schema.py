@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import yaml
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Any, Dict, List, Literal, Optional
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 
@@ -14,32 +14,44 @@ class RopeScalingConfig(BaseModel):
 
 
 class MoEConfig(BaseModel):
-    num_experts: int = 8
-    top_k: int = 2
+    num_experts: int = Field(default=8, ge=1)
+    top_k: int = Field(default=2, ge=1)
     expert_capacity: Optional[int] = None
-    shared_expert_count: int = 1
+    shared_expert_count: int = Field(default=1, ge=0)
     shared_expert_gate: bool = True
     norm_topk_prob: bool = True
     output_router_logits: bool = False
-    aux_loss_coef: float = 0.01
-    jitter_noise: float = 0.0
-    router_aux_loss_coef: float = 0.001
+    aux_loss_coef: float = Field(default=0.01, ge=0.0)
+    jitter_noise: float = Field(default=0.0, ge=0.0)
+    router_aux_loss_coef: float = Field(default=0.001, ge=0.0)
+
+    @model_validator(mode="after")
+    def validate_top_k(self) -> "MoEConfig":
+        if self.top_k > self.num_experts:
+            raise ValueError(f"top_k ({self.top_k}) cannot exceed num_experts ({self.num_experts})")
+        return self
 
 
 class VisionConfig(BaseModel):
     enabled: bool = False
     vision_encoder: str = "google/siglip-so400m-patch14-384"
-    image_size: int = 384
-    patch_size: int = 14
-    vision_hidden_size: int = 1152
-    num_vision_layers: int = 27
-    num_attention_heads: int = 16
-    intermediate_size: int = 4304
-    projection_dim: int = 5120
+    image_size: int = Field(default=384, ge=1)
+    patch_size: int = Field(default=14, ge=1)
+    vision_hidden_size: int = Field(default=1152, ge=1)
+    num_vision_layers: int = Field(default=27, ge=1)
+    num_attention_heads: int = Field(default=16, ge=1)
+    intermediate_size: int = Field(default=4304, ge=1)
+    projection_dim: int = Field(default=5120, ge=1)
     freeze_vision_encoder: bool = True
     tie_vision_embeddings: bool = False
-    image_token_id: Optional[int] = 128000
-    max_images_per_sample: int = 5
+    image_token_id: Optional[int] = Field(default=128000, ge=0)
+    max_images_per_sample: int = Field(default=5, ge=1)
+
+    @model_validator(mode="after")
+    def validate_image_size(self) -> "VisionConfig":
+        if self.enabled and self.image_size % self.patch_size != 0:
+            raise ValueError(f"image_size ({self.image_size}) must be evenly divisible by patch_size ({self.patch_size})")
+        return self
 
 
 class MultimodalConfig(BaseModel):
@@ -59,31 +71,100 @@ class NSLTConfig(BaseModel):
     sparsity_pct: float = 1.0
 
 
+class MethosV3Config(BaseModel):
+    """MethosV3 architecture parameters."""
+    d_state: int = Field(default=4096, ge=1)
+    d_hidden: int = Field(default=10240, ge=1)
+    n_ssm_layers: int = Field(default=6, ge=1)
+    n_hssm_levels: int = Field(default=3, ge=1)
+    n_ode_steps: int = Field(default=8, ge=1)
+    n_trajectories: int = Field(default=7, ge=1)
+    n_sim_steps: int = Field(default=16, ge=1)
+    use_efficient_sandbox: bool = True
+    sparsity_pct: float = Field(default=1.0, ge=0.0, le=1.0)
+    n_token_categories: int = Field(default=8, ge=1)
+    n_languages: int = Field(default=16, ge=1)
+    n_doc_roles: int = Field(default=8, ge=1)
+    n_task_types: int = Field(default=8, ge=1)
+    n_difficulty_levels: int = Field(default=5, ge=1)
+    n_reasoning_types: int = Field(default=8, ge=1)
+    max_subgoals: int = Field(default=64, ge=1)
+    n_domains: int = Field(default=5, ge=1)
+    max_reasoning_steps: int = Field(default=32, ge=1)
+    n_semantic_concepts: int = Field(default=4096, ge=1)
+    working_mem_capacity: int = Field(default=512, ge=1)
+    max_episodes: int = Field(default=256, ge=1)
+    n_context_adapter_blocks: int = Field(default=4, ge=1)
+    n_language_groups: int = Field(default=8, ge=1)
+    adaptive_top_k_min: int = Field(default=32, ge=1)
+    adaptive_top_k_max: int = Field(default=2048, ge=1)
+    n_experts: int = Field(default=7, ge=1)
+    n_debate_rounds: int = Field(default=3, ge=1)
+    max_refinement_passes: int = Field(default=5, ge=1)
+    max_repair_iters: int = Field(default=3, ge=1)
+    max_entities: int = Field(default=64, ge=1)
+    n_relation_types: int = Field(default=16, ge=1)
+    max_events: int = Field(default=32, ge=1)
+    n_tool_types: int = Field(default=4, ge=1)
+    enable_executive: bool = True
+    enable_world_model: bool = True
+    enable_learning_controller: bool = True
+    enable_tools: bool = True
+    enable_curiosity: bool = True
+    enable_aux_losses: bool = True
+    executive_gate_threshold: float = Field(default=0.3, ge=0.0, le=1.0)
+    qa_max_passes: int = Field(default=5, ge=1)
+    qa_converge_threshold: float = Field(default=0.05, ge=0.0, le=1.0)
+    loss_weights: Optional[Dict[str, float]] = None
+
+    @model_validator(mode="after")
+    def validate_top_k_range(self) -> "MethosV3Config":
+        if self.adaptive_top_k_min > self.adaptive_top_k_max:
+            raise ValueError(f"adaptive_top_k_min ({self.adaptive_top_k_min}) cannot exceed adaptive_top_k_max ({self.adaptive_top_k_max})")
+        return self
+
+
 class ModelArchitectureConfig(BaseModel):
-    model_type: Literal["llama", "mixtral", "qwen2_moe", "deepseek_v2", "nslt"] = "nslt"
-    hidden_size: int = 7168
-    num_hidden_layers: int = 56
-    num_attention_heads: int = 56
-    num_key_value_heads: int = 8
-    intermediate_size: int = 18432
+    model_type: Literal["llama", "mixtral", "qwen2_moe", "deepseek_v2", "nslt", "methos_v3"] = "nslt"
+    hidden_size: int = Field(default=7168, ge=1)
+    num_hidden_layers: int = Field(default=56, ge=1)
+    num_attention_heads: int = Field(default=56, ge=1)
+    num_key_value_heads: int = Field(default=8, ge=1)
+    intermediate_size: int = Field(default=18432, ge=1)
     moe: MoEConfig = Field(default_factory=MoEConfig)
     nslt: NSLTConfig = Field(default_factory=NSLTConfig)
+    methos_v3: MethosV3Config = Field(default_factory=MethosV3Config)
     multimodal: MultimodalConfig = Field(default_factory=MultimodalConfig)
-    max_position_embeddings: int = 16384
-    rope_theta: float = 10000000.0
+    max_position_embeddings: int = Field(default=16384, ge=1)
+    rope_theta: float = Field(default=10000000.0, ge=0.0)
     rope_scaling: Optional[RopeScalingConfig] = None
     attention_implementation: Literal["sdpa", "flash_attention_2", "eager"] = "flash_attention_2"
     tie_word_embeddings: bool = False
     attention_bias: bool = False
-    attention_dropout: float = 0.0
-    hidden_act: str = "silu"
-    rms_norm_eps: float = 1e-6
-    initializer_range: float = 0.02
-    pretraining_tp: int = 1
+    attention_dropout: float = Field(default=0.0, ge=0.0, le=1.0)
+    hidden_act: Literal["silu", "gelu", "relu", "swish"] = "silu"
+    rms_norm_eps: float = Field(default=1e-6, ge=1e-12)
+    initializer_range: float = Field(default=0.02, ge=0.0)
+    pretraining_tp: int = Field(default=1, ge=1)
     mlp_bias: bool = False
     gradient_checkpointing: bool = True
+    activation_checkpointing: Optional[bool] = None
     use_compile: bool = False
-    vocab_size: int = 128000
+    vocab_size: int = Field(default=128000, ge=1)
+
+    @model_validator(mode="after")
+    def validate_kv_heads(self) -> "ModelArchitectureConfig":
+        if self.num_key_value_heads > self.num_attention_heads:
+            raise ValueError(
+                f"num_key_value_heads ({self.num_key_value_heads}) cannot exceed "
+                f"num_attention_heads ({self.num_attention_heads})"
+            )
+        if self.num_attention_heads % self.num_key_value_heads != 0:
+            raise ValueError(
+                f"num_attention_heads ({self.num_attention_heads}) must be divisible by "
+                f"num_key_value_heads ({self.num_key_value_heads})"
+            )
+        return self
 
 
 class ModelConfig(BaseModel):
@@ -94,6 +175,12 @@ class ModelConfig(BaseModel):
     architecture: ModelArchitectureConfig = Field(default_factory=ModelArchitectureConfig)
     load_in_8bit: bool = False
     load_in_4bit: bool = False
+
+    @model_validator(mode="after")
+    def validate_loading(self) -> "ModelConfig":
+        if self.load_in_8bit and self.load_in_4bit:
+            raise ValueError("load_in_8bit and load_in_4bit cannot both be enabled")
+        return self
 
 
 class DPOConfig(BaseModel):
@@ -230,7 +317,7 @@ class TrainingConfig(BaseModel):
 class FSDPConfig(BaseModel):
     enabled: bool = True
     sharding_strategy: Literal["full_shard", "hybrid_shard", "no_shard"] = "full_shard"
-    transformer_layer_cls: str = "NSLTModel"
+    transformer_layer_cls: str = "MethosV3Model"
     backward_prefetch: Literal["backward_pre", "backward_post", "no_prefetch"] = "backward_pre"
     forward_prefetch: bool = True
     activation_checkpointing: bool = True
@@ -238,6 +325,7 @@ class FSDPConfig(BaseModel):
     sync_module_states: bool = True
     limit_all_gathers: bool = True
     mixed_precision: Literal["bf16", "fp16", "fp32"] = "bf16"
+    cpu_offload: bool = False
 
 
 class DeepSpeedConfig(BaseModel):
@@ -251,11 +339,17 @@ class DistributedConfig(BaseModel):
     fsdp: FSDPConfig = Field(default_factory=FSDPConfig)
     deepspeed: Optional[DeepSpeedConfig] = None
 
+    @model_validator(mode="after")
+    def validate_deepspeed(self) -> "DistributedConfig":
+        if self.strategy == "deepspeed" and self.deepspeed is None:
+            raise ValueError("deepspeed config is required when strategy is 'deepspeed'")
+        return self
+
 
 class DedupConfig(BaseModel):
     enabled: bool = True
     method: Literal["exact", "minhash", "embedding"] = "minhash"
-    threshold: float = 0.85
+    threshold: float = Field(default=0.85, ge=0.0, le=1.0)
 
 
 class ContaminationConfig(BaseModel):
@@ -365,18 +459,16 @@ class OutputConfig(BaseModel):
 
 
 class GenerationConfig(BaseModel):
-    max_new_tokens: int = 32768
-    temperature: float = 0.7
-    top_p: float = 0.9
-    top_k: int = 40
-    repetition_penalty: float = 1.05
+    max_new_tokens: int = Field(default=32768, ge=1)
+    temperature: float = Field(default=0.7, ge=0.0)
+    top_p: float = Field(default=0.9, ge=0.0, le=1.0)
+    top_k: int = Field(default=40, ge=0)
+    repetition_penalty: float = Field(default=1.05, ge=0.0)
     do_sample: bool = True
-    num_beams: int = 1
+    num_beams: int = Field(default=1, ge=1)
 
 
-class MMLUConfig(BaseModel):
-    subset: Optional[str] = None
-    num_few_shot: int = 5
+# MMLU benchmark config is handled by BenchmarkEntry below
 
 
 class BenchmarkEntry(BaseModel):

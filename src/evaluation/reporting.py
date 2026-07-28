@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -25,7 +25,7 @@ class EvaluationReport:
     ) -> Dict[str, Any]:
         report: Dict[str, Any] = {
             "model_name": model_name,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "benchmarks": {
                 r.name: {
                     "score": r.score,
@@ -45,7 +45,7 @@ class EvaluationReport:
             "total_benchmarks": len(benchmark_results),
         }
 
-        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         report_path = self.report_dir / f"eval_{timestamp}.json"
         report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
 

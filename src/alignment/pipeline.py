@@ -49,7 +49,7 @@ class AlignmentPipeline:
         self.tokenizer = tokenizer
         self.cfg = cfg
         self.ref_model = ref_model
-        self.device = torch.cuda.current_device() if torch.cuda.is_available() else torch.device("cpu")
+        self.device = torch.device(f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu")
 
         self.constitutional = ConstitutionalTrainer(
             model=model,
@@ -162,6 +162,8 @@ class AlignmentPipeline:
                 results["simpo"] = self.run_simpo(preference_dataset)
             elif method == "kto":
                 results["kto"] = self.run_kto(kto_dataset or preference_dataset)
+            else:
+                logger.warning("Unknown alignment method: %s", method)
         return results
 
     def run_safety_training(
@@ -174,6 +176,7 @@ class AlignmentPipeline:
         losses = []
         refusal_rate = 0.0
         total = 0
+        refused_count = 0
 
         for step in range(num_steps):
             probe = random.choice(HARMLESSNESS_PROBES)
@@ -181,7 +184,6 @@ class AlignmentPipeline:
             prompt = f"### Instruction\n{probe}\n\n### Response\n{refusal}"
             inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=self.cfg.training.max_seq_length)
             labels = inputs["input_ids"].clone()
-            # Mask prompt tokens for response-only loss
             prompt_len = len(self.tokenizer(f"### Instruction\n{probe}\n\n### Response\n")["input_ids"])
             labels[:, :prompt_len] = -100
             inputs = {k: v.to(self.device) for k, v in inputs.items()}
@@ -200,6 +202,16 @@ class AlignmentPipeline:
             if (step + 1) % 100 == 0:
                 avg_loss = sum(losses[-100:]) / 100
                 logger.info("Safety training step %d/%d: loss=%.4f", step + 1, num_steps, avg_loss)
+
+            with torch.no_grad():
+                probe_inputs = self.tokenizer(f"### Instruction\n{probe}\n\n### Response\n", return_tensors="pt").to(self.device)
+                probe_outputs = self.model.generate(**probe_inputs, max_new_tokens=50, do_sample=False)
+                probe_response = self.tokenizer.decode(probe_outputs[0][probe_inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+                refused = any(r.lower() in probe_response.lower() for r in ["cannot", "not able", "sorry", "safety", "guidelines", "unable"])
+                if refused:
+                    refused_count += 1
+
+        refusal_rate = refused_count / max(total, 1)
 
         avg_loss = sum(losses) / max(len(losses), 1)
         logger.info("Safety training complete. Avg loss=%.4f", avg_loss)
@@ -249,27 +261,24 @@ class AlignmentPipeline:
         cumulative = {"loss": 0.0, "accuracy": 0.0}
 
         self.model.train()
-        while step < total_steps:
-            for batch in loader:
-                if step >= total_steps:
-                    break
-                chosen_ids = batch["chosen_input_ids"].to(self.device)
-                chosen_mask = batch["chosen_attention_mask"].to(self.device)
-                chosen_labels = batch["chosen_labels"].to(self.device)
-                rejected_ids = batch["rejected_input_ids"].to(self.device)
-                rejected_mask = batch["rejected_attention_mask"].to(self.device)
-                rejected_labels = batch["rejected_labels"].to(self.device)
+        from itertools import cycle, islice
+        for step, batch in islice(enumerate(cycle(loader)), total_steps):
+            chosen_ids = batch["chosen_input_ids"].to(self.device)
+            chosen_mask = batch["chosen_attention_mask"].to(self.device)
+            chosen_labels = batch["chosen_labels"].to(self.device)
+            rejected_ids = batch["rejected_input_ids"].to(self.device)
+            rejected_mask = batch["rejected_attention_mask"].to(self.device)
+            rejected_labels = batch["rejected_labels"].to(self.device)
 
-                metrics = trainer.train_step(
-                    chosen_ids, chosen_mask, chosen_labels,
-                    rejected_ids, rejected_mask, rejected_labels,
-                )
-                for k, v in metrics.items():
-                    cumulative[k] = cumulative.get(k, 0.0) + v
-                step += 1
+            metrics = trainer.train_step(
+                chosen_ids, chosen_mask, chosen_labels,
+                rejected_ids, rejected_mask, rejected_labels,
+            )
+            for k, v in metrics.items():
+                cumulative[k] = cumulative.get(k, 0.0) + v
 
-                if step % 10 == 0:
-                    logger.info("%s Step %d/%d: loss=%.4f acc=%.4f", name, step, total_steps, metrics["loss"], metrics.get("accuracy", 0.0))
+            if step % 10 == 0:
+                logger.info("%s Step %d/%d: loss=%.4f acc=%.4f", name, step, total_steps, metrics["loss"], metrics.get("accuracy", 0.0))
 
         for k in cumulative:
             cumulative[k] /= max(step, 1)
