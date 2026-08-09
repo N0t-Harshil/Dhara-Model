@@ -92,6 +92,22 @@ class TestConfigValidation:
         assert arch.tie_word_embeddings is False
         assert arch.hidden_act == "silu"
 
+    def test_estimate_model_size_accepts_tokenizer_or_vocab(self):
+        from src.models.factory import ModelFactory
+
+        cfg = Config()
+        arch = cfg.model.architecture
+        size_by_arch = ModelFactory.estimate_model_size(arch)
+        assert "total_params_b" in size_by_arch
+
+        # Ensure backward-compatible keyword argument is accepted.
+        dummy_vocab_size = 50000
+        estimate_with_vocab = ModelFactory.estimate_model_size(
+            arch,
+            tokenizer_or_vocab=dummy_vocab_size,
+        )
+        assert estimate_with_vocab["total_params_b"] < size_by_arch["total_params_b"]
+
     def test_distributed_config(self):
         cfg = Config()
         assert cfg.distributed.strategy == "fsdp"
