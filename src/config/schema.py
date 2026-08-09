@@ -605,6 +605,17 @@ class DataConfig(BaseModel):
     # Override for the persistent preprocessing process pool size (defaults to
     # min(32, cpu_count)). The pool is created once and terminated on exit.
     cleanup_pool_size: Optional[int] = None
+    async_pipeline: AsyncPipelineConfig = Field(default_factory=lambda: AsyncPipelineConfig())
+
+
+class AsyncPipelineConfig(BaseModel):
+    enabled: bool = True
+    prefetch_depth: int = Field(default=2, ge=1)
+    ready_queue_size: int = Field(default=2, ge=1)
+    preprocess_workers: int = Field(default=4, ge=1)
+    metadata_workers: int = Field(default=2, ge=1)
+    max_inflight: int = Field(default=4, ge=1)
+    retry_count: int = Field(default=3, ge=0)
 
 
 class TokenizerConfig(BaseModel):

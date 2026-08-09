@@ -389,7 +389,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_full = sub.add_parser("full-training", help="Run full training (pretrain -> SFT -> instruction tuning)", parents=[sub_parent_parser])
-    p_full.add_argument("--fresh-start", action="action_true" if False else "store_true", help="Ignore existing checkpoints")
+    p_full.add_argument("--fresh-start", action="store_true", help="Ignore existing checkpoints")
 
     p_res = sub.add_parser("reserved-training", help="Wait for a free GPU, lock it, then train", parents=[sub_parent_parser])
     p_res.add_argument("--fresh-start", action="store_true", help="Ignore existing checkpoints")

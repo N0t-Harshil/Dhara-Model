@@ -315,7 +315,6 @@ class TrainingPipeline:
                         steps_this_stage = stage.max_steps - prev_max
                         if steps_this_stage <= 0:
                             continue
-                        filtered_datasets = self.data_pipeline.get_active_datasets_for_stage(stage)
                         dataset = self.data_pipeline.build_pretrain_dataset_from_registry(
                             dataset_filter=stage.dataset_filter,
                         )
@@ -633,14 +632,27 @@ class TrainingPipeline:
                             continue
 
                         t_unit = time.perf_counter()
+                        gpu_wait_sec = 0.0
+                        prep_timing = {}
                         try:
-                            dataset, umeta = prefetch.get(iter_k) if prefetch is not None \
-                                else self.data_pipeline.build_pretrain_dataset_unit(
+                            if prefetch is not None:
+                                res = prefetch.get(iter_k)
+                                if isinstance(res, tuple) and len(res) == 3:
+                                    res_payload, gpu_wait_sec, prep_timing = res
+                                    if isinstance(res_payload, tuple):
+                                        dataset, umeta = res_payload
+                                    else:
+                                        dataset, umeta = res_payload, {}
+                                else:
+                                    dataset, umeta = res, {}
+                            else:
+                                dataset, umeta = self.data_pipeline.build_pretrain_dataset_unit(
                                     u, i, j, len(units))
                             build_exc = None
                         except Exception as e:
                             dataset, umeta, build_exc = None, None, e
                         build_sec = time.perf_counter() - t_unit
+                        logger.info("[ASYNC] GPU wait before dataset %d = %.2f sec", k + 1, gpu_wait_sec)
 
                         if build_exc is not None:
                             stage_stats["failed"] += 1
@@ -670,6 +682,7 @@ class TrainingPipeline:
                         stage_stats["build_sec"] += build_sec
                         if cache_hit:
                             stage_stats["hits"] += 1
+                            logger.info("[ASYNC] unit %d cache hit — ready immediately", k + 1)
                         logger.info("[TIMER] unit %d/%d dataset ready: %.1fs, %d samples (%d steps)%s",
                                     j, len(units), time.perf_counter() - t_unit, len(dataset),
                                     item["steps"], " [cache hit]" if cache_hit else "")
@@ -709,11 +722,13 @@ class TrainingPipeline:
                         boundary = StageBoundaryCallback(j, len(units), f"{name} — {u_name}", unit_end)
                         trainer.add_callback(boundary)
                         t_train = time.perf_counter()
+                        logger.info("[ASYNC] dataset %d training start", k + 1)
                         try:
                             result = trainer.train(resume_from_checkpoint=resume_checkpoint)
                         finally:
                             trainer.remove_callback(boundary)
                         train_sec = time.perf_counter() - t_train
+                        logger.info("[ASYNC] dataset %d training end", k + 1)
                         metrics = result.metrics if hasattr(result, "metrics") else {}
                         stage_stats["train_sec"] += train_sec
                         stage_stats["steps"] += item["steps"]
@@ -844,6 +859,28 @@ class TrainingPipeline:
             (final_step / total_steps * 100) if total_steps > 0 else 0.0,
             run_tokens / 1e6, gb, self._fmt_dur(time.perf_counter() - run_t0))
         logger.info("=" * 70)
+
+        # Final ASYNC PIPELINE REPORT
+        tm_snap = self.telemetry.snapshot()
+        gpu_wait = tm_snap.get("total_gpu_wait_sec", 0.0)
+        train_time = tm_snap.get("total_train_sec", 0.0)
+        total_time = train_time + gpu_wait
+        idle_pct = (gpu_wait / total_time * 100.0) if total_time > 0 else 0.0
+        hits = tm_snap.get("cache_hits", 0)
+        attempts = tm_snap.get("cache_attempts", 0)
+        hit_pct = (hits / attempts * 100.0) if attempts > 0 else 0.0
+
+        logger.info("\n" + "=" * 60)
+        logger.info("ASYNC PIPELINE REPORT")
+        logger.info("=" * 60)
+        logger.info("datasets scheduled: %d", attempts)
+        logger.info("datasets trained: %d", tm_snap.get("units", 0))
+        logger.info("cache hits: %d | cache misses: %d", hits, max(0, attempts - hits))
+        logger.info("prefetch hit rate: %.1f%%", hit_pct)
+        logger.info("GPU training time: %.2f sec", train_time)
+        logger.info("GPU wait time: %.2f sec", gpu_wait)
+        logger.info("pipeline idle: %.1f%%", idle_pct)
+        logger.info("=" * 60 + "\n")
         return results
 
     @staticmethod
@@ -918,27 +955,6 @@ class TrainingPipeline:
         max_grad_norm = overrides.get("max_grad_norm", getattr(stage_cfg, "max_grad_norm", 1.0))
         optim = overrides.get("optimizer", getattr(stage_cfg, "optimizer", "adamw_fused"))
 
-        def _has_fused_adamw() -> bool:
-            if not torch.cuda.is_available():
-                return False
-            try:
-                from transformers.trainer_utils import is_torch_fused_available
-                return is_torch_fused_available()
-            except ImportError:
-                return hasattr(torch.optim, "AdamW") and torch.cuda.is_bf16_supported()
-
-        optim_fused = "adamw_torch_fused" if _has_fused_adamw() else "adamw_torch"
-        optim_map = {
-            "adamw": "adamw_torch",
-            "adamw_8bit": "paged_adamw_8bit" if torch.cuda.is_available() else "adamw_torch",
-            "adamw_fused": optim_fused,
-            "sgd": "sgd",
-        }
-        optim_name = optim_map.get(optim, "adamw_torch")
-
-        is_iterable = isinstance(dataset, IterableDataset)
-        num_workers = 0 if is_iterable else 8
-
         base_args = self.dist.get_training_args(str(output_dir))
         use_bf16 = base_args.get("bf16", False)
         use_fp16 = base_args.get("fp16", False)
@@ -946,6 +962,7 @@ class TrainingPipeline:
 
         is_iterable = isinstance(dataset, IterableDataset)
         num_workers = 0 if is_iterable else min(4, os.cpu_count() or 4)
+
 
         # Update FSDP transformer layer for MoE models
         model_type = self.cfg.model.architecture.model_type
@@ -967,7 +984,7 @@ class TrainingPipeline:
             save_steps=self.cfg.training.save_steps,
             save_total_limit=self.cfg.training.save_total_limit,
             eval_strategy=self.cfg.training.eval_strategy if stage_name in ("sft", "instruction_tuning") else "no",
-            eval_steps=self.cfg.training.eval_steps if stage_name in ("sft", "instruction_tuning") else 0,
+            eval_steps=self.cfg.training.eval_steps if stage_name in ("sft", "instruction_tuning") else None,
             save_strategy="steps",
             save_only_model=overrides.get("save_only_model", True),
             ddp_find_unused_parameters=False,
@@ -982,6 +999,7 @@ class TrainingPipeline:
             dataloader_num_workers=num_workers,
             dataloader_pin_memory=True,
             torch_compile=False,
+            gradient_checkpointing=self.cfg.model.architecture.gradient_checkpointing,
             **({"fsdp": base_args["fsdp"]} if base_args.get("fsdp") else {}),
             **({"fsdp_config": fsdp_config} if fsdp_config else {}),
             **({"deepspeed": base_args["deepspeed"]} if base_args.get("deepspeed") else {}),

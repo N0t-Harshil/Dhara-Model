@@ -68,7 +68,10 @@ class UnitPrefetch:
             "delivered": 0,
             "timeouts": 0,
             "errors": 0,
+            "total_prep_sec": 0.0,
+            "total_gpu_wait_sec": 0.0,
         }
+        self._timing: dict = {}
 
     # -- lifecycle -------------------------------------------------
 
@@ -90,6 +93,7 @@ class UnitPrefetch:
         self._stop.set()
         with self._cv:
             self._results.clear()
+            self._timing.clear()
             self._cv.notify_all()
 
     def discard(self, index: int) -> None:
@@ -98,6 +102,7 @@ class UnitPrefetch:
         slot is ignored by get()."""
         with self._cv:
             self._results.pop(index, None)
+            self._timing.pop(index, None)
             self._next_expected = max(self._next_expected, index + 1)
 
     def in_flight(self) -> int:
@@ -120,19 +125,26 @@ class UnitPrefetch:
                     return
                 idx = self._next_produce
                 self._next_produce += 1
+            t_start = time.monotonic()
+            logger.info("[ASYNC] dataset %d prefetch start", idx + 1)
             try:
                 payload = self._build(units[idx], idx)
                 exc = None
             except Exception as e:  # noqa: BLE001 — delivered to the consumer
                 payload = None
                 exc = e
+            t_end = time.monotonic()
+            prep_dur = t_end - t_start
+            logger.info("[ASYNC] dataset %d preprocessing complete (%.2fs)", idx + 1, prep_dur)
             if self._stop.is_set():
                 return
             with self._cv:
                 if self._stop.is_set():
                     return
                 self._results[idx] = (payload, exc)
+                self._timing[idx] = {"start": t_start, "end": t_end, "duration": prep_dur}
                 self.stats["produced"] += 1
+                self.stats["total_prep_sec"] += prep_dur
                 self._cv.notify_all()
 
     # -- consumer --------------------------------------------------
@@ -144,19 +156,24 @@ class UnitPrefetch:
           PrefetchTimeout — nothing produced within the deadline.
           the build's own exception, re-raised on the consumer thread.
         """
-        deadline = time.monotonic() + self._timeout
+        get_start = time.monotonic()
+        deadline = get_start + self._timeout
         with self._cv:
             while True:
                 if index < self._next_expected:
                     return None  # already delivered / skipped — stale
                 if index in self._results:
+                    wait_dur = time.monotonic() - get_start
                     payload, exc = self._results.pop(index)
+                    timing = self._timing.pop(index, {})
                     self._next_expected = max(self._next_expected, index + 1)
                     self.stats["delivered"] += 1
+                    self.stats["total_gpu_wait_sec"] += wait_dur
+                    logger.info("[ASYNC] dataset %d consumed (GPU wait: %.2fs)", index + 1, wait_dur)
                     if exc is not None:
                         self.stats["errors"] += 1
                         raise exc
-                    return payload
+                    return payload, wait_dur, timing
                 remain = deadline - time.monotonic()
                 if remain <= 0:
                     self.stats["timeouts"] += 1
