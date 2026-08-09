@@ -245,11 +245,23 @@ class MassiveDataCollector:
             "web-design": ["<html", "<div", "<style", "@media", "display: flex"],
         }
         
-        # Prefer more specific (longer) signals first to avoid generic collisions
-        items = sorted(markers.items(), key=lambda kv: max(len(s) for s in kv[1]), reverse=True)
-        for lang, signals in items:
-            if any(sig.lower() in content_lower for sig in signals):
-                return lang
+        # Score languages by the total matched signal length; this prefers
+        # languages with multiple or longer specific matches instead of the
+        # first generic single-token match.
+        best_lang = None
+        best_score = 0
+        best_max_sig = 0
+        for lang, signals in markers.items():
+            matched = [sig for sig in signals if sig.lower() in content_lower]
+            score = sum(len(sig) for sig in matched)
+            max_sig = max((len(sig) for sig in matched), default=0)
+            if score > best_score or (score == best_score and max_sig > best_max_sig):
+                best_lang = lang
+                best_score = score
+                best_max_sig = max_sig
+
+        if best_score > 0:
+            return best_lang
 
         # No language marker matched — treat as plain text by default.
         return "text"
