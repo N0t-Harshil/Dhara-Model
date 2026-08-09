@@ -14,12 +14,22 @@ from datasets import load_dataset
 logger = logging.getLogger("massive_collector")
 
 class MassiveDataCollector:
-    def __init__(self, config_path: str = "config.yaml"):
-        self.config = self._load_config(config_path)
-        self.datasets = (
-            self.config.get("data", {}).get("datasets")
-            or self.config.get("data_collection", {}).get("datasets", [])
-        )
+    def __init__(self, datasets_cfg_or_config: "str | list" = "config.yaml"):
+        """Constructor accepts either a path to a YAML config (legacy behavior)
+        or a list of dataset configs (tests pass a list). When a list is passed,
+        the collector uses it directly and avoids file I/O.
+        """
+        if isinstance(datasets_cfg_or_config, list):
+            # tests and some callsites pass a datasets list directly
+            self.config = {"data": {"datasets": datasets_cfg_or_config}}
+            self.datasets = datasets_cfg_or_config
+        else:
+            # treat as path to config file
+            self.config = self._load_config(datasets_cfg_or_config)
+            self.datasets = (
+                self.config.get("data", {}).get("datasets")
+                or self.config.get("data_collection", {}).get("datasets", [])
+            )
         self.target_libraries = [
             # Core DS/AI
             "numpy", "pandas", "scipy", "scikit-learn", "statsmodels",
@@ -197,8 +207,13 @@ class MassiveDataCollector:
             "all": self.target_libraries
         }
 
-    def _detect_language(self, content: str) -> str:
-        """Detects the programming language of the content (Supports 25+ languages)."""
+    @staticmethod
+    def _detect_language(content: str) -> str:
+        """Detects the programming language of the content (Supports 25+ languages).
+
+        Static method so tests can call MassiveDataCollector._detect_language(...)
+        without instantiating the class.
+        """
         content_lower = content.lower()
         
         # Comprehensive language markers
@@ -234,7 +249,7 @@ class MassiveDataCollector:
             if any(sig.lower() in content_lower for sig in signals):
                 return lang
                 
-        return "python" # Default fallback
+        return "python" if any(c.isalpha() for c in content) else "text"
 
     @staticmethod
     def _clean_text(value) -> str:
@@ -475,6 +490,42 @@ class MassiveDataCollector:
             return False
         
         return True
+
+    @staticmethod
+    def _is_valid_sample(content, language):
+        """Compatibility wrapper used by tests — mirrors _is_high_quality heuristics
+        but implemented as a staticmethod so tests can call it on the class.
+        """
+        # Reuse the same tests as _is_high_quality without needing an instance
+        content = MassiveDataCollector._clean_text(content)
+        if len(content) < 50:
+            return False
+        if len(content) > 250000:
+            return False
+        lowered = content.lower()
+        low_quality_markers = (
+            "lorem ipsum",
+            "todo: add code",
+            "your code here",
+            "coming soon",
+            "placeholder",
+        )
+        if any(marker in lowered for marker in low_quality_markers):
+            return False
+        if language == "text":
+            return len(content) >= 80
+        signals = {
+            "python": ["def ", "import ", "class "],
+            "rust": ["fn ", "let ", "use "],
+            "golang": ["func ", "package "],
+            "cpp": ["#include", "int "],
+            "java": ["class ", "public "],
+            "typescript": ["interface ", "export "],
+            "javascript": ["function", "const ", "let "],
+            "web-design": ["<html", "<div", "<style"],
+        }
+        target_signals = signals.get(language, [" "])
+        return any(sig.lower() in lowered for sig in target_signals)
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
