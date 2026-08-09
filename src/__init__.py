@@ -1,17 +1,33 @@
-from src.model import SpecializedCoderModel
-from src.trainer import ModelTrainer
-from src.dataset import SpecializedDataset
-from src.generator import CodeGenerator
-from src.validator import CodeValidator
-from src.benchmark import CodingBenchmark
-from src.massive_data_collector import MassiveDataCollector
-from src.tokenizer_trainer import train_custom_tokenizer
-from src.knowledge_graph import GraphMemory
-from src.config.schema import Config, load_config
-from src.training.pipeline import TrainingPipeline
-from src.alignment.pipeline import AlignmentPipeline
-from src.evaluation.benchmarks import BenchmarkRunner
-from src.evaluation.reporting import EvaluationReport
+import importlib
+import logging as _logging
+
+_logger = _logging.getLogger(__name__)
+
+
+def __getattr__(name):
+    _lazy = {
+        "SpecializedCoderModel": ("src.model", "SpecializedCoderModel"),
+        "ModelTrainer": ("src.trainer", "ModelTrainer"),
+        "SpecializedDataset": ("src.dataset", "SpecializedDataset"),
+        "CodeGenerator": ("src.generator", "CodeGenerator"),
+        "CodeValidator": ("src.validator", "CodeValidator"),
+        "CodingBenchmark": ("src.benchmark", "CodingBenchmark"),
+        "MassiveDataCollector": ("src.data.streaming", "MassiveDataCollector"),
+        "train_custom_tokenizer": ("src.tokenizer_trainer", "train_custom_tokenizer"),
+        "GraphMemory": ("src.knowledge_graph", "GraphMemory"),
+        "Config": ("src.config.schema", "Config"),
+        "load_config": ("src.config.schema", "load_config"),
+        "TrainingPipeline": ("src.training.pipeline", "TrainingPipeline"),
+        "AlignmentPipeline": ("src.alignment.pipeline", "AlignmentPipeline"),
+        "BenchmarkRunner": ("src.evaluation.benchmarks", "BenchmarkRunner"),
+        "EvaluationReport": ("src.evaluation.reporting", "EvaluationReport"),
+    }
+    if name in _lazy:
+        mod_path, attr = _lazy[name]
+        mod = importlib.import_module(mod_path)
+        return getattr(mod, attr)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 __all__ = [
     "SpecializedCoderModel", "ModelTrainer", "SpecializedDataset",

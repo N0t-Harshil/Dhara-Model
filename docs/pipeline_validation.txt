@@ -1,0 +1,65 @@
+========================================================================
+  PIPELINE VALIDATION REPORT — Methos Foundation
+  Config: config_foundation.yaml
+========================================================================
+
+── Dataset Mixture ──────────────────────────────────────────────
+  Total dataset entries: 15
+  Streaming mode:        True
+  Cache dir:             ./hf_cache
+
+  Path                                          Cat              Wt    QS      Max
+  --------------------------------------------- ------------ ------ ----- --------
+  HuggingFaceFW/fineweb                         code          12.0%  0.35   200000
+  bigcode/the-stack-v2-dedup                    code           9.0%  0.30   150000
+  code_search_net                               code           4.5%  0.30    80000
+  codeparrot/codeparrot-clean                   code           4.5%  0.35    80000
+  HuggingFaceFW/fineweb                         web_text      25.0%  0.35   400000
+  HuggingFaceFW/fineweb                         docs           3.0%  0.35    50000
+  HuggingFaceFW/fineweb                         docs           3.0%  0.35    50000
+  HuggingFaceFW/fineweb                         docs           9.0%  0.35   150000
+  wikipedia                                     wiki          10.0%  0.35   150000
+  open-web-math/open-web-math                   math           4.0%  0.30    80000
+  EleutherAI/proof-pile                         math           3.0%  0.30    50000
+  AI-MO/NuminaMath-CoT                          math           3.0%  0.30    50000
+  HuggingFaceFW/fineweb                         science        5.0%  0.30    80000
+  bookcorpus/bookcorpus                         books          2.5%  0.40    40000
+  wikipedia                                     books          2.5%  0.40    40000
+                                   Total weight  1.000
+
+── Category Breakdown ────────────────────────────────────────────
+  books            2 datasets, total weight 0.050 (5.0%)
+  code             4 datasets, total weight 0.300 (30.0%)
+  docs             3 datasets, total weight 0.150 (15.0%)
+  math             3 datasets, total weight 0.100 (10.0%)
+  science          1 datasets, total weight 0.050 (5.0%)
+  web_text         1 datasets, total weight 0.250 (25.0%)
+  wiki             1 datasets, total weight 0.100 (10.0%)
+
+── Preprocessing ────────────────────────────────────────────────
+  Remove boilerplate:    True
+  Min text length:       100
+  Max text length:       250000
+  License keywords:      19 patterns
+  Boilerplate patterns:  16 patterns
+
+── Language Balancing ───────────────────────────────────────────
+  Enabled:               False
+
+── Synthetic Reasoning ──────────────────────────────────────────
+  Enabled:               False
+
+── Quality Pipeline ─────────────────────────────────────────────
+  Length range:          [30, 500000]
+  Dedup method:          simhash (threshold=0.85)
+  Contamination:         True
+  Benchmarks:            human_eval, mbpp, mmlu, gsm8k, arc, hellaswag, truthfulqa
+
+── Curriculum ───────────────────────────────────────────────────
+  Enabled:               False
+
+  [OK] No validation errors.
+
+========================================================================
+  Validation complete.
+========================================================================

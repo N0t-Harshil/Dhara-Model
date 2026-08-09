@@ -236,7 +236,16 @@ python main.py download-tokenizer --force
 │   ├── infrastructure/
 │   │   ├── distributed.py      # FSDP distributed setup (mixed_precision fix)
 │   │   └── tracking.py         # WandB/MLflow/TensorBoard
-│   └── data/pipeline.py        # Data streaming + processing
+│   └── data/
+│       ├── pipeline.py         # Data streaming + processing
+│       ├── doc_builder.py      # 18-source documentation crawler (template-safe)
+│       ├── registry.py         # Dataset registry + weights
+│       └── streaming.py        # Streaming with fallback chains
+├── scripts/
+│   ├── corpus_audit.py         # JSONL corpus quality gate
+│   ├── verify_datasets.py      # HF Hub dataset verification
+│   ├── production_validation.py# 8-phase production validation
+│   └── test_local_validation.py# 14 local validation tests
 ├── tests/                      # 109 tests
 └── hf_cache/                   # Dataset cache
 ```
@@ -317,6 +326,28 @@ tests/test_validation.py          # 10 — Python syntax + execution
 ---
 
 ## Changelog
+
+### 2026-07 — v1.0-pretraining final pass (data pipeline)
+
+**Final engineering pass before freeze — status: READY TO FREEZE REPOSITORY.**
+
+| Area | Fix |
+|------|-----|
+| **Template URL injection** | Template placeholder URLs (`{{ }}`, `{% %}`, `${ }`, `<% %>`) and invalid hrefs (`javascript:`, `void(0)`, `#`) are rejected in every scraper's `discover_urls()` **before queue insertion**; logged as `Filtered template URL` and counted in `filtered=N` — verified end-to-end with a synthetic Docker crawl (0 template URLs reach the network) |
+| **CUDA discovery bug** | Indentation bug dropped every href except the last per page; all links now followed |
+| **PostgreSQL** | URL validation accepts any `/docs/<version>/` path |
+| **Linux kernel** | `MIN_TEXT_LENGTH` 3000→500 (nav sidebar excluded by selector — no boilerplate) |
+| **cuDNN** | Seeds updated to `/latest/`, sub-link following re-enabled |
+| **Corpus audit** | New `scripts/corpus_audit.py` — UTF-8/JSON/dup/HTML-leakage/length/token checks; corrupt 0-byte artifact removed |
+| **Validation** | `test_local_validation.py` 14/14 clean; `test_integration.py` fixed for transformers v5 (`AutoConfig.for_model`, `eval_strategy`, resume from `checkpoint-N/` dirs) — training→checkpoint→resume verified offline |
+
+**Data pipeline summary**: 18 doc sources, template-safe crawling, per-source summary (`discovered= dups= filtered= failed=`), quality-gated JSONL output. Build datasets with:
+
+```bash
+python src/data/doc_builder.py                  # all 18 sources
+python src/data/doc_builder.py --sources python docker cudnn
+python scripts/corpus_audit.py                  # quality gate on all JSONL
+```
 
 ### 2026-07 — V4 Bug Fix Audit
 

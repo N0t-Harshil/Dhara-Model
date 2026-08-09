@@ -233,6 +233,37 @@ class AlignmentPhaseConfig(BaseModel):
     method_configs: AlignmentMethodConfig = Field(default_factory=AlignmentMethodConfig)
 
 
+class PretrainStageGroupConfig(BaseModel):
+    name: str
+    description: Optional[str] = None
+    categories: List[str] = Field(default_factory=list)
+    weights: Optional[Dict[str, float]] = None
+    steps: int = Field(default=0, ge=0)
+    max_samples_per_dataset: Optional[int] = None
+
+
+class PretrainStagingConfig(BaseModel):
+    enabled: bool = False
+    stage_cache_dir: str = "cache"
+    stages: List[PretrainStageGroupConfig] = Field(default_factory=list)
+    prefetch: bool = True
+    mode: Literal["dataset", "stage"] = "dataset"
+    # How many units the pipeline builds ahead of the Trainer. 1 == the next
+    # dataset is double-buffered; 3 == the next 3 datasets are being prepared
+    # (stream / filter / tokenize / pack) while the GPU trains the current one.
+    prefetch_depth: int = Field(default=3, ge=0, le=16)
+    # Max seconds the main loop waits for a prefetched unit before treating
+    # that unit as failed (build hung) and continuing with the next one.
+    prefetch_timeout: float = Field(default=900.0, ge=5)
+    # When a unit build fails (network / timeout / cache corruption): record a
+    # failure journal, skip the unit, and continue training (default). Set
+    # abort_on_unit_error to fail fast instead.
+    abort_on_unit_error: bool = False
+    # Persist a failure journal under the model dir so resumed runs skip the
+    # units that were already marked failed instead of re-attempting them.
+    skip_failed_units_on_resume: bool = True
+
+
 class PretrainStageConfig(BaseModel):
     enabled: bool = True
     learning_rate: float = 2e-4
@@ -246,6 +277,7 @@ class PretrainStageConfig(BaseModel):
     data_mix: Dict[str, float] = Field(default_factory=lambda: {
         "code": 0.3, "web_text": 0.3, "books": 0.1, "math": 0.1, "science": 0.1, "other": 0.1
     })
+    staging: PretrainStagingConfig = Field(default_factory=PretrainStagingConfig)
 
 
 class SFTStageConfig(BaseModel):
@@ -297,6 +329,14 @@ class SafetyConfig(BaseModel):
     red_team_model: Optional[str] = None
 
 
+class TelemetryConfig(BaseModel):
+    enabled: bool = True
+    interval_sec: float = Field(default=30.0, ge=1.0)
+    # Report GPU utilization via nvidia-smi when available (works without any
+    # extra deps; falls back to torch.cuda.memory stats).
+    gpu_util_sampling: bool = True
+
+
 class TrainingConfig(BaseModel):
     max_seq_length: int = 8192
     response_only_loss: bool = True
@@ -306,6 +346,11 @@ class TrainingConfig(BaseModel):
     eval_strategy: Literal["steps", "epoch", "no"] = "steps"
     eval_steps: int = 500
     logging_steps: int = 10
+    # AsyncCompact: write checkpoints on a background thread with atomic rename
+    # + sha256 manifest + resume verification instead of blocking the GPU.
+    async_checkpoint: bool = True
+    checkpoint_checksum: bool = True
+    telemetry: TelemetryConfig = Field(default_factory=TelemetryConfig)
     pretrain: PretrainStageConfig = Field(default_factory=PretrainStageConfig)
     sft: SFTStageConfig = Field(default_factory=SFTStageConfig)
     alignment: AlignmentPhaseConfig = Field(default_factory=AlignmentPhaseConfig)
@@ -348,7 +393,7 @@ class DistributedConfig(BaseModel):
 
 class DedupConfig(BaseModel):
     enabled: bool = True
-    method: Literal["exact", "minhash", "embedding"] = "minhash"
+    method: Literal["exact", "minhash", "simhash", "embedding"] = "simhash"
     threshold: float = Field(default=0.85, ge=0.0, le=1.0)
 
 
@@ -382,13 +427,120 @@ class QualityPipelineConfig(BaseModel):
 
 class CurriculumStageConfig(BaseModel):
     name: str
-    weight: float = Field(ge=0.0, le=1.0)
-    dataset_indices: Optional[List[int]] = None
+    max_steps: int = Field(default=10000, ge=0)
+    dataset_filter: Optional[List[str]] = None
+    description: Optional[str] = None
 
 
 class CurriculumConfig(BaseModel):
     enabled: bool = False
     stages: List[CurriculumStageConfig] = Field(default_factory=list)
+
+
+class ASTFilterConfig(BaseModel):
+    code_filtering: bool = True
+    reject_no_parse: bool = True
+    reject_autogen: bool = True
+    reject_syntax_corruption: bool = True
+    reject_one_liner: bool = True
+    reject_few_identifiers: bool = True
+    max_one_liner_ratio: float = 0.95
+    min_identifier_ratio: float = 0.05
+    min_executable_ratio: float = 0.10
+
+
+class FunctionSamplingConfig(BaseModel):
+    enabled: bool = False
+    strategies: List[Literal["function", "class", "method", "all"]] = Field(default_factory=lambda: ["function", "class"])
+    min_body_lines: int = 3
+    max_body_lines: int = 500
+    per_file_limit: int = 20
+
+
+class WeightedSamplerConfig(BaseModel):
+    balance_by: Literal["documents", "tokens"] = "tokens"
+    use_token_weights: bool = True
+
+
+class DomainBalancingConfig(BaseModel):
+    enabled: bool = False
+    include: Dict[str, float] = Field(default_factory=lambda: {
+        "backend": 0.15, "frontend": 0.10, "ml": 0.15, "cv": 0.05,
+        "nlp": 0.10, "databases": 0.08, "networking": 0.08,
+        "systems": 0.10, "security": 0.05, "embedded": 0.04,
+        "mobile": 0.05, "web": 0.05,
+    })
+
+
+class SanityCheckConfig(BaseModel):
+    enabled: bool = True
+    num_samples: int = 10
+    max_decode_length: int = 512
+
+
+class HealthReportingConfig(BaseModel):
+    enabled: bool = True
+    output_dir: str = "reports"
+    report_every_n_datasets: int = 1
+
+
+class PreprocessingConfig(BaseModel):
+    remove_boilerplate: bool = True
+    min_text_length: int = 100
+    max_text_length: int = 250000
+    collapse_blank_lines: bool = True
+    strip_trailing_spaces: bool = True
+    license_keywords: List[str] = Field(default_factory=lambda: [
+        'copyright', 'license', 'spdx', 'apache', 'mit license',
+        'licensed under', 'all rights reserved', 'gnu general public',
+        'gnu lesser general public', 'gnu affero general public',
+        'redistribution and use', 'permission is hereby granted',
+        'this file is part of', 'generated by', 'auto-generated',
+        'do not edit', 'this code was generated',
+        'bsd license', 'mozilla public license',
+    ])
+    boilerplate_file_patterns: List[str] = Field(default_factory=lambda: [
+        '_pb2.py', '_pb2_grpc.py', '_grpc_pb2.py',
+        'generated/', 'build/', 'dist/', 'vendor/',
+        'node_modules/', '.git/', '__pycache__/',
+        '.min.js', '.min.css', '.bundle.js',
+        'package-lock.json', 'yarn.lock', 'go.sum',
+    ])
+    autogen_patterns: List[str] = Field(default_factory=lambda: [
+        'auto-generated', 'autogenerated', 'do not edit',
+        'this file is generated', 'this code was generated',
+        'generated by the protocol buffer', 'generated by the swagger',
+        'source code is machine-generated',
+        'this file was automatically generated',
+    ])
+    removal_comment_markers: List[str] = Field(default_factory=lambda: [
+        '#' , '//', '/*', '*', '"""', "'''", '--', ';',
+    ])
+
+
+class LanguageBalancingConfig(BaseModel):
+    enabled: bool = False
+    target_distribution: Optional[Dict[str, float]] = None
+    min_samples_per_language: int = 100
+
+
+class SyntheticReasoningConfig(BaseModel):
+    enabled: bool = False
+    max_chains: int = 50000
+    chain_length_min: int = 3
+    chain_length_max: int = 8
+
+
+class MetadataCacheConfig(BaseModel):
+    """Persistent cache of resolved HuggingFace dataset metadata.
+
+    Avoids re-resolving repositories/splits/shards on every run by saving the
+    resolved file list, revision and fingerprint. On subsequent runs the file
+    list is reused directly (no repo enumeration) unless the fingerprint
+    changes (repo revision, files, preprocessing or tokenizer version)."""
+    enabled: bool = True
+    dir: str = "cache/datasets"
+    fingerprint_version: int = 1
 
 
 class DatasetEntryConfig(BaseModel):
@@ -399,7 +551,26 @@ class DatasetEntryConfig(BaseModel):
     data_dir: Optional[str] = None
     language: Optional[str] = None
     category: Optional[str] = None
+    domain: Optional[str] = None
     weight: float = 1.0
+    quality_score: Optional[float] = None
+    token_weight: Optional[float] = None
+    strip_instruction_format: bool = True
+    function_sampling: bool = False
+
+
+class DatasetPolicyConfig(BaseModel):
+    """Per-dataset streaming policy (accepted-sample driven).
+
+    path is a glob matched against the registry dataset path. When a policy
+    matches, it overrides the generic streaming behavior for that repository.
+    """
+    path: str
+    enabled: bool = True
+    accepted_target: Optional[int] = None
+    text_fields: Optional[List[str]] = None
+    shard_workers: Optional[int] = None
+    shard_order: Literal["sequential", "yield"] = "sequential"
 
 
 class DataConfig(BaseModel):
@@ -408,8 +579,32 @@ class DataConfig(BaseModel):
     max_cache_gb: int = 200
     num_download_workers: int = 16
     datasets: List[DatasetEntryConfig] = Field(default_factory=list)
+    metadata_cache: MetadataCacheConfig = Field(default_factory=MetadataCacheConfig)
     quality: QualityPipelineConfig = Field(default_factory=QualityPipelineConfig)
     curriculum: CurriculumConfig = Field(default_factory=CurriculumConfig)
+    preprocessing: PreprocessingConfig = Field(default_factory=PreprocessingConfig)
+    language_balancing: LanguageBalancingConfig = Field(default_factory=LanguageBalancingConfig)
+    synthetic_reasoning: SyntheticReasoningConfig = Field(default_factory=SyntheticReasoningConfig)
+    domain_balancing: DomainBalancingConfig = Field(default_factory=DomainBalancingConfig)
+    ast_filter: ASTFilterConfig = Field(default_factory=ASTFilterConfig)
+    function_sampling: FunctionSamplingConfig = Field(default_factory=FunctionSamplingConfig)
+    sampler: WeightedSamplerConfig = Field(default_factory=WeightedSamplerConfig)
+    sanity_checks: SanityCheckConfig = Field(default_factory=SanityCheckConfig)
+    health_reporting: HealthReportingConfig = Field(default_factory=HealthReportingConfig)
+    hf_token: Optional[str] = None
+    use_registry: bool = True
+    max_samples_per_dataset: Optional[int] = None
+    use_packed_cache: bool = True
+    dataset_policies: List[DatasetPolicyConfig] = Field(default_factory=list)
+    shard_workers: int = 8
+    shard_window: int = 4
+    shard_progress_dir: str = "cache/shards"
+    resume_shards: bool = True
+    bottleneck_threshold_sec: float = 30.0
+    acceptance_investigation_threshold: float = 0.10
+    # Override for the persistent preprocessing process pool size (defaults to
+    # min(32, cpu_count)). The pool is created once and terminated on exit.
+    cleanup_pool_size: Optional[int] = None
 
 
 class TokenizerConfig(BaseModel):

@@ -1,0 +1,76 @@
+{
+  "name": "Methos Foundation",
+  "config_path": "",
+  "timestamp": "2026-08-02T11:41:39.461451",
+  "global_stats": {
+    "total_datasets": 1,
+    "total_raw_samples": 30,
+    "total_packed_sequences": 2,
+    "total_tokens": 256,
+    "total_duplicates_removed": 0,
+    "average_retention_pct": 6.67,
+    "average_packing_efficiency": 1.0,
+    "average_padding_ratio": 0.0,
+    "average_tokens_per_sequence": 128.0,
+    "average_quality_score": 0.9,
+    "long_context_documents": 0,
+    "long_context_ratio_global": 0.0,
+    "categories": 1,
+    "languages_detected": 30,
+    "domains_detected": 30
+  },
+  "categories": {
+    "code": {
+      "dataset_count": 1,
+      "packed_count": 2,
+      "token_count": 256,
+      "weight": 1.0,
+      "long_ctx_count": 0
+    }
+  },
+  "languages": {
+    "python": 30
+  },
+  "domains": {
+    "code": 30
+  },
+  "datasets": [
+    {
+      "path": "fake/ds1",
+      "category": "code",
+      "weight": 1.0,
+      "raw_samples": 30,
+      "after_boilerplate": 30,
+      "after_quality": 30,
+      "after_dedup": 30,
+      "packed_sequences": 2,
+      "total_tokens": 256,
+      "duplicates_removed": 0,
+      "retention_rate": 6.67,
+      "avg_tokens_per_seq": 128.0,
+      "packing_efficiency": 1.0,
+      "padding_ratio": 0.0,
+      "long_context_count": 0,
+      "long_context_ratio": 0.0,
+      "max_seq_length": 128,
+      "rejection_reasons": {
+        "loaded": 30,
+        "accepted": 30,
+        "rejected_boilerplate": 0,
+        "rejected_short": 0,
+        "rejected_quality": 0,
+        "rejected_dedup": 0,
+        "rejected_ast": 0,
+        "rejected_empty": 0
+      },
+      "quality_scores": {
+        "mean": 0.9,
+        "min": 0.9,
+        "max": 0.9,
+        "median": 0.9,
+        "count": 30
+      }
+    }
+  ],
+  "errors": []
+}

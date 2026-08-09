@@ -1,465 +1,564 @@
 from __future__ import annotations
 
+import itertools
 import logging
+import os
+import queue
+import threading
+import time
 from pathlib import Path
-from typing import Any, Dict, Generator, List, Optional, Tuple
+from types import SimpleNamespace
+from typing import Any, Dict, Generator, Iterable, List, Optional, Tuple
 
-import yaml
-from datasets import load_dataset
+from datasets import (
+    DatasetDict,
+    IterableDatasetDict,
+    load_dataset,
+    load_dataset_builder,
+)
 
-from src.config.schema import DatasetEntryConfig
+from src.data.metadata_cache import (
+    DatasetMetadataCache,
+    GATED_DATASET_HELP,  # noqa: F401 (re-exported for back-compat)
+    _handle_load_error,
+    _is_gated_error,  # noqa: F401 (re-exported for back-compat)
+    _loader_for_files,
+    extract_data_sources,
+    rewrite_hf_url,
+    stream_from_record,
+)
+from src.data.registry import DatasetRegistry, DatasetInfo, detect_text_fields, extract_text
 
 logger = logging.getLogger(__name__)
 
 
-class MassiveDataCollector:
-    def __init__(self, datasets_cfg: List[DatasetEntryConfig]) -> None:
-        self.datasets = datasets_cfg
-        self.target_libraries = [
-            "numpy", "pandas", "scipy", "scikit-learn", "statsmodels",
-            "pytorch", "torch", "tensorflow", "jax", "keras",
-            "matplotlib", "seaborn", "plotly", "bokeh",
-            "transformers", "tokenizers", "accelerate", "peft", "diffusers",
-            "bitsandbytes", "deepspeed", "optimum", "vllm", "sglang",
-            "outlines", "instructor", "pydantic_ai", "guidance",
-            "langchain", "langgraph", "langserve", "llamaindex", "autogen",
-            "crewai", "haystack", "semantic_kernel", "babyagi",
-            "fastapi", "flask", "django", "uvicorn", "gunicorn", "docker",
-            "kubernetes", "k8s", "boto3", "google-cloud-aiplatform",
-            "chromadb", "pinecone", "qdrant", "weaviate", "milvus",
-            "pymongo", "redis", "sqlalchemy", "psycopg2",
-        ]
+class ShardCoordinator:
+    """Ordered, shard-parallel streaming of a resolved dataset record.
 
-    def get_dataset_list(self) -> List[DatasetEntryConfig]:
-        return self.datasets
+    A record's shard files are downloaded/decoded concurrently by up to
+    `workers` threads (each thread owns one shard at a time), while the
+    coordinator re-emits samples in exact shard order — all samples of shard k
+    before any of shard k+1, each in file order. Downstream processing
+    therefore observes precisely the original sequential stream order.
 
-    def stream_single_dataset(
+    Worker responsibilities per shard:
+      1. open the shard file (Arrow iterable) — timed
+      2. skip `resume_offset` raw rows (islice) — mid-shard resume
+      3. apply the streaming-layer extraction gate (dataset-specific field
+         hints first, generic detection fallback) and count raw rows
+      4. enqueue gated samples tagged (shard_idx, seq) — bounded queue gives
+         backpressure so downloads never run ahead of the consumer
+
+    Closing contract: the consumer MUST call ``close()`` (e.g. in a finally
+    block) when it stops pulling early — workers are daemon threads and would
+    otherwise keep reading. After close(), ``progress_state()`` returns the
+    (last_shard, last_offset) position for persisted resume.
+
+    Samples carry ``_shard`` so the consumer can tally per-shard acceptance
+    statistics for intelligent shard selection.
+    """
+
+    def __init__(
         self,
-        ds_info: DatasetEntryConfig,
+        record: Dict[str, Any],
+        plan: List[Tuple[int, int]],
+        workers: int = 4,
+        text_fields: Optional[List[str]] = None,
+        token: Optional[str] = None,
         limit: Optional[int] = None,
-        theme: str = "all",
-        skip_samples: int = 0,
-    ) -> Generator[Dict[str, Any], None, None]:
-        count = 0
-        if limit is None:
-            limit = ds_info.max_samples
-        groups = self._get_groups()
-        target_libs = groups.get(theme, self.target_libraries)
-
-        state_key = f"_skip_{ds_info.path.replace('/','_').replace('-','_')}"
-        if not hasattr(self, state_key):
-            setattr(self, state_key, skip_samples)
-
-        logger.info("Streaming %s samples from %s...", theme, ds_info.path)
-        try:
-            ds_kwargs = self._build_ds_kwargs(ds_info)
-            while True:
-                processed = 0
-                ds = load_dataset(**ds_kwargs)
-                initial_skip = getattr(self, state_key)
-
-                for entry in ds:
-                    processed += 1
-                    sample = self._process_entry(entry, theme, target_libs)
-                    if sample:
-                        current_skip = getattr(self, state_key)
-                        if current_skip > 0:
-                            setattr(self, state_key, current_skip - 1)
-                            continue
-                        yield sample
-                        count += 1
-                        if limit and count >= limit:
-                            return
-
-                if count > 0:
-                    break
-                if processed == 0:
-                    logger.warning("Dataset %s is empty.", ds_info.path)
-                    break
-                if getattr(self, state_key) == initial_skip:
-                    logger.warning("Dataset %s yielded 0 valid samples. Breaking.", ds_info.path)
-                    break
-        except Exception as e:
-            logger.error("Error streaming from %s: %s", ds_info.path, e)
-
-        logger.info("Finished streaming %d samples from %s", count, ds_info.path)
-
-    def stream_samples(
-        self,
-        limit: Optional[int] = None,
-        theme: str = "all",
-        stages: Optional[List[Tuple[str, int]]] = None,
-    ) -> Generator[Dict[str, Any], None, None]:
-        if stages:
-            yield from self._stream_curriculum(stages)
-        else:
-            yield from self._stream_for_theme(theme, limit)
-
-    def _stream_curriculum(
-        self, stages: List[Tuple[str, int]]
-    ) -> Generator[Dict[str, Any], None, None]:
-        stage_iter = iter(stages)
-        try:
-            curr_theme, curr_limit = next(stage_iter)
-        except StopIteration:
-            return
-
-        curr_count = 0
-        logger.info("=== CURRICULUM STAGE: %s (%d samples) ===", curr_theme.upper(), curr_limit)
-        groups = self._get_groups()
-
-        for ds_info in self.datasets:
-            ds_kwargs = self._build_ds_kwargs(ds_info)
-            try:
-                ds = load_dataset(**ds_kwargs)
-                ds_count = 0
-                ds_limit = ds_info.max_samples
-                for entry in ds:
-                    target_libs = groups.get(curr_theme, self.target_libraries)
-                    sample = self._process_entry(entry, curr_theme, target_libs)
-                    if sample:
-                        yield sample
-                        curr_count += 1
-                        ds_count += 1
-                        if ds_limit and ds_count >= ds_limit:
-                            break
-                        if curr_count >= curr_limit:
-                            try:
-                                curr_theme, curr_limit = next(stage_iter)
-                                curr_count = 0
-                                logger.info("=== CURRICULUM STAGE: %s (%d samples) ===", curr_theme.upper(), curr_limit)
-                            except StopIteration:
-                                return
-            except Exception as e:
-                logger.error("Error in curriculum stream for %s: %s", ds_info.path, e)
-
-    def _stream_for_theme(
-        self, theme: str, limit: Optional[int]
-    ) -> Generator[Dict[str, Any], None, None]:
-        count = 0
-        groups = self._get_groups()
-        target_libs = groups.get(theme, self.target_libraries)
-
-        for ds_info in self.datasets:
-            logger.info("Streaming %s from %s...", theme, ds_info.path)
-            ds_kwargs = self._build_ds_kwargs(ds_info)
-            try:
-                ds = load_dataset(**ds_kwargs)
-                ds_count = 0
-                ds_limit = ds_info.max_samples
-                for entry in ds:
-                    sample = self._process_entry(entry, theme, target_libs)
-                    if sample:
-                        yield sample
-                        count += 1
-                        ds_count += 1
-                        if limit and count >= limit:
-                            return
-                        if ds_limit and ds_count >= ds_limit:
-                            break
-            except Exception as e:
-                logger.error("Error streaming %s: %s", ds_info.path, e)
-
-    def _build_ds_kwargs(self, ds_info: DatasetEntryConfig) -> Dict[str, Any]:
-        kwargs: Dict[str, Any] = {
-            "path": ds_info.path,
-            "split": ds_info.split,
-            "streaming": True,
+        on_progress: Optional[callable] = None,
+    ) -> None:
+        self.record = record
+        self.files: List[str] = list(record.get("files") or [])
+        self.loader = record.get("loader") or _loader_for_files(self.files)
+        self.plan = plan
+        self.workers = max(1, int(workers))
+        self.text_fields = text_fields
+        self.token = token
+        self.limit = limit
+        self.on_progress = on_progress
+        self._stop = threading.Event()
+        self._runs: Dict[int, "_ShardRun"] = {}
+        self._plan_pos = 0
+        self._emit_pos = 0
+        self._current: Optional["_ShardRun"] = None
+        self._gated = 0
+        self._consumed_raw: Dict[int, int] = {}
+        self._raw_done: Dict[int, int] = {}
+        self._timings: Dict[str, float] = {
+            "arrow_open_sec": 0.0, "arrow_open_max_sec": 0.0,
+            "extraction_sec": 0.0, "network_wait_sec": 0.0,
         }
-        if ds_info.data_dir:
-            kwargs["data_dir"] = ds_info.data_dir
-        if ds_info.name:
-            kwargs["name"] = ds_info.name
-        return kwargs
+        self._failed_shards: List[int] = []
+        self._first_row_seen = False
+        self._first_row_timeout = float(
+            os.environ.get("DATA_FILE_FIRST_ROW_TIMEOUT", "600"))
+        self._created = time.monotonic()
+        logger.info("Streaming begins — %d shards, %d parallel workers%s%s",
+                    len(self.files), self.workers,
+                    f", resume at shard {plan[0][0]} offset {plan[0][1]}" if plan else "",
+                    f", gated cap {limit}" if limit else "")
 
-    def _get_groups(self) -> Dict[str, List[str]]:
-        return {
-            "core": [],
-            "ai": ["numpy", "pandas", "pytorch", "torch", "tensorflow", "transformers", "scikit-learn", "matplotlib"],
-            "agentic": ["langchain", "langgraph", "llamaindex", "autogen", "crewai", "pydantic_ai", "instructor"],
-            "multi": ["rust", "golang", "cpp", "java", "typescript", "php", "ruby", "swift", "csharp", "kotlin", "sql", "shell", "dart", "scala", "lua", "zig", "haskell"],
-            "all": self.target_libraries,
-        }
+    def __iter__(self):
+        return self
 
-    @staticmethod
-    def _clean_text(value: Any) -> str:
-        if value is None:
-            return ""
-        if isinstance(value, (list, tuple)):
-            return "\n".join(str(v) for v in value if v is not None)
-        return str(value).strip()
-
-    def _process_entry(self, entry: dict, theme: str, target_libs: list) -> Optional[Dict[str, str]]:
-        instruction, input_text, output = self._extract_fields(entry)
-        content = "\n".join(p for p in (instruction, input_text, output) if p)
-        lang = self._detect_entry_language(entry, content)
-
-        content_lower = content.lower()
-        if theme != "all":
-            if theme == "core":
-                if any(lib in content_lower for lib in self.target_libraries):
-                    return None
-            elif theme not in ("multi", "text"):
-                if not any(lib in content_lower for lib in target_libs):
-                    return None
-
-        if not self._is_valid_sample(content, lang):
-            return None
-
-        return {
-            "instruction": instruction or f"Complete this {lang} code:",
-            "input": input_text,
-            "output": output or content,
-            "language": lang,
-        }
-
-    def _extract_fields(self, entry: dict) -> Tuple[str, str, str]:
-        instruction = self._clean_text(entry.get("instruction", ""))
-        input_text = self._clean_text(entry.get("input", ""))
-        output = self._clean_text(entry.get("output", ""))
-
-        # Tool-use / function calling: tool_def + instruction (check before standard path)
-        if "tool_definition" in entry and instruction:
-            tool = self._clean_text(entry["tool_definition"])
-            resp = self._clean_text(entry.get("response", ""))
-            return f"{tool}\n\n{instruction}", "", resp
-
-        # Dolly format: context + instruction + response (check before standard path)
-        if "context" in entry and entry.get("context") and "response" in entry:
-            ctx = self._clean_text(entry["context"])
-            inst = instruction if instruction else self._clean_text(entry.get("instruction", ""))
-            resp = self._clean_text(entry["response"])
-            return f"{ctx} {inst}".strip(), "", resp
-
-        # Fast path: standard instruction/output already filled
-        if instruction and output:
-            return instruction, input_text, output
-
-        # Alpaca/CodeAlpaca: instruction + response
-        if instruction and "response" in entry:
-            return instruction, "", self._clean_text(entry.get("response", ""))
-
-        # Problem/solution (code contests, competitive programming)
-        if "problem" in entry and "solution" in entry:
-            return self._clean_text(entry["problem"]), "", self._clean_text(entry["solution"])
-
-        # Query/answer (general QA)
-        if "query" in entry and "answer" in entry:
-            return self._clean_text(entry["query"]), "", self._clean_text(entry["answer"])
-
-        # Question/answer (GSM8K, MATH, CoT datasets)
-        if "question" in entry:
-            if "answer" in entry:
-                return self._clean_text(entry["question"]), "", self._clean_text(entry["answer"])
-            if "rationale" in entry and "target" in entry:
-                rationale = self._clean_text(entry["rationale"])
-                target = self._clean_text(entry["target"])
-                return self._clean_text(entry["question"]), "", f"{rationale} {target}"
-
-        # FLAN format: inputs + targets
-        if "inputs" in entry and "targets" in entry:
-            return self._clean_text(entry["inputs"]), "", self._clean_text(entry["targets"])
-
-        # Orca-style: question + response + system_prompt
-        if "system_prompt" in entry and "response" in entry:
-            sys_p = self._clean_text(entry["system_prompt"])
-            q = instruction if instruction else self._clean_text(entry.get("question", ""))
-            r = self._clean_text(entry["response"])
-            return f"{sys_p}\n\n{q}" if q else sys_p, "", r
-
-        # Chat/conversation formats (ShareGPT, OpenAssistant, UltraChat, etc.)
-        if "messages" in entry or "chosen" in entry or "conversations" in entry:
-            return self._extract_chat_fields(entry)
-
-        # ShareGPT format with 'from'/'value' pairs
-        if "from" in entry and "value" in entry:
-            return self._extract_sharegpt_fields(entry)
-
-        # Prompt + completion/response (UltraFeedback, Tulu, etc.)
-        if "prompt" in entry:
-            prompt_val = self._clean_text(entry["prompt"])
-            completion = entry.get("completion") or entry.get("response", "")
-            if completion:
-                return prompt_val, "", self._clean_text(completion)
-            # prompt might contain full conversation
-            if not instruction:
-                instruction = prompt_val
-
-        # Code contests: description + solutions dict
-        if "description" in entry and "solutions" in entry:
-            return self._extract_code_contests(entry)
-
-        # Function/docstring pairs (CodeSearchNet style)
-        if "func_documentation_string" in entry and "func_code_string" in entry:
-            return (
-                self._clean_text(entry["func_documentation_string"]),
-                "",
-                self._clean_text(entry["func_code_string"]),
-            )
-
-        # Code + explanation (paired)
-        if "code" in entry and "explanation" in entry:
-            return self._clean_text(entry.get("explanation") or entry.get("description", "")), "", self._clean_text(entry["code"])
-
-        # NLU datasets: premise/hypothesis or sentence1/sentence2
-        if "sentence1" in entry and "sentence2" in entry:
-            return self._clean_text(entry["sentence1"]), self._clean_text(entry["sentence2"]), self._clean_text(entry.get("label", ""))
-
-        # SciQ: support + question + answer
-        if "support" in entry and "answer" in entry:
-            support = self._clean_text(entry["support"])
-            q = self._clean_text(entry.get("question", instruction))
-            a = self._clean_text(entry["answer"])
-            return f"{support}\n\n{q}" if support else q, "", a
-
-        # C4 / BookCorpus / PG19: just text content (no instruction)
-        fallback = self._clean_text(entry.get("content") or entry.get("text") or entry.get("code") or "")
-        if fallback and not instruction:
-            return "", "", fallback
-
-        # Last resort: if we have instruction but no output yet, try any field
-        if instruction and not output:
-            for field in ["response", "completion", "answer", "target", "result", "code", "text", "content"]:
-                val = entry.get(field)
-                if val:
-                    return instruction, input_text, self._clean_text(val)
-
-        return instruction, input_text, output or fallback
-
-    def _extract_sharegpt_fields(self, entry: dict) -> Tuple[str, str, str]:
-        """ShareGPT format: {'from': 'human', 'value': '...'} or {'from': 'gpt', 'value': '...'}."""
-        role = str(entry.get("from", "")).lower()
-        value = self._clean_text(entry.get("value", ""))
-        if role in ("human", "user"):
-            return value, "", ""
-        if role in ("gpt", "assistant"):
-            return "", "", value
-        return "", "", value
-
-    def _extract_chat_fields(self, entry: dict) -> Tuple[str, str, str]:
-        messages = entry.get("messages") or entry.get("chosen") or entry.get("conversations") or []
-        if not isinstance(messages, list):
-            return self._clean_text(entry.get("prompt")), "", self._clean_text(entry.get("response") or entry.get("answer", ""))
-
-        user_turns, assistant_turns = [], []
-        for msg in messages:
-            if not isinstance(msg, dict):
+    def __next__(self) -> Dict[str, Any]:
+        self._top_up()
+        if not self._runs:
+            raise StopIteration
+        while True:
+            if (not self._first_row_seen
+                    and (time.monotonic() - self._created) > self._first_row_timeout):
+                raise TimeoutError(
+                    f"Streaming produced no samples within "
+                    f"{self._first_row_timeout:.0f}s ({len(self._runs)} shards in "
+                    "flight). Causes: (1) gated dataset — ensure HF_TOKEN is set and "
+                    "the repo terms are accepted; (2) Xet backend stall — "
+                    "HF_HUB_DISABLE_XET=1 is set by default; (3) network outage. "
+                    "Raise with DATA_FILE_FIRST_ROW_TIMEOUT=<seconds> if the first "
+                    "row legitimately takes longer.")
+            if self._stop.is_set():
+                raise StopIteration
+            if self._emit_pos >= len(self.plan):
+                raise StopIteration
+            idx = self.plan[self._emit_pos][0]
+            run = self._runs.get(idx)
+            if run is None:
+                # not started yet (worker top-up in progress) — poll
+                self._top_up()
+                if not self._runs:
+                    raise StopIteration
+                self._timings["network_wait_sec"] += 0.05
                 continue
-            role = str(msg.get("role") or msg.get("from") or "").lower()
-            text = self._clean_text(msg.get("content") or msg.get("value") or msg.get("text"))
+            self._current = run
+            try:
+                sample = run.queue.get(timeout=0.25)
+            except queue.Empty:
+                if run.done.is_set():
+                    self._finish_shard(idx, run)
+                    self._top_up()
+                    continue
+                self._timings["network_wait_sec"] += 0.25
+                continue
+            sample["_shard"] = idx
+            self._first_row_seen = True
+            self._consumed_raw[idx] = max(
+                self._consumed_raw.get(idx, 0), int(sample.get("_raw_seq", 0)))
+            self._gated += 1
+            if self.limit and self._gated >= self.limit:
+                self._stop.set()
+            return sample
+
+    def _top_up(self) -> None:
+        while self._plan_pos < len(self.plan) and len(self._runs) < self.workers:
+            self._start_run(self.plan[self._plan_pos])
+            self._plan_pos += 1
+
+    def _start_run(self, shard: Tuple[int, int]) -> None:
+        run = _ShardRun(shard)
+        run.thread = threading.Thread(
+            target=self._worker, args=(run,), daemon=True,
+            name=f"shard-{shard[0]}")
+        run.thread.start()
+        self._runs[shard[0]] = run
+
+    def _worker(self, run: "_ShardRun") -> None:
+        try:
+            t0 = time.perf_counter()
+            for sample in self._stream_shard(run):
+                if self._stop.is_set():
+                    break
+                put = False
+                while not put:
+                    try:
+                        run.queue.put(sample, timeout=0.5)
+                        put = True
+                    except queue.Full:
+                        # Consumer stopped reading (target reached / closed);
+                        # abandon the sample instead of blocking forever, so
+                        # the pyarrow reader is released on close.
+                        if self._stop.is_set():
+                            break
+            run.open_sec = time.perf_counter() - t0
+        except Exception as e:
+            logger.warning("Shard %d stream failed: %s", run.shard[0], e)
+            run.failed = True
+        finally:
+            run.done.set()
+
+    def _stream_shard(self, run: "_ShardRun"):
+        """Open a shard file (Arrow iterable), skip resume rows, apply the
+        streaming-layer extraction gate (identical to stream_dataset), and
+        yield gated samples tagged (_shard, _raw_seq) for exact resume."""
+        idx, offset = run.shard
+        url = rewrite_hf_url(self.files[idx])
+        try:
+            it = load_dataset(
+                self.loader, data_files=[url], split="train",
+                streaming=True, token=self.token,
+            )
+        except Exception as e:
+            logger.warning("Shard %d open failed (%s) — retrying once", idx, e)
+            it = load_dataset(
+                self.loader, data_files=[url], split="train",
+                streaming=True, token=self.token,
+            )
+        if offset > 0:
+            it = itertools.islice(it, offset, None)
+        detected = None
+        t_extract = 0.0
+        for sample in it:
+            if self._stop.is_set():
+                break
+            run.raw_count += 1
+            if detected is None:
+                detected = detect_text_fields(sample, self.text_fields)
+            t0 = time.perf_counter()
+            text = extract_text(sample, detected)
+            t_extract += time.perf_counter() - t0
             if not text:
                 continue
-            if role in ("assistant", "gpt", "model", "bot"):
-                assistant_turns.append(text)
-            elif role in ("user", "human", "prompter", "customer"):
-                user_turns.append(text)
+            yield {**sample, "text": text, "_raw_seq": run.raw_count}
+        self._timings["extraction_sec"] += t_extract
 
-        user_text = user_turns[-1] if user_turns else ""
-        asst_text = assistant_turns[-1] if assistant_turns else ""
-        return user_text, "", asst_text
+    def _finish_shard(self, idx: int, run: "_ShardRun") -> None:
+        open_sec = run.open_sec or 0.0
+        self._timings["arrow_open_sec"] += open_sec
+        self._timings["arrow_open_max_sec"] = max(
+            self._timings["arrow_open_max_sec"], open_sec)
+        if run.failed:
+            self._failed_shards.append(idx)
+        self._raw_done[idx] = run.raw_count
+        del self._runs[idx]
+        if self._current is run:
+            self._current = None
+        self._emit_pos += 1
+        if self.on_progress is not None:
+            try:
+                self.on_progress(idx, run.raw_count, failed=run.failed)
+            except Exception as e:
+                logger.warning("Progress callback failed: %s", e)
 
-    def _extract_code_contests(self, entry: dict) -> Tuple[str, str, str]:
-        desc = self._clean_text(entry.get("description", ""))
-        solutions = entry.get("solutions", {})
-        if isinstance(solutions, dict):
-            sol_list = solutions.get("solution", [])
-        elif isinstance(solutions, list):
-            sol_list = solutions
+    def progress_state(self) -> Tuple[int, int]:
+        """(next shard to read, raw offset within it) — the exact resume point.
+
+        The offset counts raw rows CONSUMED by the consumer (not merely pulled
+        into a worker buffer), so resuming skips exactly what was already
+        handed to downstream processing — no duplicates, no gaps. Returns
+        (-1, 0) when the whole plan was exhausted."""
+        if self._emit_pos < len(self.plan):
+            idx = self.plan[self._emit_pos][0]
+            consumed = self._consumed_raw.get(idx, 0)
+            return idx, consumed
+        return -1, 0
+
+    def raw_rows(self) -> int:
+        """Raw rows consumed across all shards (finished + current)."""
+        current = self._current.raw_count if self._current is not None else 0
+        return sum(self._raw_done.values()) + current
+
+    def gated_count(self) -> int:
+        return self._gated
+
+    def timings(self) -> Dict[str, float]:
+        return dict(self._timings)
+
+    def failed_shards(self) -> List[int]:
+        return list(self._failed_shards)
+
+    def close(self) -> None:
+        self._stop.set()
+        for run in self._runs.values():
+            run.thread.join(timeout=5)
+        self._runs.clear()
+
+
+class _ShardRun:
+    __slots__ = ("shard", "queue", "done", "thread", "failed", "open_sec", "raw_count")
+
+    def __init__(self, shard: Tuple[int, int]) -> None:
+        self.shard = shard
+        self.queue: queue.Queue = queue.Queue(maxsize=512)
+        self.done = threading.Event()
+        self.thread: Optional[threading.Thread] = None
+        self.failed = False
+        self.open_sec: Optional[float] = None
+        self.raw_count: int = 0
+
+
+def resolve_and_cache(
+    path: str,
+    split: str = "train",
+    name: Optional[str] = None,
+    data_dir: Optional[str] = None,
+    revision: Optional[str] = None,
+    meta_cache: Optional[DatasetMetadataCache] = None,
+    preprocess_sig: str = "",
+    token_sig: str = "",
+    builder_cache=None,
+) -> bool:
+    """Resolve a dataset's driver record WITHOUT downloading any data and store
+    it in the metadata cache (file family) or builder cache (script family),
+    so later stream_dataset calls take the fast path.
+
+    Uses load_dataset_builder + as_streaming_dataset (metadata only), the same
+    shard-source capture used by the cold path. Returns True when a usable
+    record is available afterwards (either it already was, or resolution
+    succeeded). Never raises — resolution failures are logged and return False.
+    """
+    info_like = SimpleNamespace(path=path, name=name, split=split, data_dir=data_dir)
+    if builder_cache is not None:
+        from src.data.drivers import DRIVER_KIND_STREAMING, detect_driver
+
+        drv, diag = detect_driver(
+            info_like, meta_cache, builder_cache, preprocess_sig, token_sig,
+            revision=revision)
+        return (diag.get("driver_kind") != DRIVER_KIND_STREAMING
+                or drv.record is not None)
+    if meta_cache is not None and meta_cache.enabled:
+        rec = meta_cache.verify(info_like, preprocess_sig, token_sig)
+        if rec is not None:
+            return True
+        local = Path(path)
+        try:
+            if local.exists():
+                files = [str(local)] if local.is_file() else sorted(
+                    str(p) for p in local.rglob("*") if p.is_file())
+                loader = _loader_for_files(files) if files else None
+                if files and loader:
+                    rec = meta_cache.build_record(info_like, files, None,
+                                                  preprocess_sig, token_sig, loader)
+                    if meta_cache.save(rec, info_like):
+                        logger.info("Metadata resolved+cached (local): %s (%d files)",
+                                    path, len(files))
+                        return True
+                return False
+        except Exception as e:
+            logger.warning("Local metadata resolution failed for %s: %s", path, e)
+            return False
+        try:
+            builder = load_dataset_builder(
+                path,
+                name=name if name else None,
+                data_dir=data_dir if data_dir else None,
+                revision=revision if revision else None,
+                token=os.environ.get("HF_TOKEN"),
+            )
+            it = builder.as_streaming_dataset(split)
+            ex = getattr(it, "_ex_iterable", None)
+            files = extract_data_sources(ex) if ex is not None else []
+            loader = _loader_for_files(files) if files else None
+            if files and loader:
+                rec = meta_cache.build_record(info_like, files, revision, preprocess_sig, token_sig, loader)
+                if meta_cache.save(rec, info_like):
+                    logger.info("Metadata resolved+cached: %s/%s (%d shards)",
+                                path, name or "default", len(files))
+                    return True
+            else:
+                logger.info("No file-list metadata captured for %s/%s (script/streaming dataset)",
+                            path, name or "default")
+                return False
+        except Exception as e:
+            _handle_load_error(path, e)
+            return False
+    return False
+
+
+def stream_dataset(
+    path: str,
+    split: str = "train",
+    name: Optional[str] = None,
+    data_dir: Optional[str] = None,
+    streaming: bool = True,
+    limit: Optional[int] = None,
+    text_fields: Optional[List[str]] = None,
+    meta_cache: Optional[DatasetMetadataCache] = None,
+    preprocess_sig: str = "",
+    token_sig: str = "",
+) -> Generator[Dict[str, Any], None, None]:
+    kwargs: dict = {"path": path, "split": split, "streaming": streaming}
+    if name:
+        kwargs["name"] = name
+    if data_dir:
+        kwargs["data_dir"] = data_dir
+
+    detected_fields = None
+    count = 0
+
+    info_like = SimpleNamespace(path=path, name=name, split=split, data_dir=data_dir)
+
+    # Fast path: reuse previously resolved metadata (no repo/shard resolution).
+    if meta_cache is not None and meta_cache.enabled:
+        rec = meta_cache.verify(info_like, preprocess_sig, token_sig)
+        if rec is not None:
+            logger.info("Dataset cache found: %s/%s", path, name or "default")
+            logger.info("  Repository unchanged | metadata reused (%d shards)",
+                        rec.get("num_shards", 0))
+            logger.info("  Arrow reused — direct iterable, no HF resolution")
+            logger.info("  Streaming begins (no HF resolution)")
+            try:
+                for sample in stream_from_record(rec, limit=limit, token=os.environ.get("HF_TOKEN")):
+                    if detected_fields is None:
+                        detected_fields = detect_text_fields(sample, text_fields)
+                    text = extract_text(sample, detected_fields)
+                    if text:
+                        yield {**sample, "text": text}
+                        count += 1
+                        if limit and count >= limit:
+                            return
+                return
+            except Exception as e:
+                logger.warning("Fast-path streaming failed for %s (%s) — "
+                               "re-resolving dataset metadata", path, e)
+                meta_cache.invalidate(path, name, split)
         else:
-            return desc, "", ""
-        if isinstance(sol_list, list) and len(sol_list) > 0:
-            return desc, "", self._clean_text(sol_list[0])
-        return desc, "", ""
+            logger.info("Dataset cache not found (or fingerprint changed) for %s/%s",
+                        path, name or "default")
 
-    @staticmethod
-    def _normalize_language(lang: str) -> str:
-        aliases = {
-            "c++": "cpp", "cc": "cpp", "cxx": "cpp", "py": "python",
-            "python3": "python", "js": "javascript", "jsx": "javascript",
-            "ts": "typescript", "tsx": "typescript", "go": "golang",
-            "bash": "shell", "sh": "shell", "markdown": "text", "md": "text",
-        }
-        return aliases.get(lang.strip().lower(), lang.strip().lower())
+    try:
+        ds = load_dataset(**kwargs)
+    except Exception as e:
+        _handle_load_error(path, e)
+        return
 
-    def _detect_entry_language(self, entry: dict, content: str) -> str:
-        forced = entry.get("language") or entry.get("lang") or entry.get("programming_language") or entry.get("ext")
-        if forced:
-            return self._normalize_language(str(forced))
-        return self._detect_language(content)
+    if ds is None:
+        logger.error("load_dataset returned None for %s", path)
+        return
 
-    @staticmethod
-    def _detect_language(content: str) -> str:
-        lower = content.lower()
-        markers = {
-            "python": ["def ", "import ", "if __name__", "elif ", "except ", "raise "],
-            "rust": ["fn ", "let mut", "impl ", "match ", "pub "],
-            "golang": ["func ", "package ", "chan ", "select {", "go "],
-            "cpp": ["#include", "std::", "int main(", "public:", "virtual ", "::iterator"],
-            "java": ["public class", "System.out.println", "@Override", "private static", "protected void"],
-            "typescript": ["interface ", "type ", "as string", "readonly ", ": string"],
-            "javascript": ["const ", "let ", "=>", "function ", "export default"],
-            "csharp": ["using System", "namespace ", "Console.WriteLine"],
-            "ruby": ["def ", "end", "require ", "module "],
-            "swift": ["func ", "var ", "let ", "guard "],
-            "kotlin": ["fun ", "val ", "var ", "data class"],
-            "sql": ["SELECT ", "INSERT INTO", "CREATE TABLE"],
-            "shell": ["#!/bin/bash", "#!/bin/sh", "if [[", "export "],
-            "php": ["<?php", "$this->", "public function"],
-            "perl": ["#!/usr/bin/perl", "use strict"],
-            "scala": ["object ", "def main(", "import scala"],
-            "lua": ["function ", "local "],
-            "r": ["library(", "ggplot("],
-            "haskell": ["::", "where", "data "],
-            "dart": ["void main", "import 'package:"],
-            "elixir": ["defmodule", "def do"],
-            "julia": ["function ", "println("],
-            "fsharp": ["let ", "module "],
-        }
-        scores = {}
-        for lang, sigs in markers.items():
-            count = sum(1 for s in sigs if s in lower)
-            if count > 0:
-                scores[lang] = count
-        if scores:
-            return max(scores, key=scores.get)
-        nl_markers = ["the ", "is ", "are ", "was ", "were ", "have ", "has ", "do ", "does ", "an ", "this ", "that ", "with ", "for ", "not ", "but ", "can ", "all ", "its "]
-        if sum(1 for m in nl_markers if m in lower) >= 2:
-            return "text"
-        return "python"
+    if isinstance(ds, (DatasetDict, IterableDatasetDict)):
+        try:
+            ds = ds[split]
+        except KeyError:
+            logger.exception("Split '%s' not found in %s (available: %s)",
+                             split, path, list(ds.keys()))
+            return
 
-    @staticmethod
-    def _is_valid_sample(content: str, language: str) -> bool:
-        if not content or len(content) < 50 or len(content) > 250000:
-            return False
-        lowered = content.lower()
-        bad = ["lorem ipsum", "todo: add code", "your code here", "coming soon", "placeholder", "under construction"]
-        if any(m in lowered for m in bad):
-            return False
-        signals = {
-            "python": ["def ", "import ", "class "],
-            "rust": ["fn ", "let ", "use "],
-            "golang": ["func ", "package "],
-            "cpp": ["#include", "int ", "void "],
-            "java": ["class ", "public ", "private ", "protected "],
-            "typescript": ["interface ", "export "],
-            "javascript": ["function", "const ", "let "],
-            "csharp": ["class ", "void ", "int ", "string "],
-            "ruby": ["def ", "end", "do "],
-            "swift": ["func ", "var ", "let "],
-            "kotlin": ["fun ", "val ", "var "],
-            "php": ["<?php", "function "],
-            "sql": ["select", "from", "where "],
-            "shell": ["#!/", "echo ", "export "],
-            "perl": ["my ", "sub ", "use "],
-            "scala": ["def ", "val ", "object "],
-            "lua": ["function ", "local "],
-            "r": ["<-", "function(", "library"],
-            "haskell": [" :: ", "->"],
-            "dart": ["void ", "class ", "import "],
-            "elixir": ["defmodule", "def "],
-            "julia": ["function ", "println"],
-            "fsharp": ["let ", "module "],
-            "text": ["the ", "is ", "are ", "was "],
-        }
-        sigs = signals.get(language, [" "])
-        return any(s in lowered for s in sigs)
+    if meta_cache is not None and meta_cache.enabled:
+        ex = getattr(ds, "_ex_iterable", None)
+        files = extract_data_sources(ex) if ex is not None else []
+        from src.data.metadata_cache import _loader_for_files
+        loader = _loader_for_files(files) if files else None
+        if files and loader:
+            rec = meta_cache.build_record(info_like, files, None, preprocess_sig, token_sig, loader)
+            if meta_cache.save(rec, info_like):
+                logger.info("Metadata cached for %s/%s (%d shards)",
+                            path, name or "default", len(files))
+        else:
+            logger.info("No file-list metadata captured for %s/%s (script/streaming dataset)",
+                        path, name or "default")
+
+    for sample in ds:
+        if detected_fields is None:
+            detected_fields = detect_text_fields(sample, text_fields)
+            logger.debug("Detected fields for %s: %s", path, detected_fields)
+        text = extract_text(sample, detected_fields)
+        if text:
+            yield {**sample, "text": text}
+            count += 1
+            if limit and count >= limit:
+                return
+
+    logger.info("Streamed %d samples from %s/%s", count, path, name or "default")
+
+
+def stream_dataset_with_fallbacks(
+    info: DatasetInfo,
+    registry: DatasetRegistry,
+    limit: Optional[int] = None,
+    meta_cache: Optional[DatasetMetadataCache] = None,
+    preprocess_sig: str = "",
+    token_sig: str = "",
+) -> Generator[Dict[str, Any], None, None]:
+    tried: List[str] = []
+    chain = [info]
+    for fb_path in info.fallbacks:
+        fb_entry = registry.get_by_path_category(fb_path, info.category)
+        if fb_entry:
+            chain.append(fb_entry)
+
+    for entry in chain:
+        key = f"{entry.path}/{entry.name or 'default'}"
+        if key in tried:
+            continue
+        tried.append(key)
+        logger.info("Loading dataset: %s/%s (cat=%s, weight=%.3f, qs=%.2f)",
+                     entry.path, entry.name or "default", entry.category,
+                     entry.weight, entry.quality_score)
+        count = 0
+        try:
+            for sample in stream_dataset(
+                path=entry.path,
+                split=entry.split,
+                name=entry.name,
+                data_dir=entry.data_dir,
+                streaming=entry.streaming,
+                limit=limit,
+                text_fields=entry.text_fields,
+                meta_cache=meta_cache,
+                preprocess_sig=preprocess_sig,
+                token_sig=token_sig,
+            ):
+                yield sample
+                count += 1
+        except Exception:
+            logger.exception("Stream failed for %s", key)
+            continue
+        if count > 0:
+            if key != f"{info.path}/{info.name or 'default'}":
+                registry.log_fallback(f"{info.path}/{info.name or 'default'}", key)
+            return
+        logger.warning("Dataset %s returned 0 samples, trying fallback %s", key,
+                       entry.fallbacks if entry is info else "none")
+
+    logger.error("All fallbacks exhausted for %s/%s", info.path, info.name or "default")
+
+
+class StreamingManager:
+    def __init__(self, registry: DatasetRegistry) -> None:
+        self.registry = registry
+        self._skip_counters: Dict[str, int] = {}
+
+    def stream_all(self, limit_per_dataset: Optional[int] = None) -> Generator[Dict[str, Any], None, None]:
+        for info in self.registry.all_entries():
+            key = f"{info.path}/{info.name or 'default'}/{info.category}"
+            self._skip_counters[key] = 0
+            yield from stream_dataset_with_fallbacks(info, self.registry, limit=limit_per_dataset)
+
+    def stream_category(self, category: str, limit_per_dataset: Optional[int] = None) -> Generator[Dict[str, Any], None, None]:
+        for info in self.registry.all_entries():
+            if info.category == category:
+                yield from stream_dataset_with_fallbacks(info, self.registry, limit=limit_per_dataset)
+
+    def skip_rate(self) -> Dict[str, float]:
+        total = sum(self._skip_counters.values())
+        if total == 0:
+            return {}
+        return {k: v / total for k, v in self._skip_counters.items()}
+
+
+class MassiveDataCollector:
+    """Legacy wrapper for backward compatibility."""
+    def __init__(self, datasets_cfg: Optional[List] = None) -> None:
+        self.datasets = datasets_cfg or []
+
+    def get_dataset_list(self):
+        return self.datasets
+
+    def stream_single_dataset(self, ds_info, limit=None, theme="all", skip_samples=0, raw_text=True):
+        try:
+            info = DatasetInfo(
+                path=ds_info.path,
+                category=ds_info.category,
+                weight=getattr(ds_info, 'weight', 1.0),
+                quality_score=getattr(ds_info, 'quality_score', 0.5),
+                name=getattr(ds_info, 'name', None),
+                split=getattr(ds_info, 'split', 'train'),
+                text_fields=getattr(ds_info, 'text_fields', None),
+            )
+            registry = DatasetRegistry()
+            registry.register(info)
+            yield from stream_dataset_with_fallbacks(info, registry, limit=limit)
+        except Exception:
+            logger.exception("stream_single_dataset(%s) failed",
+                             ds_info.path if hasattr(ds_info, 'path') else str(ds_info))
+            return

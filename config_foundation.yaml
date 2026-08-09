@@ -1,0 +1,522 @@
+# ======================================================================
+# Methos Foundation Pretraining Configuration
+# Optimized for Single NVIDIA A100 80GB
+# Target: ~160M parameters
+# ======================================================================
+
+project:
+  name: Methos Foundation
+  seed: 42
+
+model:
+  name: Methos Foundation
+  dtype: bfloat16
+  device: auto
+  train_from_scratch: true
+
+  architecture:
+    model_type: methos_v3
+    vocab_size: 64000
+    hidden_size: 576
+    gradient_checkpointing: false
+    activation_checkpointing: false
+    tie_word_embeddings: true
+
+    methos_v3:
+      d_state: 288
+      d_hidden: 576
+      n_ssm_layers: 3
+      n_hssm_levels: 2
+      n_ode_steps: 4
+      use_efficient_sandbox: true
+      n_trajectories: 2
+      n_sim_steps: 8
+      n_experts: 2
+      n_debate_rounds: 1
+      max_reasoning_steps: 8
+      max_subgoals: 16
+      n_token_categories: 8
+      n_languages: 8
+      n_doc_roles: 8
+      n_task_types: 8
+      n_difficulty_levels: 5
+      n_reasoning_types: 8
+      n_context_adapter_blocks: 1
+      n_language_groups: 8
+      working_mem_capacity: 128
+      max_episodes: 64
+      n_semantic_concepts: 512
+      max_entities: 16
+      n_relation_types: 8
+      max_events: 8
+      adaptive_top_k_min: 32
+      adaptive_top_k_max: 128
+      qa_max_passes: 1
+      qa_converge_threshold: 0.05
+      max_refinement_passes: 1
+      max_repair_iters: 1
+      enable_executive: true
+      enable_world_model: false
+      enable_learning_controller: false
+      enable_tools: false
+      enable_curiosity: false
+      enable_aux_losses: false
+      executive_gate_threshold: 0.3
+
+    max_position_embeddings: 4096
+    rope_theta: 10000000.0
+    rope_scaling:
+      type: yarn
+      factor: 16.0
+      target_max_length: 65536
+      original_max_position_embeddings: 4096
+
+# ======================================================================
+# Training
+# ======================================================================
+
+training:
+  max_seq_length: 2048
+  response_only_loss: true
+  ignore_data_skip: true
+  save_steps: 5000
+  save_total_limit: 5
+  eval_strategy: "no"
+  logging_steps: 50
+
+  pretrain:
+    enabled: true
+    learning_rate: 1e-4
+    lr_scheduler_type: cosine
+    warmup_steps: 3000
+    max_grad_norm: 1.0
+    weight_decay: 0.1
+    batch_size: 4
+    gradient_accumulation_steps: 4
+    max_steps: 50000
+    optimizer: adamw_fused
+
+    # Staged pretraining: 8 category groups, run sequentially with a single
+    # Trainer (one cosine schedule over the full 50k steps). Each stage stops
+    # at its cumulative step count, saves a FULL checkpoint (model + optimizer
+    # + scheduler + RNG), and the next stage resumes from it. Datasets are
+    # cached per stage under stage_cache_dir/stageN/ — on a cache hit no
+    # streaming/tokenization happens and training starts immediately.
+    # Total of stage.steps must equal pretrain.max_steps.
+    # mode: "dataset" trains ONE dataset per segment — every registry dataset
+    # becomes its own training unit with a full checkpoint at each unit
+    # boundary (resume from checkpoint after every dataset) and a per-dataset
+    # cache at stage_cache_dir/stageN/uM/. "stage" keeps the legacy whole-stage
+    # dataset.
+    staging:
+      enabled: true
+      stage_cache_dir: ./hf_cache/stages
+      prefetch: true
+      mode: dataset
+      stages:
+        - name: code
+          description: "Code and programming datasets"
+          categories: [code]
+          steps: 8000
+        - name: docs
+          description: "Documentation and API references"
+          categories: [docs]
+          steps: 6000
+        - name: web_text
+          description: "General web text"
+          categories: [web_text]
+          steps: 10000
+        - name: wiki
+          description: "Wikipedia and encyclopedia articles"
+          categories: [wiki]
+          steps: 6000
+        - name: math
+          description: "Mathematics datasets"
+          categories: [math]
+          steps: 6000
+        - name: science
+          description: "Science and research datasets"
+          categories: [science]
+          steps: 6000
+        - name: books
+          description: "Books and long-form prose"
+          categories: [books]
+          steps: 6000
+        - name: structured_knowledge
+          description: "Structured knowledge bases"
+          categories: [structured_knowledge]
+          steps: 2000
+
+  sft:
+    enabled: false
+
+  instruction_tuning:
+    enabled: false
+
+  alignment:
+    enabled: false
+
+  safety:
+    enabled: false
+
+# ======================================================================
+# Distributed
+# ======================================================================
+
+distributed:
+  strategy: none
+  fsdp:
+    enabled: false
+    activation_checkpointing: false
+
+# ======================================================================
+# Data — Production Foundation Pretraining Pipeline
+# ======================================================================
+
+data:
+
+  hf_token: 
+  use_registry: true
+  cache_dir: ./hf_cache
+  streaming: true
+  max_cache_gb: 100
+
+  # Persistent dataset metadata cache: resolved HF file lists + fingerprints
+  # are saved so subsequent runs skip repository/shard resolution entirely
+  # ("Resolving data files..." disappears). Invalidated automatically when
+  # repo, subset, split, revision, preprocessing or tokenizer changes.
+  metadata_cache:
+    enabled: true
+    dir: ./hf_cache/datasets
+    fingerprint_version: 1
+
+  # Cap on raw samples streamed per dataset before cleanup.
+  # null -> per-dataset max_samples -> DEFAULT_MAX_SAMPLES_PER_DATASET (100000).
+  # For an end-to-end SMOKE TEST set this low (e.g. 5000) so the first
+  # optimizer step is reached quickly; raise/remove for the real run.
+  max_samples_per_dataset: null
+
+  # Packed-dataset disk cache (hf_cache/registry/). After the first full
+  # cleanup+tokenize+pack pass per dataset, results are cached and replayed
+  # on reruns so the pipeline starts at the first optimizer step instantly.
+  # The cache key includes max_samples, seq length, dedup/quality/preprocess
+  # settings, so any config change rebuilds automatically.
+  use_packed_cache: true
+
+  # ====================================================================
+  # Preprocessing
+  # ====================================================================
+  preprocessing:
+    remove_boilerplate: true
+    min_text_length: 100
+    max_text_length: 250000
+    collapse_blank_lines: true
+    strip_trailing_spaces: true
+
+    license_keywords:
+      - copyright
+      - license
+      - spdx
+      - apache
+      - mit license
+      - licensed under
+      - all rights reserved
+      - gnu general public
+      - gnu lesser general public
+      - gnu affero general public
+      - redistribution and use
+      - permission is hereby granted
+      - this file is part of
+      - generated by
+      - auto-generated
+      - do not edit
+      - this code was generated
+      - bsd license
+      - mozilla public license
+
+    boilerplate_file_patterns:
+      - _pb2.py
+      - _pb2_grpc.py
+      - _grpc_pb2.py
+      - generated/
+      - build/
+      - dist/
+      - vendor/
+      - node_modules/
+      - .git/
+      - __pycache__/
+      - .min.js
+      - .min.css
+      - .bundle.js
+      - package-lock.json
+      - yarn.lock
+      - go.sum
+
+    autogen_patterns:
+      - auto-generated
+      - autogenerated
+      - do not edit
+      - this file is generated
+      - this code was generated
+      - generated by the protocol buffer
+      - generated by the swagger
+      - source code is machine-generated
+      - this file was automatically generated
+
+    removal_comment_markers:
+      - '#'
+      - '//'
+      - '/*'
+      - '*'
+      - '"""'
+      - "'''"
+      - '--'
+      - ';'
+
+  # ====================================================================
+  # AST-aware Code Filtering
+  # ====================================================================
+  ast_filter:
+    code_filtering: true
+    reject_no_parse: true
+    reject_autogen: true
+    reject_syntax_corruption: true
+    reject_one_liner: true
+    reject_few_identifiers: true
+    max_one_liner_ratio: 0.95
+    min_identifier_ratio: 0.05
+    min_executable_ratio: 0.10
+
+  # ====================================================================
+  # Function-level Sampling
+  # ====================================================================
+  function_sampling:
+    enabled: false  # Enable for code-heavy stages
+    strategies:
+      - function
+      - class
+    min_body_lines: 3
+    max_body_lines: 500
+    per_file_limit: 20
+
+  # ====================================================================
+  # Weighted Sampler
+  # ====================================================================
+  sampler:
+    balance_by: tokens  # "documents" or "tokens"
+    use_token_weights: true
+
+  # ====================================================================
+  # Language Balancing
+  # ====================================================================
+  language_balancing:
+    enabled: false
+    target_distribution:
+      python: 0.35
+      cpp: 0.15
+      javascript: 0.10
+      java: 0.10
+      rust: 0.08
+      go: 0.07
+      sql: 0.05
+      shell: 0.05
+      csharp: 0.05
+    min_samples_per_language: 100
+
+  # ====================================================================
+  # Domain Balancing
+  # ====================================================================
+  domain_balancing:
+    enabled: false
+    include:
+      backend: 0.15
+      frontend: 0.10
+      ml: 0.15
+      cv: 0.05
+      nlp: 0.10
+      databases: 0.08
+      networking: 0.08
+      systems: 0.10
+      security: 0.05
+      embedded: 0.04
+      mobile: 0.05
+      web: 0.05
+
+  # ====================================================================
+  # Quality Pipeline
+  # ====================================================================
+  quality:
+    min_length: 30
+    max_length: 500000
+
+    deduplication:
+      enabled: true
+      method: simhash   # exact | minhash | simhash
+      threshold: 0.85
+
+    contamination:
+      enabled: true
+      benchmarks:
+        - human_eval
+        - mbpp
+        - mmlu
+        - gsm8k
+        - arc
+        - hellaswag
+        - truthfulqa
+
+    quality_scoring:
+      enabled: true
+      method: heuristic
+
+    language_detection:
+      enabled: true
+
+    toxicity_filtering:
+      enabled: true
+
+  # ====================================================================
+  # Curriculum (disabled by default)
+  # ====================================================================
+  curriculum:
+    enabled: false
+
+    stages:
+      - name: foundation
+        max_steps: 10000
+        dataset_filter: ['web_text', 'wiki', 'books']
+        description: "Language fundamentals: web text, Wikipedia, books"
+
+      - name: code_basics
+        max_steps: 25000
+        dataset_filter: ['code', 'docs', 'web_text', 'wiki']
+        description: "Introduce code, documentation, and technical writing"
+
+      - name: reasoning
+        max_steps: 40000
+        dataset_filter: ['code', 'math', 'science', 'docs']
+        description: "Mathematics, science, reasoning, advanced code"
+
+      - name: full_mix
+        max_steps: 50000
+        dataset_filter: null
+        description: "Full mixture — all categories"
+
+  # ====================================================================
+  # Synthetic Reasoning (disabled)
+  # ====================================================================
+  synthetic_reasoning:
+    enabled: false
+    max_chains: 50000
+    chain_length_min: 3
+    chain_length_max: 8
+
+  # ====================================================================
+  # Sanity Checks
+  # ====================================================================
+  sanity_checks:
+    enabled: true
+    num_samples: 5
+    max_decode_length: 512
+
+  # ====================================================================
+  # Health Reporting
+  # ====================================================================
+  health_reporting:
+    enabled: true
+    output_dir: reports
+    report_every_n_datasets: 1
+
+    # ====================================================================
+    # Dataset Registry — Production Corpus v2
+    # ====================================================================
+    # The dataset registry (src/data/registry.py) defines the full mixture
+    # with 41 entries across 8 categories. Total weight = 1.000.
+    #
+    #   Code (35%):
+    #     bigcode/the-stack-v2-dedup (19 languages): 29%
+    #     code_search_net: 2.5%
+    #     codeparrot/codeparrot-clean: 2.5%
+    #     deepmind/code_contests: 1%
+    #
+    #   Web text (20%):
+    #     HuggingFaceFW/fineweb: 18%
+    #     cerebras/SlimPajama-627B: 2%
+    #
+    #   Documentation (15%):
+    #     HuggingFaceFW/fineweb-edu (general + ml): 15%
+    #
+    #   Wikipedia / Reference (10%):
+    #     wikimedia/wikipedia (20231101.en): 10%
+    #
+    #   Mathematics (8%):
+    #     open-web-math/open-web-math: 3%
+    #     AI-MO/NuminaMath-CoT: 2%
+    #     AI-MO/NuminaMath-1.5: 1.5%
+    #     GAIR/MathPile: 1%
+    #     FineWeb-Edu (math proxy): 0.5%
+    #
+    #   Scientific Literature (5%):
+    #     S2ORC: 2.5%
+    #     FineWeb-Edu (science proxy): 1.5%
+    #     OpenAlex: 1%
+    #
+    #   Books (5%):
+    #     deepmind/pg19: 2.5%
+    #     FineWeb-Edu (books proxy): 1.5%
+    #     FineWeb (books proxy): 1%
+    #
+    #   Structured Knowledge (2%):
+    #     google/wit: 1%
+    #     FineWeb-Edu (structured proxy): 1%
+    #
+    # Fallback chains:
+    #   fineweb -> dolma -> SlimPajama -> RedPajama -> Falcon RefinedWeb
+    #   NuminaMath-CoT -> NuminaMath-1.5
+    #   MathPile -> open-web-math
+    #   code_contests -> Stack v2
+    #   pg19 -> fineweb-edu
+    #   openalex -> fineweb-edu
+    #   google/wit -> fineweb-edu
+    # ====================================================================
+
+  # Registry mode (use_registry: true) drives the dataset mixture.
+  # This datasets list is ignored when use_registry is enabled.
+  datasets: []
+
+# ======================================================================
+# Tokenizer
+# ======================================================================
+
+tokenizer:
+  source: huggingface
+  huggingface_model: Xenova/claude-tokenizer
+  vocab_size: 64000
+  max_samples: 100000
+  type: bpe
+  force: false
+  add_bos_token: true
+  add_eos_token: true
+
+# ======================================================================
+# Output
+# ======================================================================
+
+output:
+  model_dir: ./models/methos-foundation
+  data_dir: ./data
+  checkpoint_dir: ./models/methos-foundation/checkpoints
+  log_dir: ./logs
+  experiment_tracking:
+    enabled: false
+
+# ======================================================================
+# Generation
+# ======================================================================
+
+generation:
+  max_new_tokens: 4096
+  temperature: 0.7
+  top_p: 0.9
+  top_k: 40
+  do_sample: true

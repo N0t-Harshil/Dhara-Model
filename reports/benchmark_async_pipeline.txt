@@ -1,0 +1,34 @@
+# Async Pipeline Benchmark (offline, synthetic)
+date: 2026-08-05 13:30:51
+units: 6, build: 250ms, train: 200ms, checkpoint payload: 64MB
+
+## 1. Prefetch overlap (build hidden behind training)
+  sequential: 2703ms
+  prefetched: 1454ms
+  hidden:     83.3%
+
+## 2. Unit startup: cold vs warm cache
+  cold wall: 515ms (6 units, 250ms build each)
+  warm wall: 0ms
+  cold build total: 1502ms
+  warm build total: 6ms
+  speedup:   273x
+
+## 3. Async checkpoint writer (caller-side block)
+  submit (async):      0.0ms (ok=True)
+  flush (durability):  297.0ms (flushed=True)
+  synchronous write:   109.0ms
+  GPU thread unblocked: 100.0% of the sync write time
+
+## 4. Telemetry accounting overhead
+  0.157us per counter op (lock+accumulate)
+
+## 5. Persistent cleanup pool
+  created once & reused: True
+  workers:              2
+  close() cost:         16.0ms (joins then terminates)
+
+## 6. Failure isolation (unit 3 of 6 crashes)
+  failed unit marked: True
+  all other units delivered in order: True
+  run completed in 500ms (no stall, no deadlock)

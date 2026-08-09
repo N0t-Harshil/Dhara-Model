@@ -16,4 +16,4 @@ def set_seed(seed: int = 42, deterministic: bool = True) -> None:
         torch.backends.cudnn.benchmark = False
         os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
         if hasattr(torch, "use_deterministic_algorithms"):
-            torch.use_deterministic_algorithms(True, warn_only=True)
+            torch.use_deterministic_algorithms(False)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import inspect
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -262,6 +263,12 @@ class ModelTrainer:
             dataloader_pin_memory=True,
         )
 
+        # transformers >= 5.0 removed the `tokenizer` kwarg from
+        # Trainer.__init__ in favor of `processing_class`.
+        tokenizer_kwarg = (
+            "processing_class" if "processing_class" in inspect.signature(Trainer.__init__).parameters else "tokenizer"
+        )
+
         self._trainer = Trainer(
             model=self._unwrap_model,
             args=training_args,
@@ -269,7 +276,11 @@ class ModelTrainer:
             eval_dataset=eval_dataset,
             data_collator=DefaultDataCollator(),
             callbacks=[_LoggingCallback()],
-            tokenizer=getattr(self.model, "tokenizer", self._data_pipeline.tokenizer if self._data_pipeline else None),
+            **{
+                tokenizer_kwarg: getattr(
+                    self.model, "tokenizer", self._data_pipeline.tokenizer if self._data_pipeline else None
+                )
+            },
         )
 
         result = self._trainer.train(resume_from_checkpoint=resume_from_checkpoint)

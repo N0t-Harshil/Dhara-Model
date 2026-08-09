@@ -10,6 +10,15 @@ import time
 from pathlib import Path
 from typing import Optional
 
+def _resolve_checkpoint(cfg) -> str:
+    model_dir = Path(cfg.output.model_dir)
+    if (model_dir / "config.json").exists() or (model_dir / "pytorch_model.bin").exists() or (model_dir / "model.safetensors").exists():
+        return str(model_dir)
+    candidates = sorted(model_dir.rglob("checkpoint-*"), key=lambda p: int(p.name.split("-")[-1]), reverse=True)
+    if candidates:
+        return str(candidates[0])
+    return str(model_dir)
+
 # ── GPU selection: must run before import torch ──────────────────────
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -95,6 +104,14 @@ logger = logging.getLogger("main")
 # COMMANDS
 # ===================================================================
 
+def _apply_hf_token_env(cfg) -> None:
+    """Set HF_TOKEN from config before any hub/datasets import so downloads
+    are authenticated (tokenizer download runs before DataPipeline exists)."""
+    token = getattr(getattr(cfg, "data", None), "hf_token", None)
+    if token:
+        os.environ.setdefault("HF_TOKEN", token)
+
+
 def cmd_full_training(args: argparse.Namespace) -> None:
     """Run the complete training sequence (pretrain -> SFT -> instruction tuning)."""
     from src.config.schema import load_config
@@ -104,6 +121,7 @@ def cmd_full_training(args: argparse.Namespace) -> None:
 
     config_path = os.path.join(_PROJECT_DIR, args.config)
     cfg = load_config(config_path)
+    _apply_hf_token_env(cfg)
     dist = DistributedSetup(cfg)
 
     if dist.is_main_process():
@@ -163,8 +181,9 @@ def cmd_generate(args: argparse.Namespace) -> None:
 
     config_path = os.path.join(_PROJECT_DIR, args.config)
     cfg = load_config(config_path)
+    checkpoint = args.checkpoint or _resolve_checkpoint(cfg)
     tokenizer = ModelFactory.load_tokenizer(args.tokenizer, cfg)
-    model, _ = ModelFactory.load_model(args.checkpoint, cfg, tokenizer)
+    model, _ = ModelFactory.load_model(checkpoint, cfg, tokenizer, strict=True)
     model.eval()
     if torch.cuda.is_available():
         model = model.cuda()
@@ -232,11 +251,12 @@ def cmd_benchmark(args: argparse.Namespace) -> None:
     from src.config.schema import load_config
     from src.evaluation.benchmarks import BenchmarkRunner
     from src.models.factory import ModelFactory
-
     config_path = os.path.join(_PROJECT_DIR, args.config)
     cfg = load_config(config_path)
+    checkpoint = args.checkpoint or _resolve_checkpoint(cfg)
     tokenizer = ModelFactory.load_tokenizer(args.tokenizer, cfg)
-    model, _ = ModelFactory.load_model(args.checkpoint, cfg, tokenizer)
+    model, _ = ModelFactory.load_model(checkpoint, cfg, tokenizer, strict=True)
+
     model.eval()
     if torch.cuda.is_available():
         model = model.cuda()
@@ -383,7 +403,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_gen = sub.add_parser("generate", help="Generate code from a prompt", parents=[sub_parent_parser])
     p_gen.add_argument("--prompt", type=str, help="Prompt text (or pipe to stdin)")
-    p_gen.add_argument("--checkpoint", type=str, default="models/methos", help="Model checkpoint path")
+    p_gen.add_argument("--checkpoint", type=str, default=None, help="Model checkpoint path (default: from config)")
     p_gen.add_argument("--tokenizer", type=str, default="models/tokenizer", help="Tokenizer path")
     p_gen.add_argument("--max-new-tokens", type=int, default=1024)
     p_gen.add_argument("--temperature", type=float, default=0.7)
@@ -399,7 +419,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_dl.add_argument("--force", action="store_true", help="Overwrite existing tokenizer")
 
     p_bench = sub.add_parser("benchmark", help="Run coding benchmarks", parents=[sub_parent_parser])
-    p_bench.add_argument("--checkpoint", type=str, default="models/methos", help="Model checkpoint path")
+    p_bench.add_argument("--checkpoint", type=str, default=None, help="Model checkpoint path (default: from config)")
     p_bench.add_argument("--tokenizer", type=str, default="models/tokenizer", help="Tokenizer path")
     p_bench.add_argument("--benchmarks", type=str, default="human_eval,mbpp", help="Comma-separated benchmark names")
 

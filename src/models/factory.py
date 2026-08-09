@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 import torch
+import transformers as _transformers
 from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
@@ -22,6 +23,10 @@ from transformers import (
 from src.config.schema import Config, ModelArchitectureConfig
 
 logger = logging.getLogger(__name__)
+
+_TRANSFORMERS_MAJOR = int(_transformers.__version__.split(".")[0])
+_DTYPE_CONFIG_ATTR = "dtype" if _TRANSFORMERS_MAJOR >= 5 else "torch_dtype"
+_DTYPE_KWARG = _DTYPE_CONFIG_ATTR
 
 
 ARCH_CONFIG_MAP = {
@@ -269,7 +274,7 @@ class ModelFactory:
                 qa_max_passes=v3.qa_max_passes,
                 qa_converge_threshold=v3.qa_converge_threshold,
             )
-            model_config.torch_dtype = dtype
+            setattr(model_config, _DTYPE_CONFIG_ATTR, dtype)
             model = MethosV3Model(config=model_config)
             return model
 
@@ -301,7 +306,9 @@ class ModelFactory:
         )
 
         _, model_cls = ARCH_CONFIG_MAP.get(model_type, (AutoConfig, AutoModelForCausalLM))
-        model = model_cls.from_config(arch_cfg, torch_dtype=dtype)
+        if _TRANSFORMERS_MAJOR >= 5 and not hasattr(model_cls, "from_config"):
+            model_cls = AutoModelForCausalLM
+        model = model_cls.from_config(arch_cfg, **{_DTYPE_KWARG: dtype})
 
         for param in model.parameters():
             param.requires_grad = True
@@ -416,24 +423,80 @@ class ModelFactory:
         path = Path(path)
         if not path.exists():
             raise RuntimeError(f"Tokenizer not found at {path}. Train it first.")
-        tokenizer = ModelFactory._try_load_tokenizer(path)
+        verified = ModelFactory._verify_tokenizer_cache(path)
+        if verified is not None:
+            logger.info("Tokenizer cache verified (hash match) — loading offline, no network access")
+            tokenizer = ModelFactory._try_load_tokenizer(path, offline=True)
+        else:
+            ModelFactory._write_tokenizer_manifest(path)
+            tokenizer = ModelFactory._try_load_tokenizer(path, offline=False)
         if tokenizer.pad_token is None:
             tokenizer.add_special_tokens({"pad_token": "<pad>"})
         if not hasattr(tokenizer, "padding_side") or tokenizer.padding_side != "right":
             tokenizer.padding_side = "right"
         max_len = getattr(cfg, 'model', None) and getattr(cfg.model, 'architecture', None) and cfg.model.architecture.max_position_embeddings
-        if not hasattr(tokenizer, "model_max_length") or tokenizer.model_max_length > 1_000_000:
+        if (not hasattr(tokenizer, "model_max_length")
+                or tokenizer.model_max_length is None
+                or tokenizer.model_max_length > 1_000_000):
             tokenizer.model_max_length = max_len or 4096
         return tokenizer
 
     @staticmethod
-    def _try_load_tokenizer(path: Path) -> PreTrainedTokenizerBase:
+    def _tokenizer_manifest_path(path: Path) -> Path:
+        return path / "tokenizer_version.json"
+
+    @staticmethod
+    def _hash_tokenizer_files(path: Path) -> Dict[str, str]:
+        import hashlib
+        out: Dict[str, str] = {}
+        for f in sorted(path.iterdir()):
+            if f.is_file() and f.name != "tokenizer_version.json":
+                out[f.name] = hashlib.sha256(f.read_bytes()).hexdigest()
+        return out
+
+    @staticmethod
+    def _verify_tokenizer_cache(path: Path) -> Optional[Dict[str, Any]]:
+        """Return the manifest if the on-disk tokenizer files match the stored
+        hashes (i.e. the tokenizer is exactly the version we trained and can be
+        loaded offline). Returns None otherwise."""
+        manifest_path = ModelFactory._tokenizer_manifest_path(path)
+        if not manifest_path.exists():
+            return None
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if manifest.get("version") != 1:
+                return None
+            current = ModelFactory._hash_tokenizer_files(path)
+            if manifest.get("files") != current:
+                logger.warning("Tokenizer files changed since manifest was written — re-verifying")
+                return None
+            return manifest
+        except Exception as e:
+            logger.debug("Tokenizer manifest check failed: %s", e)
+            return None
+
+    @staticmethod
+    def _write_tokenizer_manifest(path: Path) -> None:
+        try:
+            manifest = {"version": 1, "files": ModelFactory._hash_tokenizer_files(path)}
+            ModelFactory._tokenizer_manifest_path(path).write_text(
+                json.dumps(manifest, indent=2), encoding="utf-8")
+            logger.info("Tokenizer manifest written (%d files)", len(manifest["files"]))
+        except Exception as e:
+            logger.warning("Could not write tokenizer manifest: %s", e)
+
+    @staticmethod
+    def _try_load_tokenizer(path: Path, offline: bool = False) -> PreTrainedTokenizerBase:
         from transformers import PreTrainedTokenizerFast
         try:
+            if offline:
+                return AutoTokenizer.from_pretrained(str(path), trust_remote_code=False, local_files_only=True)
             return AutoTokenizer.from_pretrained(str(path), trust_remote_code=False)
         except Exception:
             pass
         try:
+            if offline:
+                return PreTrainedTokenizerFast.from_pretrained(str(path), local_files_only=True)
             return PreTrainedTokenizerFast.from_pretrained(str(path))
         except Exception:
             pass
@@ -462,6 +525,7 @@ class ModelFactory:
         path: str | Path,
         cfg: Config,
         tokenizer: Optional[PreTrainedTokenizerBase] = None,
+        strict: bool = False,
     ) -> Tuple[PreTrainedModel, PreTrainedTokenizerBase]:
         path = Path(path)
         if tokenizer is None:
@@ -474,53 +538,71 @@ class ModelFactory:
             with open(config_file) as f:
                 saved_config = json.load(f)
             model_type = saved_config.get("model_type") or saved_config.get("architecture")
-        elif cfg.model.architecture.model_type in ("nslt", "methos_v3") and (path / "pytorch_model.bin").exists():
+        elif cfg.model.architecture.model_type in ("nslt", "methos_v3") and ((path / "pytorch_model.bin").exists() or (path / "model.safetensors").exists()):
             model_type = cfg.model.architecture.model_type
 
         if model_type == "methos_v3":
             from src.methos_v3 import MethosV3Model
             from src.methos_v3.model import MethosV3Config as MethosV3ModelConfig
-            state_dict = torch.load(path / "pytorch_model.bin", map_location="cpu", weights_only=True)
-            arch = cfg.model.architecture
-            v3 = arch.methos_v3
-            model_config = MethosV3ModelConfig(
-                vocab_size=len(tokenizer),
-                hidden_size=arch.hidden_size,
-                d_state=v3.d_state,
-                d_hidden=v3.d_hidden,
-                max_position_embeddings=arch.max_position_embeddings,
-                rope_theta=arch.rope_theta,
-                sparsity_pct=v3.sparsity_pct,
-                n_ssm_layers=v3.n_ssm_layers,
-                n_hssm_levels=v3.n_hssm_levels,
-                n_ode_steps=v3.n_ode_steps,
-                n_trajectories=v3.n_trajectories,
-                n_sim_steps=v3.n_sim_steps,
-                use_efficient_sandbox=v3.use_efficient_sandbox,
-                n_token_categories=v3.n_token_categories,
-                n_languages=v3.n_languages,
-                n_doc_roles=v3.n_doc_roles,
-                n_task_types=v3.n_task_types,
-                n_difficulty_levels=v3.n_difficulty_levels,
-                n_reasoning_types=v3.n_reasoning_types,
-                max_subgoals=v3.max_subgoals,
-                n_domains=v3.n_domains,
-                max_reasoning_steps=v3.max_reasoning_steps,
-                n_semantic_concepts=v3.n_semantic_concepts,
-                working_mem_capacity=v3.working_mem_capacity,
-                max_episodes=v3.max_episodes,
-                n_context_adapter_blocks=v3.n_context_adapter_blocks,
-                n_language_groups=v3.n_language_groups,
-                adaptive_top_k_min=v3.adaptive_top_k_min,
-                adaptive_top_k_max=v3.adaptive_top_k_max,
-            )
-            model_config.torch_dtype = ModelFactory._resolve_dtype(cfg.model.dtype)
+            bin_path = path / "pytorch_model.bin"
+            if bin_path.exists():
+                state_dict = torch.load(bin_path, map_location="cpu", weights_only=True)
+            else:
+                from safetensors.torch import load_file
+                state_dict = load_file(str(path / "model.safetensors"), device="cpu")
+            if saved_config is not None:
+                model_config = MethosV3ModelConfig.from_pretrained(str(path))
+                model_config.vocab_size = len(tokenizer)
+            else:
+                arch = cfg.model.architecture
+                v3 = arch.methos_v3
+                model_config = MethosV3ModelConfig(
+                    vocab_size=len(tokenizer),
+                    hidden_size=arch.hidden_size,
+                    d_state=v3.d_state,
+                    d_hidden=v3.d_hidden,
+                    max_position_embeddings=arch.max_position_embeddings,
+                    rope_theta=arch.rope_theta,
+                    sparsity_pct=v3.sparsity_pct,
+                    n_ssm_layers=v3.n_ssm_layers,
+                    n_hssm_levels=v3.n_hssm_levels,
+                    n_ode_steps=v3.n_ode_steps,
+                    n_trajectories=v3.n_trajectories,
+                    n_sim_steps=v3.n_sim_steps,
+                    use_efficient_sandbox=v3.use_efficient_sandbox,
+                    n_token_categories=v3.n_token_categories,
+                    n_languages=v3.n_languages,
+                    n_doc_roles=v3.n_doc_roles,
+                    n_task_types=v3.n_task_types,
+                    n_difficulty_levels=v3.n_difficulty_levels,
+                    n_reasoning_types=v3.n_reasoning_types,
+                    max_subgoals=v3.max_subgoals,
+                    n_domains=v3.n_domains,
+                    max_reasoning_steps=v3.max_reasoning_steps,
+                    n_semantic_concepts=v3.n_semantic_concepts,
+                    working_mem_capacity=v3.working_mem_capacity,
+                    max_episodes=v3.max_episodes,
+                    n_context_adapter_blocks=v3.n_context_adapter_blocks,
+                    n_language_groups=v3.n_language_groups,
+                    adaptive_top_k_min=v3.adaptive_top_k_min,
+                    adaptive_top_k_max=v3.adaptive_top_k_max,
+                )
+            setattr(model_config, _DTYPE_CONFIG_ATTR, ModelFactory._resolve_dtype(cfg.model.dtype))
             model = MethosV3Model(config=model_config)
-            missing, unexpected = model.load_state_dict(state_dict, strict=True)
+            model_state = model.state_dict()
+            filtered = {}
+            for k, v in state_dict.items():
+                if k in model_state and v.shape == model_state[k].shape:
+                    filtered[k] = v
+            missing, unexpected = model.load_state_dict(filtered, strict=False)
+            skipped = len(state_dict) - len(filtered)
             if missing:
-                logger.warning("Missing keys: %d — %s", len(missing), missing[:5])
-            if unexpected:
-                logger.warning("Unexpected keys: %d — %s", len(unexpected), unexpected[:5])
+                msg = f"Checkpoint missing {len(missing)} keys: {sorted(missing)[:8]}"
+                if strict:
+                    raise RuntimeError(msg)
+                logger.info("Random init for %d new parameters — %s", len(missing), sorted(missing)[:4])
+            if skipped:
+                logger.info("Skipped %d incompatible checkpoint weights", skipped)
             for param in model.parameters():
                 param.requires_grad = True
             return model, tokenizer
@@ -563,7 +645,7 @@ class ModelFactory:
 
         model = AutoModelForCausalLM.from_pretrained(
             str(path),
-            torch_dtype=load_dtype,
+            **{_DTYPE_KWARG: load_dtype},
             device_map=device_map,
             trust_remote_code=True,
         )

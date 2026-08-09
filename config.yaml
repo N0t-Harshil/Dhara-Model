@@ -412,7 +412,7 @@ data:
     - path: code_x_glue_cc_code_docstring
       max_samples: 15000
       category: code
-    - path: code_search_net
+    - path: code-search-net/code_search_net
       max_samples: 50000
       category: code
 

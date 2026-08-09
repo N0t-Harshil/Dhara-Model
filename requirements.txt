@@ -9,18 +9,19 @@
 # =============================================================================
 
 # PyTorch with CUDA 12.8+ (Blackwell / H100 / A100 / RTX 4090+)
+# NOTE: cu128 wheels start at torch 2.7.0 (2.6.0+cu128 does not exist on the index)
 --extra-index-url https://download.pytorch.org/whl/cu128
-torch==2.6.0+cu128
-torchvision==0.21.0+cu128
-torchaudio==2.6.0+cu128
+torch==2.9.0+cu128
+torchvision==0.24.0+cu128
+torchaudio==2.9.0+cu128
 
-# HuggingFace ecosystem
-transformers==4.43.3
-datasets>=2.14.4
-accelerate==0.33.0
+# HuggingFace ecosystem (verified working set — code uses eval_strategy + AutoConfig.for_model, requires >=4.46)
+transformers==5.1.0
+datasets==4.0.0
+accelerate==1.12.0
 bitsandbytes>=0.43.0
 peft>=0.10.0
-tokenizers>=0.19.1
+tokenizers==0.22.2
 
 # Core utilities
 pyyaml
