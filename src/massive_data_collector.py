@@ -219,7 +219,7 @@ class MassiveDataCollector:
         # Comprehensive language markers
         markers = {
             "python": ["def ", "import ", "class ", "if __name__"],
-            "rust": ["fn ", "let mut", "impl ", "match ", "pub "],
+            "rust": ["fn main", "fn ", "let mut", "impl ", "match ", "pub "],
             "golang": ["func ", "package ", "chan ", "select {", "go "],
             "cpp": ["#include", "std::", "int main(", "public:", "virtual "],
             "java": ["public class", "System.out.println", "@Override", "package "],
