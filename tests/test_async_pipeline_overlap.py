@@ -117,7 +117,7 @@ def test_processed_cache_fast_path_and_atomic_write():
         # Test atomic write
         _atomic_write_bytes(manifest_path, json.dumps({"key": "test_key", "packed_count": 100}).encode())
         assert manifest_path.exists()
-        assert rec_is_valid := json.loads(manifest_path.read_text())
+        assert (rec_is_valid := json.loads(manifest_path.read_text()))
         assert rec_is_valid["key"] == "test_key"
         assert rec_is_valid["packed_count"] == 100
 
