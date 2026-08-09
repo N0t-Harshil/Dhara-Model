@@ -245,7 +245,9 @@ class MassiveDataCollector:
             "web-design": ["<html", "<div", "<style", "@media", "display: flex"],
         }
         
-        for lang, signals in markers.items():
+        # Prefer more specific (longer) signals first to avoid generic collisions
+        items = sorted(markers.items(), key=lambda kv: max(len(s) for s in kv[1]), reverse=True)
+        for lang, signals in items:
             if any(sig.lower() in content_lower for sig in signals):
                 return lang
 
