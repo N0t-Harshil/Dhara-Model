@@ -446,7 +446,36 @@ class MassiveDataCollector:
         input_text = ""
         output = ""
 
-        if "instruction" in entry and "output" in entry:
+        # More specific formats first (dolly, flan, orca, tool-use, QA, sentence pairs)
+        if "context" in entry and "instruction" in entry and "response" in entry:
+            # Dolly format: include context with instruction
+            context = self._clean_text(entry.get("context"))
+            instruction = (context + "\n" + self._clean_text(entry.get("instruction"))).strip()
+            output = self._clean_text(entry.get("response"))
+        elif "tool_definition" in entry and "instruction" in entry and ("response" in entry or "output" in entry):
+            # Tool use: include tool definition with instruction
+            td = self._clean_text(entry.get("tool_definition"))
+            inst_text = self._clean_text(entry.get("instruction"))
+            instruction = (td + "\n" + inst_text).strip()
+            output = self._clean_text(entry.get("response") or entry.get("output"))
+        elif "system_prompt" in entry and "question" in entry and "response" in entry:
+            # Orca-style
+            system = self._clean_text(entry.get("system_prompt"))
+            q = self._clean_text(entry.get("question"))
+            instruction = (system + "\n" + q).strip()
+            output = self._clean_text(entry.get("response"))
+        elif "inputs" in entry and "targets" in entry:
+            # Flan-style
+            instruction = self._clean_text(entry.get("inputs"))
+            output = self._clean_text(entry.get("targets"))
+        elif "question" in entry and "answer" in entry:
+            instruction = self._clean_text(entry.get("question"))
+            output = self._clean_text(entry.get("answer"))
+        elif "sentence1" in entry and "sentence2" in entry and "label" in entry:
+            instruction = self._clean_text(entry.get("sentence1"))
+            input_text = self._clean_text(entry.get("sentence2"))
+            output = self._clean_text(entry.get("label"))
+        elif "instruction" in entry and "output" in entry:
             instruction = self._clean_text(entry.get("instruction"))
             input_text = self._clean_text(entry.get("input"))
             output = self._clean_text(entry.get("output"))
@@ -464,35 +493,15 @@ class MassiveDataCollector:
         elif "prompt" in entry and ("completion" in entry or "response" in entry):
             instruction = self._clean_text(entry.get("prompt"))
             output = self._clean_text(entry.get("completion") or entry.get("response"))
-        elif "context" in entry and "instruction" in entry and "response" in entry:
-            # Dolly format: include context with instruction
-            context = self._clean_text(entry.get("context"))
-            instruction = (context + "\n" + self._clean_text(entry.get("instruction"))).strip()
-            output = self._clean_text(entry.get("response"))
-        elif "inputs" in entry and "targets" in entry:
-            # Flan-style
-            instruction = self._clean_text(entry.get("inputs"))
-            output = self._clean_text(entry.get("targets"))
-        elif "system_prompt" in entry and "question" in entry and "response" in entry:
-            # Orca-style
-            system = self._clean_text(entry.get("system_prompt"))
-            q = self._clean_text(entry.get("question"))
-            instruction = (system + "\n" + q).strip()
-            output = self._clean_text(entry.get("response"))
-        elif "tool_definition" in entry and "instruction" in entry and ("response" in entry or "output" in entry):
-            # Tool use: include tool definition with instruction
-            td = self._clean_text(entry.get("tool_definition"))
-            inst_text = self._clean_text(entry.get("instruction"))
-            instruction = (td + "\n" + inst_text).strip()
-            output = self._clean_text(entry.get("response") or entry.get("output"))
-        elif "question" in entry and "answer" in entry:
-            instruction = self._clean_text(entry.get("question"))
-            output = self._clean_text(entry.get("answer"))
-        elif "sentence1" in entry and "sentence2" in entry and "label" in entry:
-            instruction = self._clean_text(entry.get("sentence1"))
-            input_text = self._clean_text(entry.get("sentence2"))
-            output = self._clean_text(entry.get("label"))
         elif "description" in entry and "solutions" in entry:
+            instruction = self._clean_text(entry.get("description"))
+            solutions = entry.get("solutions")
+            if isinstance(solutions, dict) and "solution" in solutions:
+                sol_list = solutions["solution"]
+                if isinstance(sol_list, list) and sol_list:
+                    output = self._clean_text(sol_list[0])
+            elif isinstance(solutions, list) and solutions:
+                output = self._clean_text(solutions[0])
             instruction = self._clean_text(entry.get("description"))
             solutions = entry.get("solutions")
             if isinstance(solutions, dict) and "solution" in solutions:
