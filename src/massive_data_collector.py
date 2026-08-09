@@ -248,8 +248,9 @@ class MassiveDataCollector:
         for lang, signals in markers.items():
             if any(sig.lower() in content_lower for sig in signals):
                 return lang
-                
-        return "python" if any(c.isalpha() for c in content) else "text"
+
+        # No language marker matched — treat as plain text by default.
+        return "text"
 
     @staticmethod
     def _clean_text(value) -> str:
@@ -413,6 +414,63 @@ class MassiveDataCollector:
         instruction = user_turns[-1] if user_turns else self._clean_text(entry.get("prompt"))
         output = assistant_turns[-1] if assistant_turns else ""
         return instruction, output
+
+    def _extract_fields(self, entry: dict) -> tuple[str, str, str]:
+        """Extracts (instruction, input, output) fields from a generic dataset entry.
+        This mirrors the extraction logic used in _process_entry but does not apply
+        quality filtering; used by tests to validate field extraction.
+        """
+        instruction = ""
+        input_text = ""
+        output = ""
+
+        if "instruction" in entry and "output" in entry:
+            instruction = self._clean_text(entry.get("instruction"))
+            input_text = self._clean_text(entry.get("input"))
+            output = self._clean_text(entry.get("output"))
+        elif "instruction" in entry and "response" in entry:
+            instruction = self._clean_text(entry.get("instruction"))
+            output = self._clean_text(entry.get("response"))
+        elif "problem" in entry and "solution" in entry:
+            instruction = self._clean_text(entry.get("problem"))
+            output = self._clean_text(entry.get("solution"))
+        elif "query" in entry and "answer" in entry:
+            instruction = self._clean_text(entry.get("query"))
+            output = self._clean_text(entry.get("answer"))
+        elif "messages" in entry or "chosen" in entry or "conversations" in entry:
+            instruction, output = self._extract_chat_pair(entry)
+        elif "prompt" in entry and ("completion" in entry or "response" in entry):
+            instruction = self._clean_text(entry.get("prompt"))
+            output = self._clean_text(entry.get("completion") or entry.get("response"))
+        elif "description" in entry and "solutions" in entry:
+            instruction = self._clean_text(entry.get("description"))
+            solutions = entry.get("solutions")
+            if isinstance(solutions, dict) and "solution" in solutions:
+                sol_list = solutions["solution"]
+                if isinstance(sol_list, list) and sol_list:
+                    output = self._clean_text(sol_list[0])
+            elif isinstance(solutions, list) and solutions:
+                output = self._clean_text(solutions[0])
+        elif "func_documentation_string" in entry and "func_code_string" in entry:
+            instruction = self._clean_text(entry.get("func_documentation_string"))
+            output = self._clean_text(entry.get("func_code_string"))
+        elif "code" in entry and "explanation" in entry:
+            instruction = self._clean_text(entry.get("explanation"))
+            output = self._clean_text(entry.get("code"))
+        else:
+            output = self._clean_text(entry.get('content') or entry.get('text') or entry.get('code') or "")
+
+        return instruction, input_text, output
+
+    def _extract_sharegpt_fields(self, message: dict) -> tuple[str, str, str]:
+        """Extract a single ShareGPT-style message dict into (inst, inp, out).
+        Human/user messages return (text, '', '') and assistant messages return ('', '', text).
+        """
+        role = str(message.get("from") or message.get("role") or "").lower()
+        text = self._clean_text(message.get("value") or message.get("content") or message.get("text"))
+        if role in {"human", "user"}:
+            return text, "", ""
+        return "", "", text
 
     def _language_from_entry(self, entry: dict, content: str, ds_info: dict) -> str:
         forced = self._clean_text(ds_info.get("language"))
