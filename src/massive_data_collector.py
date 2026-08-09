@@ -245,6 +245,14 @@ class MassiveDataCollector:
             "web-design": ["<html", "<div", "<style", "@media", "display: flex"],
         }
         
+        # Short-circuit on some high-confidence patterns to avoid ambiguous
+        # collisions (e.g., 'public class' should be Java even though 'class'
+        # also appears in Python markers).
+        if "public class" in content_lower or "system.out.println" in content_lower:
+            return "java"
+        if "fn main" in content_lower:
+            return "rust"
+
         # Score languages by the total matched signal length; this prefers
         # languages with multiple or longer specific matches instead of the
         # first generic single-token match.
