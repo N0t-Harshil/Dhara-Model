@@ -536,29 +536,39 @@ class StreamingManager:
         return {k: v / total for k, v in self._skip_counters.items()}
 
 
-class MassiveDataCollector:
-    """Legacy wrapper for backward compatibility."""
-    def __init__(self, datasets_cfg: Optional[List] = None) -> None:
-        self.datasets = datasets_cfg or []
+# Backward-compatible exposure of the richer MassiveDataCollector implementation.
+# Prefer the full-featured collector from src.massive_data_collector when available.
+try:
+    from src.massive_data_collector import MassiveDataCollector as _RichMassiveDataCollector  # type: ignore
+except Exception:
+    _RichMassiveDataCollector = None
 
-    def get_dataset_list(self):
-        return self.datasets
+if _RichMassiveDataCollector is not None:
+    MassiveDataCollector = _RichMassiveDataCollector
+else:
+    class MassiveDataCollector:
+        """Legacy wrapper for backward compatibility."""
+        def __init__(self, datasets_cfg: Optional[List] = None) -> None:
+            self.datasets = datasets_cfg or []
 
-    def stream_single_dataset(self, ds_info, limit=None, theme="all", skip_samples=0, raw_text=True):
-        try:
-            info = DatasetInfo(
-                path=ds_info.path,
-                category=ds_info.category,
-                weight=getattr(ds_info, 'weight', 1.0),
-                quality_score=getattr(ds_info, 'quality_score', 0.5),
-                name=getattr(ds_info, 'name', None),
-                split=getattr(ds_info, 'split', 'train'),
-                text_fields=getattr(ds_info, 'text_fields', None),
-            )
-            registry = DatasetRegistry()
-            registry.register(info)
-            yield from stream_dataset_with_fallbacks(info, registry, limit=limit)
-        except Exception:
-            logger.exception("stream_single_dataset(%s) failed",
-                             ds_info.path if hasattr(ds_info, 'path') else str(ds_info))
-            return
+        def get_dataset_list(self):
+            return self.datasets
+
+        def stream_single_dataset(self, ds_info, limit=None, theme="all", skip_samples=0, raw_text=True):
+            try:
+                info = DatasetInfo(
+                    path=ds_info.path,
+                    category=ds_info.category,
+                    weight=getattr(ds_info, 'weight', 1.0),
+                    quality_score=getattr(ds_info, 'quality_score', 0.5),
+                    name=getattr(ds_info, 'name', None),
+                    split=getattr(ds_info, 'split', 'train'),
+                    text_fields=getattr(ds_info, 'text_fields', None),
+                )
+                registry = DatasetRegistry()
+                registry.register(info)
+                yield from stream_dataset_with_fallbacks(info, registry, limit=limit)
+            except Exception:
+                logger.exception("stream_single_dataset(%s) failed",
+                                 ds_info.path if hasattr(ds_info, 'path') else str(ds_info))
+                return

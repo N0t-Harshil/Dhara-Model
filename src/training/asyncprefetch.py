@@ -121,6 +121,9 @@ class UnitPrefetch:
     def _worker(self, units) -> None:
         while True:
             with self._cv:
+                # Backpressure: wait if outstanding results reach buffer depth
+                while not self._stop.is_set() and len(self._results) >= self._depth:
+                    self._cv.wait()
                 if self._stop.is_set() or self._next_produce >= self._total:
                     return
                 idx = self._next_produce
@@ -170,6 +173,8 @@ class UnitPrefetch:
                     self.stats["delivered"] += 1
                     self.stats["total_gpu_wait_sec"] += wait_dur
                     logger.info("[ASYNC] dataset %d consumed (GPU wait: %.2fs)", index + 1, wait_dur)
+                    # Wake producers that may be blocked on buffer depth
+                    self._cv.notify_all()
                     if exc is not None:
                         self.stats["errors"] += 1
                         raise exc

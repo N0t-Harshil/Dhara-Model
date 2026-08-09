@@ -142,7 +142,7 @@ def test_driver_classification_and_legacy_hf_uris():
         meta_cache = DatasetMetadataCache(Path(tmp_dir) / "meta")
         builder_cache = BuilderCache(Path(tmp_dir) / "builder")
         
-        info_file = DatasetInfo(path=tmp_dir, category="code", weight=1.0, split="train")
+        info_file = DatasetInfo(path=tmp_dir, category="code", weight=1.0, quality_score=1.0, split="train")
         driver, diag = detect_driver(
             info_file, meta_cache=meta_cache, builder_cache=builder_cache,
             preprocess_sig="sig1", token_sig="tok1"
