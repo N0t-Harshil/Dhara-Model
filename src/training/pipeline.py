@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import gc
 import hashlib
-import inspect
 import json
 import logging
+import math
 import os
 import random
 import shutil
@@ -37,10 +37,21 @@ from src.infrastructure.telemetry import PipelineTelemetry
 from src.infrastructure.tracking import ExperimentTracker
 from src.models.factory import ARCH_FSDP_LAYER_MAP, ModelFactory
 from src.training.asyncprefetch import UnitPrefetch
-from src.training.checkpoint import AsyncCheckpointWriter
+from src.training.checkpoint import AsyncCheckpointWriter, verify_checkpoint
 from src.utils.reproducibility import set_seed
+from src.utils.training import dataloader_num_workers, trainer_tokenizer_kwarg
 
 logger = logging.getLogger(__name__)
+
+
+def _prefetch_enabled(staging: Any, async_cfg: Any) -> bool:
+    """Async prefetch runs only when the staging block opts in AND the global
+    ``data.async_pipeline.enabled`` switch is on. A missing/disabled async
+    config gives the emergency synchronous fallback (build inline on the
+    training thread)."""
+    if not bool(getattr(staging, "prefetch", True)):
+        return False
+    return bool(getattr(async_cfg, "enabled", True))
 
 
 class _FailureJournal:
@@ -71,6 +82,21 @@ class _FailureJournal:
         except Exception as e:
             logger.warning("Could not persist failure journal: %s", e)
 
+    def clear(self, key: str) -> None:
+        """Drop a failed marker (a later successful run must not skip this
+        unit on resume). No-op when the unit is not in the journal."""
+        if key not in self._failed:
+            return
+        self._failed.pop(key)
+        try:
+            if not self._failed and self._path.exists():
+                self._path.unlink()
+            else:
+                self._path.parent.mkdir(parents=True, exist_ok=True)
+                self._path.write_text(json.dumps(self._failed, indent=2), encoding="utf-8")
+        except Exception as e:
+            logger.warning("Could not persist failure journal: %s", e)
+
 
 class _LoggingCallback(TrainerCallback):
     def __init__(self):
@@ -92,9 +118,16 @@ class _LoggingCallback(TrainerCallback):
 
 
 class _NaNSafeCallback(TrainerCallback):
+    def __init__(self, check_every: int = 100) -> None:
+        self.check_every = max(1, check_every)
+        self._last_check = -1
+
     def on_step_end(self, args, state, control, model=None, **kwargs):
         if model is None or not state.is_world_process_zero:
             return
+        if state.global_step - self._last_check < self.check_every:
+            return
+        self._last_check = state.global_step
         for name, p in model.named_parameters():
             if not torch.isfinite(p).all():
                 raise RuntimeError(f"Non-finite parameter at step {state.global_step}: {name}")
@@ -152,6 +185,9 @@ class TrainingPipeline:
         self.ref_model: Optional[PreTrainedModel] = None
         self.data_pipeline: Optional[DataPipeline] = None
         self.alignment: Optional[AlignmentPipeline] = None
+        self._last_trainer: Optional[Trainer] = None
+        self._fresh_start: bool = False
+        self._forced_resume: Optional[str] = None
         self._ckpt_writer: Optional[AsyncCheckpointWriter] = None
         if getattr(self.cfg.training, "async_checkpoint", True):
             self._ckpt_writer = AsyncCheckpointWriter(
@@ -167,6 +203,10 @@ class TrainingPipeline:
 
     def initialize(self, fresh_start: bool = False, resume_checkpoint: Optional[str] = None) -> None:
         logger.info("Initializing Methos Class Model pipeline (fresh_start=%s, resume=%s)...", fresh_start, resume_checkpoint)
+        self._fresh_start = fresh_start
+        if resume_checkpoint is not None:
+            ckpt_path = Path(resume_checkpoint)
+            self._forced_resume = str(ckpt_path) if (ckpt_path.exists() and ckpt_path.is_dir()) else None
         self.tokenizer = ModelFactory.load_tokenizer(cfg=self.cfg)
 
         if fresh_start:
@@ -176,7 +216,22 @@ class TrainingPipeline:
             resume_checkpoint = resume_checkpoint or self._find_resume_checkpoint()
             if resume_checkpoint is not None:
                 ckpt_path = Path(resume_checkpoint)
-                if ckpt_path.exists() and ModelFactory.is_compatible(self.cfg, self.tokenizer, ckpt_path):
+                if ckpt_path.is_dir():
+                    try:
+                        ok, detail = verify_checkpoint(ckpt_path)
+                        if not ok:
+                            logger.error(
+                                "Resume checkpoint %s failed integrity "
+                                "verification (%s) — starting from scratch "
+                                "instead of resuming (do not trust a corrupt "
+                                "checkpoint).", ckpt_path, detail)
+                            resume_checkpoint = None
+                    except Exception as e:
+                        logger.warning("Checkpoint verification error for %s "
+                                       "(%s) — continuing without it.",
+                                       ckpt_path, e)
+                        resume_checkpoint = None
+                if resume_checkpoint is not None and ckpt_path.exists() and ModelFactory.is_compatible(self.cfg, self.tokenizer, ckpt_path):
                     logger.info("Loading model from checkpoint: %s", ckpt_path)
                     self.model, self.tokenizer = ModelFactory.load_model(ckpt_path, self.cfg)
                 else:
@@ -253,7 +308,16 @@ class TrainingPipeline:
 
         self.model.eval()
         runner = BenchmarkRunner(self.model, self.tokenizer)
-        benchmark_results = runner.run_benchmarks(self.cfg.evaluation.benchmarks)
+        benchmark_results: List[Any] = []
+        bench_configs = self.cfg.evaluation.benchmark_configs or {}
+        for name in self.cfg.evaluation.benchmarks:
+            entry = bench_configs.get(name)
+            kwargs: Dict[str, Any] = {}
+            if entry is not None and entry.max_samples:
+                kwargs["limit"] = entry.max_samples
+            if getattr(self.cfg.evaluation, "timeout", 0) > 0:
+                kwargs["timeout"] = self.cfg.evaluation.timeout
+            benchmark_results.extend(runner.run_benchmarks([name], **kwargs))
 
         safety_eval = SafetyEvaluator(self.model, self.tokenizer)
         safety_results = safety_eval.full_report()
@@ -271,7 +335,23 @@ class TrainingPipeline:
         return report
 
     def _cache_key(self, ds_info: Any, stage_name: str) -> str:
-        raw = f"{ds_info.path}_{ds_info.max_samples}_{self.cfg.training.max_seq_length}_{self.cfg.model.architecture.vocab_size}"
+        # Mirror DataPipeline._get_cache_key: preprocessing/quality settings
+        # must invalidate the cache, otherwise changing dedup/filtering
+        # silently reuses stale tokenized data (the original bug used only
+        # path+max_samples+seq_len+vocab).
+        pp = self.cfg.data.preprocessing
+        q = self.cfg.data.quality
+        raw = "|".join([
+            ds_info.path, getattr(ds_info, "name", "") or "",
+            getattr(ds_info, "split", "train"),
+            str(getattr(ds_info, "max_samples", "")),
+            str(self.cfg.training.max_seq_length),
+            str(self.cfg.model.architecture.vocab_size),
+            q.deduplication.method, f"{q.deduplication.threshold:.4f}",
+            str(self.cfg.data.ast_filter.code_filtering),
+            str(pp.remove_boilerplate), str(pp.min_text_length),
+            "v2",
+        ])
         return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
     def _cached_dataset_path(self, ds_info: Any, stage_name: str) -> Path:
@@ -302,6 +382,11 @@ class TrainingPipeline:
                 staging = self.cfg.training.pretrain.staging
                 curriculum = self.cfg.data.curriculum
                 if staging.enabled and staging.stages:
+                    if curriculum.enabled and curriculum.stages:
+                        logger.warning(
+                            "Both staging and curriculum are enabled — the "
+                            "legacy curriculum is ignored in favor of the "
+                            "staging stages.")
                     logger.info("Staged pretraining mode: %d stage groups (legacy curriculum ignored)",
                                 len(staging.stages))
                     metrics = self._run_staged_pretrain(stage_cfg)
@@ -341,6 +426,21 @@ class TrainingPipeline:
                     results[stage_name] = metrics
             else:
                 datasets = self.data_pipeline.collector.get_dataset_list()
+                if not datasets and getattr(self.cfg.data, "use_registry", False):
+                    logger.warning(
+                        "No datasets configured for %s and use_registry=true — "
+                        "routing the stage through the registry mixture (no "
+                        "dedicated instruction corpora).", stage_name)
+                    dataset = self.data_pipeline.build_pretrain_dataset_from_registry()
+                    if len(dataset) == 0:
+                        logger.error("Registry produced no samples for %s — skipping",
+                                     stage_name)
+                        continue
+                    logger.info("%s dataset ready from registry: %d samples",
+                                stage_name, len(dataset))
+                    metrics = self._train_stage(dataset, stage_name, stage_cfg)
+                    results[stage_name] = metrics
+                    continue
                 valid_count = 0
                 skipped_count = 0
 
@@ -392,8 +492,63 @@ class TrainingPipeline:
             logger.info("=" * 70)
             logger.info("Phase %s complete", stage_name.upper())
 
+        if self.cfg.training.alignment.enabled:
+            logger.info("=" * 70)
+            logger.info("PHASE: ALIGNMENT")
+            logger.info("=" * 70)
+            pref_ds = self._build_alignment_datasets()
+            if pref_ds is not None:
+                results["alignment"] = self.run_alignment(pref_ds)
+            else:
+                logger.warning("Alignment enabled but no usable instructions — skipping alignment phase")
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        if self.cfg.training.safety.enabled:
+            logger.info("=" * 70)
+            logger.info("PHASE: SAFETY TRAINING + RED TEAMING")
+            logger.info("=" * 70)
+            results["safety_training"] = self.run_safety_training()
+            if self.cfg.training.safety.red_teaming_iters > 0:
+                results["red_teaming"] = self.run_red_teaming()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        if self.cfg.evaluation.automated_report:
+            logger.info("=" * 70)
+            logger.info("PHASE: EVALUATION")
+            logger.info("=" * 70)
+            results["evaluation"] = self.run_evaluation()
+
         logger.info("Training complete.")
         return results
+
+    def _build_alignment_datasets(self) -> Optional[Dataset]:
+        """Collect a bounded set of instruction prompts for preference-pair
+        generation, then tokenize them into the preference dataset format.
+        Returns None when no usable instruction text can be gathered."""
+        instructions: List[str] = []
+        try:
+            for ds_info in self.data_pipeline.collector.get_dataset_list():
+                if len(instructions) >= 256:
+                    break
+                for sample in self.data_pipeline.collector.stream_single_dataset(
+                    ds_info, limit=min(ds_info.max_samples or DEFAULT_MAX_SAMPLES_PER_DATASET, 32)
+                ):
+                    text = sample.get("prompt") or sample.get("instruction") or sample.get("text") or ""
+                    if isinstance(text, str) and len(text) >= 8:
+                        instructions.append(text)
+                    if len(instructions) >= 256:
+                        break
+        except Exception as e:
+            logger.warning("Instruction collection for alignment failed: %s", e)
+            return None
+        if not instructions:
+            return None
+        pairs = self.alignment.generate_preference_data(instructions[:256])
+        if not pairs:
+            return None
+        return self.data_pipeline.build_preference_dataset(pairs)
 
     def _train_stage(
         self,
@@ -403,6 +558,7 @@ class TrainingPipeline:
         **overrides,
     ) -> Dict[str, float]:
         trainer = self._build_trainer(dataset, stage_name, stage_cfg, **overrides)
+        self._last_trainer = trainer
 
         # Verify model is on GPU
         if torch.cuda.is_available():
@@ -415,7 +571,7 @@ class TrainingPipeline:
 
         output_dir = Path(self.cfg.output.model_dir) / stage_name
         resume_checkpoint = None
-        if output_dir.exists():
+        if not self._fresh_start and output_dir.exists():
             ckpt_dirs = sorted(
                 output_dir.glob("checkpoint-*"),
                 key=lambda p: int(p.name.split("-")[1]) if p.name.split("-")[1].isdigit() else 0,
@@ -472,6 +628,98 @@ class TrainingPipeline:
             logger.warning("Could not read trainer_state.json: %s", e)
         return 0
 
+    # -- dataset-granular checkpoint identity ---------------------------------
+    #
+    # Every unit checkpoint records its dataset identity so a restart can
+    # verify *which* dataset a checkpoint belongs to (never skip by index
+    # alone), and a per-run completion manifest is committed atomically only
+    # after training + checkpoint + flush succeeded.
+
+    @staticmethod
+    def _atomic_write_json(path: Path, payload: dict) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        os.replace(tmp, path)
+
+    def _unit_fingerprint(self, u) -> str:
+        """Deterministic sha256 over the dataset identity of a unit. Changing
+        the repository/subset/revision/data_dir changes the fingerprint and
+        forces a retrain on resume even if the step counter would skip it."""
+        ident = {
+            "path": getattr(u, "path", ""),
+            "name": getattr(u, "name", None) or "",
+            "data_dir": str(getattr(u, "data_dir", "") or ""),
+            "revision": str(getattr(u, "revision", "") or ""),
+            "category": getattr(u, "category", ""),
+        }
+        return hashlib.sha256(json.dumps(ident, sort_keys=True).encode("utf-8")).hexdigest()
+
+    def _unit_completions_path(self) -> Path:
+        return Path(self.cfg.output.model_dir) / "unit_completions.json"
+
+    def _load_unit_completions(self) -> Dict[str, Any]:
+        path = self._unit_completions_path()
+        try:
+            if path.exists():
+                return json.loads(path.read_text(encoding="utf-8"))
+        except Exception as e:
+            logger.warning("Could not read unit completion manifest (%s): %s", path, e)
+        return {}
+
+    def _mark_unit_complete(self, stage_index: int, unit_index: int,
+                            unit_key: str, unit_fingerprint: str,
+                            global_step: int, total_steps: int) -> None:
+        """Atomically commit a dataset-completion record. Only reached after
+        training finished AND the per-unit checkpoint flushed to disk."""
+        completions = self._load_unit_completions()
+        completions[unit_key] = {
+            "stage_index": stage_index,
+            "unit_index": unit_index,
+            "unit_fingerprint": unit_fingerprint,
+            "global_step": int(global_step),
+            "total_steps": int(total_steps),
+            "completed_at": time.time(),
+        }
+        self._atomic_write_json(self._unit_completions_path(), completions)
+
+    def _clear_stale_run_state(self) -> List[str]:
+        """Drop per-run failure journals and the unit completion manifest so a
+        --fresh-start run does not inherit skip decisions from an earlier
+        crashed run. Returns the paths that were removed."""
+        cleared: List[str] = []
+        mdir = Path(self.cfg.output.model_dir)
+        for _p in sorted(mdir.glob("failed_units_stage*.json")):
+            try:
+                _p.unlink()
+                cleared.append(str(_p))
+            except Exception as _e:
+                logger.warning("Could not clear failure journal %s: %s", _p, _e)
+        _wm = mdir / "unit_completions.json"
+        if _wm.exists():
+            try:
+                _wm.unlink()
+                cleared.append(str(_wm))
+            except Exception as _e:
+                logger.warning("Could not clear completion manifest %s: %s", _wm, _e)
+        return cleared
+
+    def _write_unit_identity(self, ckpt_dir: Path, stage_index: int, unit_index: int,
+                             u, unit_key: str, end_step: int, total_steps: int) -> None:
+        """Persist unit_identity.json inside the latest per-unit checkpoint so
+        a resume can verify which dataset the checkpoint belongs to."""
+        identity = {
+            "stage_index": stage_index,
+            "unit_index": unit_index,
+            "unit_key": unit_key,
+            "unit_fingerprint": self._unit_fingerprint(u),
+            "processed_cache_key": hashlib.sha256(
+                (unit_key + ":" + self._unit_fingerprint(u)).encode("utf-8")).hexdigest(),
+            "global_step": int(end_step),
+            "total_steps": int(total_steps),
+        }
+        self._atomic_write_json(ckpt_dir / "unit_identity.json", identity)
+
     def _run_staged_pretrain(self, stage_cfg) -> Dict[str, Any]:
         """Run pretraining as N staged groups with a single Trainer.
 
@@ -497,10 +745,19 @@ class TrainingPipeline:
                         i, total_stages, s.name or f"stage_{i}", s.steps, sorted(s.categories or []))
         logger.info("=" * 70)
 
-        current_step = self._pretrain_global_step()
+        current_step = 0 if self._fresh_start else self._pretrain_global_step()
+        if self._fresh_start:
+            logger.info("Fresh start requested — restarting all staged pretrain steps from 0")
+            cleared_state = self._clear_stale_run_state()
+            if cleared_state:
+                logger.info("[UNIT] fresh start — cleared stale run state: %s",
+                            "; ".join(cleared_state))
         results: Dict[str, Any] = {}
         trainer = None
         run_t0 = time.perf_counter()
+        dup_prevented_total = 0
+        retries_total = 0
+        prefetch_stats: List[Dict[str, Any]] = []
 
         for i, s in enumerate(stages, 1):
             end_step = sum(x.steps for x in stages[:i])
@@ -565,8 +822,46 @@ class TrainingPipeline:
                                  "steps": alloc[j - 1],
                                  "skip": alloc[j - 1] <= 0 or current_step >= unit_end})
 
+                completions = self._load_unit_completions()
+                for item in plan:
+                    if item["skip"]:
+                        continue
+                    ukey = f"{item['u'].path}/{item['u'].name or 'default'}"
+                    rec = completions.get(ukey)
+                    if rec and rec.get("unit_fingerprint") == self._unit_fingerprint(item["u"]):
+                        item["skip"] = True
+                        logger.info("[UNIT] %d/%d %s — completion manifest verified "
+                                    "(fingerprint match), skipping",
+                                    item["j"], len(units), ukey)
+                    elif rec:
+                        logger.warning("[UNIT] %d/%d %s — completion manifest fingerprint "
+                                       "MISMATCH — identity changed, will retrain",
+                                       item["j"], len(units), ukey)
+
                 journal = _FailureJournal(Path(self.cfg.output.model_dir),
                                           f"stage{i}")
+                # Cull journal-failed units BEFORE scheduling: the prefetch
+                # queue must never spawn a background build for a dataset the
+                # failure journal already ruled out (previously the skip only
+                # fired on the consumer side, after the worker had started).
+                if getattr(staging, "skip_failed_units_on_resume", True):
+                    for item in plan:
+                        if item["skip"]:
+                            continue
+                        ukey = f"{item['u'].path}/{item['u'].name or 'default'}"
+                        if journal.is_failed(ukey):
+                            if self.data_pipeline.unit_cache_hit(item["u"], i, item["j"]):
+                                logger.info("[UNIT] %d/%d %s — previously failed (%s) but "
+                                            "packed cache is warm — scheduling from cache",
+                                            item["j"], len(units), ukey,
+                                            journal.reason(ukey))
+                                journal.clear(ukey)
+                                continue
+                            item["skip"] = True
+                            logger.warning("[UNIT] %d/%d %s — previously failed (%s), "
+                                           "skipping per journal",
+                                           item["j"], len(units), ukey,
+                                           journal.reason(ukey))
                 next_trainable = [p for p in plan if not p["skip"]]
                 for item in plan:
                     if item["skip"]:
@@ -589,7 +884,8 @@ class TrainingPipeline:
 
                 n_train = len(next_trainable)
                 prefetch = None
-                if n_train and getattr(staging, "prefetch", True):
+                async_cfg = getattr(self.cfg.data, "async_pipeline", None)
+                if n_train and _prefetch_enabled(staging, async_cfg):
                     # Bounded, ordered, multi-depth prefetch: up to
                     # prefetch_depth datasets are streamed/filtered/tokenized/
                     # packed on worker threads while the GPU trains. Unit 0 is
@@ -599,9 +895,13 @@ class TrainingPipeline:
                         build_fn=lambda item, idx: self.data_pipeline.build_pretrain_dataset_unit(
                             item["u"], i, item["j"], len(units)),
                         total=n_train,
-                        depth=max(1, int(getattr(staging, "prefetch_depth", 1) or 1)),
-                        timeout=float(getattr(staging, "prefetch_timeout", 900.0) or 900.0),
+                        depth=self._effective_prefetch_depth(staging, async_cfg),
+                        timeout=float(getattr(staging, "prefetch_timeout", 3600.0) or 3600.0),
                         name=f"stage{i}",
+                        retries=int(getattr(async_cfg, "retry_count", 0) or 0),
+                        max_workers=getattr(async_cfg, "preprocess_workers", None),
+                        cache_status=lambda item, idx: self.data_pipeline.unit_cache_hit(
+                            item["u"], i, item["j"]),
                     )
                     prefetch.start(next_trainable)
 
@@ -653,6 +953,7 @@ class TrainingPipeline:
                             dataset, umeta, build_exc = None, None, e
                         build_sec = time.perf_counter() - t_unit
                         logger.info("[ASYNC] GPU wait before dataset %d = %.2f sec", k + 1, gpu_wait_sec)
+                        self.telemetry.record("gpu_wait_sec", gpu_wait_sec)
 
                         if build_exc is not None:
                             stage_stats["failed"] += 1
@@ -683,24 +984,50 @@ class TrainingPipeline:
                         if cache_hit:
                             stage_stats["hits"] += 1
                             logger.info("[ASYNC] unit %d cache hit — ready immediately", k + 1)
+                        ds_drv_stats = getattr(dataset, "_driver_stats", None)
+                        if ds_drv_stats:
+                            if ds_drv_stats.get("metadata_hits"):
+                                self.telemetry.record("metadata_hits",
+                                                      ds_drv_stats["metadata_hits"])
+                            if ds_drv_stats.get("metadata_attempts"):
+                                self.telemetry.record("metadata_attempts",
+                                                      ds_drv_stats["metadata_attempts"])
+                            if ds_drv_stats.get("builder_hits"):
+                                self.telemetry.record("builder_hits",
+                                                      ds_drv_stats["builder_hits"])
+                            if ds_drv_stats.get("builder_attempts"):
+                                self.telemetry.record("builder_attempts",
+                                                      ds_drv_stats["builder_attempts"])
                         logger.info("[TIMER] unit %d/%d dataset ready: %.1fs, %d samples (%d steps)%s",
                                     j, len(units), time.perf_counter() - t_unit, len(dataset),
                                     item["steps"], " [cache hit]" if cache_hit else "")
 
-                        if k == n_train - 1 and i < total_stages and getattr(staging, "prefetch", True):
+                        if k == n_train - 1 and i < total_stages and _prefetch_enabled(
+                                staging, async_cfg):
                             nxt_stage = stages[i]
                             nxt_units = [u for u in registry.all_entries()
                                          if (not nxt_stage.categories or u.category in nxt_stage.categories)]
                             if nxt_units:
-                                def _bg(nu=nxt_units, ns=i + 1):
-                                    try:
-                                        self._warm_stage_metadata(nu, ns)
-                                    except Exception as e:
-                                        logger.warning("[META] background warm for stage %d failed: %s", ns, e)
-                                threading.Thread(target=_bg, daemon=True,
-                                                 name=f"stage-{i + 1}-warm").start()
+                                n_warm = max(1, int(getattr(async_cfg, "metadata_workers", 1) or 1))
+                                n_warm = min(n_warm, len(nxt_units))
+                                per = (len(nxt_units) + n_warm - 1) // n_warm
+                                for w_i in range(n_warm):
+                                    chunk = nxt_units[w_i * per:(w_i + 1) * per]
+                                    if not chunk:
+                                        continue
+
+                                    def _bg(nu=chunk, ns=i + 1, wi=w_i):
+                                        try:
+                                            self._warm_stage_metadata(nu, ns)
+                                        except Exception as e:
+                                            logger.warning(
+                                                "[META] background warm for stage %d "
+                                                "failed: %s", ns, e)
+                                    threading.Thread(target=_bg, daemon=True,
+                                                     name=f"stage-{i + 1}-warm-{w_i}").start()
                                 logger.info("[META] stage %d metadata warming in background "
-                                            "(stage %d still training)", i + 1, i)
+                                            "(%d worker(s), %d datasets — stage %d still training)",
+                                            i + 1, n_warm, len(nxt_units), i)
 
                         if trainer is None:
                             trainer = self._build_trainer(
@@ -709,30 +1036,58 @@ class TrainingPipeline:
                                 save_only_model=False,
                                 ignore_data_skip=True,
                             )
+                            self._last_trainer = trainer
                         else:
                             trainer.train_dataset = dataset
 
                         resume_checkpoint = None
-                        self._flush_checkpoints()
-                        latest = self._latest_pretrain_checkpoint()
-                        if latest is not None:
-                            resume_checkpoint = str(latest)
-                            logger.info("[UNIT] resuming from checkpoint %s", resume_checkpoint)
+                        if not self._fresh_start:
+                            self._flush_checkpoints()
+                            latest = self._latest_pretrain_checkpoint()
+                            if latest is not None:
+                                resume_checkpoint = str(latest)
+                                logger.info("[UNIT] resuming from checkpoint %s", resume_checkpoint)
 
                         boundary = StageBoundaryCallback(j, len(units), f"{name} — {u_name}", unit_end)
                         trainer.add_callback(boundary)
                         t_train = time.perf_counter()
+                        start_global = getattr(getattr(trainer, "state", None), "global_step", 0)
                         logger.info("[ASYNC] dataset %d training start", k + 1)
+                        if prefetch is not None:
+                            try:
+                                prefetch.note_training_state(k, "TRAINING")
+                            except Exception:  # noqa: BLE001 — telemetry never breaks training
+                                pass
                         try:
                             result = trainer.train(resume_from_checkpoint=resume_checkpoint)
                         finally:
                             trainer.remove_callback(boundary)
                         train_sec = time.perf_counter() - t_train
                         logger.info("[ASYNC] dataset %d training end", k + 1)
+                        if prefetch is not None:
+                            try:
+                                prefetch.note_training_state(k, "TRAINED")
+                            except Exception:  # noqa: BLE001 — telemetry never breaks training
+                                pass
+                        # A dataset that trained to completion clears any stale
+                        # journal entry: a later resume must not skip it just
+                        # because an earlier run died on it.
+                        try:
+                            journal.clear(unit_key)
+                        except Exception:  # noqa: BLE001 — telemetry never breaks training
+                            pass
                         metrics = result.metrics if hasattr(result, "metrics") else {}
                         stage_stats["train_sec"] += train_sec
-                        stage_stats["steps"] += item["steps"]
-                        unit_tokens = item["steps"] * tokens_per_step
+                        tstate = getattr(trainer, "state", None)
+                        end_global = getattr(tstate, "global_step", None)
+                        if end_global is None:
+                            # Trainer without a real HF state (test doubles) —
+                            # fall back to the planned step allocation.
+                            steps_taken = item["steps"]
+                        else:
+                            steps_taken = min(item["steps"], max(0, end_global - start_global))
+                        stage_stats["steps"] += steps_taken
+                        unit_tokens = steps_taken * tokens_per_step
                         stage_stats["tokens"] += unit_tokens
                         stage_stats["units"] += 1
 
@@ -771,6 +1126,14 @@ class TrainingPipeline:
                         })
                         results[f"stage_{i}/unit_{j}"] = metrics
 
+                        self._flush_checkpoints()
+                        latest_ckpt = self._latest_pretrain_checkpoint()
+                        if latest_ckpt is not None:
+                            self._write_unit_identity(
+                                latest_ckpt, i, j, u, unit_key, unit_end, total_steps)
+                        self._mark_unit_complete(
+                            i, j, unit_key, self._unit_fingerprint(u), unit_end, total_steps)
+
                         iter_k += 1
                         del dataset
                         gc.collect()
@@ -780,6 +1143,10 @@ class TrainingPipeline:
                 finally:
                     if prefetch is not None:
                         prefetch.close()
+                        dup_prevented_total += prefetch.stats.get(
+                            "duplicates_prevented", 0)
+                        retries_total += prefetch.stats.get("retries", 0)
+                        prefetch_stats.append(prefetch.stats)
 
                 wall = time.perf_counter() - stage_t0
                 busy = (stage_stats["train_sec"] / wall) if wall > 0 else 0.0
@@ -862,29 +1229,71 @@ class TrainingPipeline:
 
         # Final ASYNC PIPELINE REPORT
         tm_snap = self.telemetry.snapshot()
-        gpu_wait = tm_snap.get("total_gpu_wait_sec", 0.0)
-        train_time = tm_snap.get("total_train_sec", 0.0)
+        gpu_wait = tm_snap.get("gpu_wait_sec", 0.0)
+        train_time = tm_snap.get("train_sec", 0.0)
         total_time = train_time + gpu_wait
         idle_pct = (gpu_wait / total_time * 100.0) if total_time > 0 else 0.0
         hits = tm_snap.get("cache_hits", 0)
         attempts = tm_snap.get("cache_attempts", 0)
-        hit_pct = (hits / attempts * 100.0) if attempts > 0 else 0.0
+        fails = tm_snap.get("unit_failures", 0)
+        units = tm_snap.get("units", 0)
+
+        pf_hits = sum(s.get("prefetch_hits", 0) for s in prefetch_stats)
+        pf_misses = sum(s.get("prefetch_misses", 0) for s in prefetch_stats)
+        pf_attempts = pf_hits + pf_misses
+        pf_hit_pct = (pf_hits / pf_attempts * 100.0) if pf_attempts > 0 else 0.0
+        prep_sec = sum(s.get("total_prep_sec", 0.0) for s in prefetch_stats)
+        built = sum(s.get("produced", 0) for s in prefetch_stats)
+        built = max(built, 1)
+        avg_prep = prep_sec / built
+        avg_hidden = max(0.0, prep_sec - gpu_wait) / built
 
         logger.info("\n" + "=" * 60)
         logger.info("ASYNC PIPELINE REPORT")
         logger.info("=" * 60)
         logger.info("datasets scheduled: %d", attempts)
-        logger.info("datasets trained: %d", tm_snap.get("units", 0))
+        logger.info("datasets trained: %d", units)
+        logger.info("datasets skipped from processed cache: %d", hits)
+        logger.info("failed datasets: %d | retried datasets: %d", fails, retries_total)
         logger.info("cache hits: %d | cache misses: %d", hits, max(0, attempts - hits))
-        logger.info("prefetch hit rate: %.1f%%", hit_pct)
+        logger.info("metadata cache hits: %d | misses: %d",
+                    tm_snap.get("metadata_hits", 0), tm_snap.get("metadata_attempts", 0) - tm_snap.get("metadata_hits", 0))
+        logger.info("builder cache hits: %d | misses: %d",
+                    tm_snap.get("builder_hits", 0), tm_snap.get("builder_attempts", 0) - tm_snap.get("builder_hits", 0))
+        logger.info("prefetch hits: %d | prefetch misses: %d | prefetch hit rate: %.1f%%",
+                    pf_hits, pf_misses, pf_hit_pct)
         logger.info("GPU training time: %.2f sec", train_time)
         logger.info("GPU wait time: %.2f sec", gpu_wait)
         logger.info("pipeline idle: %.1f%%", idle_pct)
+        logger.info("average dataset preparation: %.2f sec", avg_prep)
+        logger.info("average hidden preparation: %.2f sec", avg_hidden)
+        logger.info("duplicate builds prevented: %d", dup_prevented_total)
+        nonretryable_fails = sum(s.get("nonretryable", 0) for s in prefetch_stats)
+        logger.info("non-retryable build failures: %d", nonretryable_fails)
+        state_counts: Dict[str, int] = {}
+        for _s in prefetch_stats:
+            for _st, _n in (_s.get("state_counts") or {}).items():
+                state_counts[_st] = state_counts.get(_st, 0) + _n
+        if state_counts:
+            logger.info("per-dataset final states: %s",
+                        ", ".join(f"{k}={v}" for k, v in sorted(state_counts.items())))
         logger.info("=" * 60 + "\n")
         return results
 
     @staticmethod
+    def _effective_prefetch_depth(staging: Any, async_cfg: Any) -> int:
+        """Staging ``prefetch_depth`` capped by the global async-pipeline
+        bounds ``ready_queue_size`` and ``max_inflight`` (all configurable; a
+        missing async section leaves the staging depth unchanged)."""
+        depth = max(1, int(getattr(staging, "prefetch_depth", 1) or 1))
+        depth = min(depth, int(getattr(async_cfg, "ready_queue_size", depth) or depth))
+        depth = min(depth, int(getattr(async_cfg, "max_inflight", depth) or depth))
+        return max(1, depth)
+
+    @staticmethod
     def _fmt_dur(secs: float) -> str:
+        if not math.isfinite(secs):
+            return "∞" if secs > 0 else "0s"
         secs = max(0.0, secs)
         h = int(secs // 3600)
         m = int(secs % 3600 // 60)
@@ -953,71 +1362,92 @@ class TrainingPipeline:
         warmup = overrides.get("warmup_steps", getattr(stage_cfg, "warmup_steps", 200))
         weight_decay = overrides.get("weight_decay", getattr(stage_cfg, "weight_decay", 0.05))
         max_grad_norm = overrides.get("max_grad_norm", getattr(stage_cfg, "max_grad_norm", 1.0))
-        optim = overrides.get("optimizer", getattr(stage_cfg, "optimizer", "adamw_fused"))
 
-        base_args = self.dist.get_training_args(str(output_dir))
+        base_args = self.dist.get_training_args(str(output_dir), per_device_batch_size=bs,
+                                            grad_accum_steps=gas)
         use_bf16 = base_args.get("bf16", False)
         use_fp16 = base_args.get("fp16", False)
         optim_name = self._resolve_optimizer_name(stage_cfg, base_args, overrides)
 
-        is_iterable = isinstance(dataset, IterableDataset)
-        num_workers = 0 if is_iterable else min(4, os.cpu_count() or 4)
+        num_workers = dataloader_num_workers(dataset)
 
 
         # Update FSDP transformer layer for MoE models
         model_type = self.cfg.model.architecture.model_type
         fsdp_config = base_args.get("fsdp_config", {})
-        if isinstance(fsdp_config, dict):
+        if base_args.get("fsdp") and isinstance(fsdp_config, dict):
             fsdp_config["transformer_layer_cls_to_wrap"] = [ARCH_FSDP_LAYER_MAP.get(model_type, "LlamaDecoderLayer")]
+ 
+        eval_strategy = (
+            self.cfg.training.eval_strategy
+            if stage_name in ("sft", "instruction_tuning")
+            else "no"
+        )
+        eval_steps = self.cfg.training.eval_steps if eval_strategy != "no" else None
+
+        train_dataset_for_trainer = dataset
+        eval_dataset = None
+        if eval_strategy != "no":
+            try:
+                n = len(dataset)
+                if n >= 10 and hasattr(dataset, "train_test_split"):
+                    split = dataset.train_test_split(test_size=max(1, int(n * 0.05)), seed=42)
+                    train_dataset_for_trainer = split["train"]
+                    eval_dataset = split["test"]
+                else:
+                    eval_strategy = "no"
+                    eval_steps = None
+            except (AttributeError, TypeError, ValueError):
+                eval_strategy = "no"
+                eval_steps = None
 
         training_args = TrainingArguments(
-            output_dir=str(output_dir),
-            num_train_epochs=1,
-            max_steps=max_steps,
-            per_device_train_batch_size=bs,
-            gradient_accumulation_steps=gas,
-            learning_rate=lr,
-            weight_decay=weight_decay,
-            warmup_steps=warmup,
-            max_grad_norm=max_grad_norm,
-            logging_steps=self.cfg.training.logging_steps,
-            save_steps=self.cfg.training.save_steps,
-            save_total_limit=self.cfg.training.save_total_limit,
-            eval_strategy=self.cfg.training.eval_strategy if stage_name in ("sft", "instruction_tuning") else "no",
-            eval_steps=self.cfg.training.eval_steps if stage_name in ("sft", "instruction_tuning") else None,
-            save_strategy="steps",
-            save_only_model=overrides.get("save_only_model", True),
-            ddp_find_unused_parameters=False,
-            fp16=use_fp16,
-            bf16=use_bf16,
-            optim=optim_name,
-            lr_scheduler_type=getattr(stage_cfg, "lr_scheduler_type", "cosine"),
-            report_to=self.cfg.output.experiment_tracking.provider if self.cfg.output.experiment_tracking.enabled else "none",
-            remove_unused_columns=False,
-            load_best_model_at_end=False,
-            ignore_data_skip=overrides.get("ignore_data_skip", self.cfg.training.ignore_data_skip),
-            dataloader_num_workers=num_workers,
-            dataloader_pin_memory=True,
-            torch_compile=False,
-            gradient_checkpointing=self.cfg.model.architecture.gradient_checkpointing,
-            **({"fsdp": base_args["fsdp"]} if base_args.get("fsdp") else {}),
-            **({"fsdp_config": fsdp_config} if fsdp_config else {}),
-            **({"deepspeed": base_args["deepspeed"]} if base_args.get("deepspeed") else {}),
+           output_dir=str(output_dir),
+           num_train_epochs=1,
+           max_steps=max_steps,
+           per_device_train_batch_size=bs,
+           gradient_accumulation_steps=gas,
+           learning_rate=lr,
+           weight_decay=weight_decay,
+           warmup_steps=warmup,
+           max_grad_norm=max_grad_norm,
+           logging_steps=self.cfg.training.logging_steps,
+           save_steps=self.cfg.training.save_steps,
+           save_total_limit=self.cfg.training.save_total_limit,
+           eval_strategy=eval_strategy,
+           eval_steps=eval_steps,
+           save_strategy="steps",
+           save_only_model=overrides.get("save_only_model", False),
+           ddp_find_unused_parameters=False,
+           fp16=use_fp16,
+           bf16=use_bf16,
+           optim=optim_name,
+           lr_scheduler_type=getattr(stage_cfg, "lr_scheduler_type", "cosine"),
+           report_to=self.cfg.output.experiment_tracking.provider if self.cfg.output.experiment_tracking.enabled else "none",
+           remove_unused_columns=False,
+           load_best_model_at_end=False,
+           ignore_data_skip=overrides.get("ignore_data_skip", self.cfg.training.ignore_data_skip),
+           dataloader_num_workers=num_workers,
+           dataloader_pin_memory=True,
+           torch_compile=False,
+           gradient_checkpointing=self.cfg.model.architecture.gradient_checkpointing,
+           **({"fsdp": base_args["fsdp"]} if base_args.get("fsdp") else {}),
+           fsdp_config=fsdp_config,
+           **({"deepspeed": base_args["deepspeed"]} if base_args.get("deepspeed") else {}),
         )
 
         data_collator = _LoggingDataCollator(DefaultDataCollator())
-        callbacks = [_LoggingCallback(), _NaNSafeCallback()]
+        callbacks = [_LoggingCallback(), _NaNSafeCallback(check_every=100)]
 
         # transformers >= 5.0 removed the `tokenizer` kwarg from
         # Trainer.__init__ in favor of `processing_class`.
-        tokenizer_kwarg = (
-            "processing_class" if "processing_class" in inspect.signature(Trainer.__init__).parameters else "tokenizer"
-        )
+        tokenizer_kwarg = trainer_tokenizer_kwarg()
 
         return Trainer(
             model=self.model,
             args=training_args,
-            train_dataset=dataset,
+            train_dataset=train_dataset_for_trainer,
+            eval_dataset=eval_dataset,
             data_collator=data_collator,
             callbacks=callbacks,
             **{tokenizer_kwarg: self.tokenizer},
@@ -1033,13 +1463,33 @@ class TrainingPipeline:
         if optim == "adamw_fused":
             if not torch.cuda.is_available() or base_args.get("fsdp") or base_args.get("deepspeed"):
                 return "adamw_torch"
+        elif optim == "adamw_8bit" and not torch.cuda.is_available():
+            logger.warning("adamw_8bit requires CUDA — falling back to adamw_torch")
+            return "adamw_torch"
         optim_map = {
             "adamw": "adamw_torch",
-            "adamw_8bit": "paged_adamw_8bit" if torch.cuda.is_available() else "adamw_torch",
-            "adamw_fused": "adamw_torch_fused" if hasattr(torch.optim, "AdamW") else "adamw_torch",
+            "adamw_8bit": "paged_adamw_8bit",
+            "adamw_fused": "adamw_torch_fused",
             "sgd": "sgd",
         }
-        return optim_map.get(optim, "adamw_torch")
+        candidate = optim_map.get(optim, "adamw_torch")
+        # transformers/HF optimizer registry — fall back to adamw_torch when the
+        # resolved name is unknown to the installed transformers version.
+        try:
+            from transformers.optimization import (
+                OPTIMIZER_NAME_TO_CLASS as _optimizers,
+            )
+            if candidate in _optimizers:
+                return candidate
+        except Exception:
+            pass
+        try:
+            from transformers.optimization import _name_to_optimizer_ctor as _ctors
+            if candidate in _ctors:
+                return candidate
+        except Exception:
+            pass
+        return "adamw_torch"
 
     def staged_training(
         self,
@@ -1094,10 +1544,54 @@ class TrainingPipeline:
 
         logger.info("All %d stages complete.", len(datasets_cfg))
 
+    def _trainer_wrapped_model(self) -> Optional[Any]:
+        """The HF Trainer's wrapped model (FSDP/DDP), if different from the
+        raw model the pipeline holds."""
+        trainer = getattr(self, "_last_trainer", None)
+        if trainer is not None:
+            model = getattr(trainer, "model", None)
+            wrapped = getattr(trainer, "model_wrapped", None)
+            candidate = wrapped if wrapped is not None and wrapped is not model else model
+            if candidate is not None and candidate is not self.model:
+                return candidate
+        return None
+
+    def _state_dict_for_save(self) -> Optional[Dict[str, Any]]:
+        """Full model state dict for the main rank (None on other ranks).
+
+        With FSDP full-shard, the raw model's state_dict holds only the
+        rank-local shards — without a FULL_STATE_DICT gather every rank would
+        write partial weights into the same path (last-writer-wins = corrupt
+        checkpoint). Gather on rank 0, offload to CPU, and let non-main ranks
+        skip the write entirely.
+        """
+        if self.dist.is_distributed and dist.is_initialized() and not self.dist.is_main_process():
+            return None
+        wrapped = self._trainer_wrapped_model()
+        if wrapped is not None:
+            try:
+                from torch.distributed.fsdp import (
+                    FullyShardedDataParallel as FSDP,
+                    FullStateDictConfig,
+                    StateDictType,
+                )
+                if self.dist.is_distributed and isinstance(wrapped, FSDP):
+                    cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+                    with FSDP.state_dict_type(wrapped, StateDictType.FULL_STATE_DICT, cfg):
+                        return wrapped.state_dict()
+            except ImportError:
+                pass
+        return self.model.state_dict()
+
     def save_model(self, path: Optional[str | Path] = None) -> None:
         path = Path(path or self.cfg.output.model_dir)
+        state = self._state_dict_for_save()
+        if state is None:
+            # Non-main ranks own only local shards; the main rank writes the
+            # full checkpoint (HF trainer.save_model already gathers for us).
+            return
         path.mkdir(parents=True, exist_ok=True)
-        torch.save(self.model.state_dict(), str(path / "pytorch_model.bin"))
+        torch.save(state, str(path / "pytorch_model.bin"))
         arch = self.cfg.model.architecture
         config = {
             "model_type": arch.model_type,
@@ -1116,9 +1610,23 @@ class TrainingPipeline:
 
     def _find_resume_checkpoint(self) -> Optional[Path]:
         model_dir = Path(self.cfg.output.model_dir)
-        if (model_dir / "pytorch_model.bin").exists() or (model_dir / "config.json").exists():
+        # 1) Root-level final save (weights present) — the most recent durable
+        #    artifact and the canonical resume point.
+        if (model_dir / "pytorch_model.bin").exists():
             return model_dir
-
+        # 2) Newest model weights anywhere under the model dir — stage dirs,
+        #    HF checkpoint-* subfolders, etc.
+        candidates = sorted(
+            model_dir.rglob("pytorch_model.bin"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        if candidates:
+            return candidates[0].parent
+        # 3) Config-only artifact (weights may still be written by the caller).
+        if (model_dir / "config.json").exists():
+            return model_dir
+        # 4) Explicit checkpoint_dir fallback.
         checkpoint_dir = Path(self.cfg.output.checkpoint_dir)
         if checkpoint_dir.exists():
             candidates = sorted(
@@ -1128,10 +1636,15 @@ class TrainingPipeline:
             )
             if candidates:
                 return candidates[0].parent
-
         return None
 
     def _save_checkpoint(self, path: Path) -> None:
+        state = self._state_dict_for_save()
+        if state is None:
+            # Non-main ranks hold only FSDP shards — the main rank owns the
+            # checkpoint (matches trainer.save_model's gather behavior, so the
+            # last write to pytorch_model.bin is always the FULL state).
+            return
         path.mkdir(parents=True, exist_ok=True)
         arch = self.cfg.model.architecture
         config = {
@@ -1144,7 +1657,6 @@ class TrainingPipeline:
             "nslt": arch.nslt.model_dump(mode="python") if arch.model_type == "nslt" else None,
             "methos_v3": arch.methos_v3.model_dump(mode="python") if arch.model_type == "methos_v3" else None,
         }
-        state = self.model.state_dict()
 
         def _write(target: Path) -> None:
             (target / "config.json").write_text(

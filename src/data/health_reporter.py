@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -16,7 +16,7 @@ class DatasetHealthReport:
     def __init__(self, name: str, config_path: str = ""):
         self.name = name
         self.config_path = config_path
-        self.timestamp = datetime.utcnow().isoformat()
+        self.timestamp = datetime.now(timezone.utc).isoformat()
         self.datasets: List[Dict[str, Any]] = []
         self.global_stats: Dict[str, Any] = {}
         self.categories: Dict[str, Dict[str, Any]] = {}
@@ -84,9 +84,11 @@ class DatasetHealthReport:
                 "count": len(quality_scores),
             }
         if lang_dist:
-            self.languages.update(lang_dist)
+            for k, v in lang_dist.items():
+                self.languages[k] = self.languages.get(k, 0) + int(v)
         if domain_dist:
-            self.domains.update(domain_dist)
+            for k, v in domain_dist.items():
+                self.domains[k] = self.domains.get(k, 0) + int(v)
         self.datasets.append(entry)
 
     def add_error(self, msg: str) -> None:
@@ -96,16 +98,14 @@ class DatasetHealthReport:
         if not self.datasets:
             self.global_stats = {"error": "no datasets"}
             return
-        total_raw = sum(d["raw_samples"] for d in self.datasets)
-        total_packed = sum(d["packed_sequences"] for d in self.datasets)
-        total_tokens = sum(d["total_tokens"] for d in self.datasets)
-        total_dup = sum(d["duplicates_removed"] for d in self.datasets)
-        avg_retention = sum(d["retention_rate"] for d in self.datasets) / max(len(self.datasets), 1)
-        avg_packing = sum(d["packing_efficiency"] for d in self.datasets) / max(len(self.datasets), 1)
-        avg_padding = sum(d["padding_ratio"] for d in self.datasets) / max(len(self.datasets), 1)
-        avg_tokens = sum(d["avg_tokens_per_seq"] for d in self.datasets) / max(len(self.datasets), 1)
-        total_long_ctx = sum(d["long_context_count"] for d in self.datasets)
-        total_docs_with_lengths = sum(d.get("quality_scores", {}).get("count", 0) for d in self.datasets)
+        total_raw = sum((d.get("raw_samples") or 0) for d in self.datasets)
+        total_packed = sum((d.get("packed_sequences") or 0) for d in self.datasets)
+        total_tokens = sum((d.get("total_tokens") or 0) for d in self.datasets)
+        total_dup = sum((d.get("duplicates_removed") or 0) for d in self.datasets)
+        avg_retention = sum((d.get("retention_rate") or 0) for d in self.datasets) / max(len(self.datasets), 1)
+        avg_packing = sum((d.get("packing_efficiency") or 0) for d in self.datasets) / max(len(self.datasets), 1)
+        avg_padding = sum((d.get("padding_ratio") or 0) for d in self.datasets) / max(len(self.datasets), 1)
+        avg_tokens = sum((d.get("avg_tokens_per_seq") or 0) for d in self.datasets) / max(len(self.datasets), 1)
 
         # Category breakdown
         cats: Dict[str, Dict[str, Any]] = {}
@@ -121,11 +121,25 @@ class DatasetHealthReport:
             cats[c]["long_ctx_count"] += d["long_context_count"]
         self.categories = cats
 
+        # Long-context ratio uses token_lengths counts, not quality_scores.
+        total_long_ctx = sum(d["long_context_count"] for d in self.datasets)
+        # Sum over actual document counts per dataset (not quality_scores).
+        # add_dataset_stats stores token_lengths-derived counts; fall back to
+        # quality_scores count when token_lengths was absent.
+        total_docs_for_ratio = 0
+        for d in self.datasets:
+            cnt = d.get("long_context_count", 0)
+            # Prefer stored total docs if available via raw_samples.
+            total_docs_for_ratio += d.get("raw_samples", d.get("quality_scores", {}).get("count", 0))
+        # Fallback: at least count datasets with any data
+        if total_docs_for_ratio == 0:
+            total_docs_for_ratio = max(len(self.datasets), 1)
+
         # Quality aggregation
         all_qs = []
         for d in self.datasets:
             qs = d.get("quality_scores", {})
-            if qs.get("count", 0) > 0:
+            if (qs.get("count", 0) or 0) > 0 and qs.get("mean") is not None:
                 all_qs.append(qs["mean"])
         avg_quality = sum(all_qs) / max(len(all_qs), 1) if all_qs else 0.0
 
@@ -145,7 +159,7 @@ class DatasetHealthReport:
             "average_tokens_per_sequence": round(avg_tokens, 1),
             "average_quality_score": round(avg_quality, 4),
             "long_context_documents": total_long_ctx,
-            "long_context_ratio_global": round(total_long_ctx / max(total_docs_with_lengths, 1), 4),
+            "long_context_ratio_global": round(total_long_ctx / max(total_docs_for_ratio, 1), 4),
             "categories": len(cats),
             "languages_detected": total_lang,
             "domains_detected": total_domain,
@@ -172,29 +186,34 @@ class DatasetHealthReport:
                   f"{'Tok':>9} {'Ret%':>5} {'PackEff':>7} {'Pad':>5} {'AvgQS':>6} {'LgCtx':>5}")
         lines.append(header)
         lines.append("-" * len(header))
-        for d in sorted(self.datasets, key=lambda x: x["retention_rate"]):
+        for d in sorted(self.datasets, key=lambda x: (x.get("retention_rate") or 0)):
             name = d["path"][:29]
-            qs_mean = d.get("quality_scores", {}).get("mean", 0)
+            qs_mean = d.get("quality_scores", {}).get("mean") or 0
             lines.append(
-                f"{name:<30} {d['category']:<10} {d['raw_samples']:>7} "
-                f"{d['packed_sequences']:>7} {d['total_tokens']:>9} "
-                f"{d['retention_rate']:>4.0f}% "
-                f"{d['packing_efficiency']:>6.0%} "
-                f"{d['padding_ratio']:>4.0%} "
+                f"{name:<30} {d['category']:<10} {(d['raw_samples'] or 0):>7} "
+                f"{(d['packed_sequences'] or 0):>7} {(d['total_tokens'] or 0):>9} "
+                f"{(d['retention_rate'] or 0):>4.0f}% "
+                f"{(d['packing_efficiency'] or 0):>6.0%} "
+                f"{(d['padding_ratio'] or 0):>4.0%} "
                 f"{qs_mean:>5.2f} "
-                f"{d['long_context_count']:>5}"
+                f"{(d['long_context_count'] or 0):>5}"
             )
         if self.categories:
             lines.append(f"\n── Category Token Distribution ──────────────────────────────")
             total_tok = self.global_stats.get("total_tokens", 1)
-            for cat, info in sorted(self.categories.items(), key=lambda x: -x[1]["token_count"]):
-                pct = info["token_count"] / max(total_tok, 1) * 100
-                target_pct = {
+            try:
+                from src.data.registry import CATEGORY_WEIGHTS
+                _cat_targets = {k: round(v * 100) for k, v in CATEGORY_WEIGHTS.items()}
+            except Exception:
+                _cat_targets = {
                     "code": 30, "web_text": 20, "docs": 15, "wiki": 10,
-                    "math": 8, "science": 5, "books": 5, "structured_knowledge": 2, "long_context": 5,
-                }.get(cat, 0)
+                    "math": 10, "science": 5, "books": 5, "structured_knowledge": 5, "long_context": 5,
+                }
+            for cat, info in sorted(self.categories.items(), key=lambda x: -(x[1].get("token_count") or 0)):
+                pct = (info.get("token_count") or 0) / max(total_tok, 1) * 100
+                target_pct = _cat_targets.get(cat, 0)
                 status = "OK" if abs(pct - target_pct) < 5 else "MISMATCH"
-                lines.append(f"  {cat:<20} {info['token_count']:>10} tokens ({pct:5.1f}%) "
+                lines.append(f"  {cat:<20} {(info.get('token_count') or 0):>10} tokens ({pct:5.1f}%) "
                            f"[target {target_pct}%] [{status}]")
         if self.languages:
             lines.append(f"\n── Language Distribution ───────────────────────────────────")
@@ -211,9 +230,12 @@ class DatasetHealthReport:
         lines.append(f"\n── Per-Dataset Quality Breakdown ─────────────────────────────")
         for d in self.datasets:
             qs = d.get("quality_scores", {})
-            if qs.get("count", 0) > 0:
-                lines.append(f"  {d['path'][:35]:35s} mean={qs['mean']:.3f} "
-                           f"min={qs['min']:.3f} max={qs['max']:.3f} n={qs['count']}")
+            if (qs.get("count", 0) or 0) > 0:
+                mean = qs.get("mean") or 0.0
+                minimum = qs.get("min") or 0.0
+                maximum = qs.get("max") or 0.0
+                lines.append(f"  {d['path'][:35]:35s} mean={mean:.3f} "
+                             f"min={minimum:.3f} max={maximum:.3f} n={qs.get('count', 0)}")
         lines.append("\n" + "=" * 72)
         return "\n".join(lines)
 

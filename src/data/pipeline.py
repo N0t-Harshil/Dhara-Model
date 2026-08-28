@@ -64,6 +64,7 @@ from src.data.drivers import (
     DRIVER_KIND_FILE,
     DRIVER_KIND_LOCAL,
     DRIVER_KIND_SCRIPT,
+    DRIVER_KIND_STREAMING,
     detect_driver,
 )
 
@@ -350,6 +351,12 @@ class WeightedMixedDataset(TorchDataset):
         # Effective weight = base_weight * quality_score
         eff = [bw * q for bw, q in zip(base_weights, qs)]
         total_w = sum(eff)
+        if total_w <= 0:
+            # All-zero weights (e.g. after normalization with zero category
+            # targets) would divide by zero — fall back to uniform.
+            logger.warning("All dataset weights are zero — using uniform weights")
+            eff = [1.0] * len(eff)
+            total_w = float(len(eff))
         self.weights = [w / total_w for w in eff]
         self.total_samples = total_samples
         self._built = False
@@ -405,11 +412,20 @@ class WeightedMixedDataset(TorchDataset):
         total = sum(eff)
         return [w / total for w in eff] if total > 0 else self.weights
 
+    def _all_exhausted(self) -> bool:
+        """True when every constituent dataset has been fully consumed."""
+        return all(c >= s for c, s in zip(self._consumed, self._dataset_sizes))
+
     def _sample_adaptive(self, rng, group_map=None, group_name="", num_samples=None):
         self.assignments = []
         self.indices = []
         n = self.total_samples if num_samples is None else num_samples
         for _ in range(n):
+            if self._all_exhausted():
+                # Every dataset fully consumed — start a fresh pass instead of
+                # re-sampling consumed indices (that would fabricate an epoch
+                # of ~100% duplicate samples).
+                self._consumed = [0] * len(self.datasets)
             eff_w = self._effective_weights()
             if sum(eff_w) == 0:
                 eff_w = [1.0 / len(eff_w)] * len(eff_w)
@@ -431,10 +447,24 @@ class WeightedMixedDataset(TorchDataset):
         self.assignments = []
         self.indices = []
         adjusted = sum(group_samples.values())
+        # Correct overflow/underflow on a group that actually contributes
+        # datasets (previously always the first key, even when that group's
+        # dataset list was empty → samples silently lost).
+        def _adjust_key(delta: int):
+            # Prefer the group with the most backing datasets.
+            ranked = sorted(group_samples.keys(),
+                            key=lambda g: len(group_map.get(g, [])), reverse=True)
+            for k in ranked:
+                if group_map.get(k):
+                    group_samples[k] += delta
+                    return
+            # Fallback: no group has datasets (should not happen).
+            group_samples[list(group_samples.keys())[0]] += delta
+
         if adjusted < self.total_samples:
-            group_samples[list(group_samples.keys())[0]] += self.total_samples - adjusted
+            _adjust_key(self.total_samples - adjusted)
         elif adjusted > self.total_samples:
-            group_samples[list(group_samples.keys())[0]] -= adjusted - self.total_samples
+            _adjust_key(-(adjusted - self.total_samples))
         for group, count in group_samples.items():
             ds_indices = group_map.get(group, [])
             if not ds_indices:
@@ -478,6 +508,8 @@ class DataPipeline:
             self.dedup = SimHashDeduplicator(threshold=dedup_threshold)
         elif dedup_method == "minhash":
             self.dedup = MinHashDeduplicator(threshold=dedup_threshold)
+        elif dedup_method == "embedding":
+            self.dedup = SemanticDeduplicator(threshold=dedup_threshold)
         else:
             self.dedup = ExactDeduplicator()
         self.contamination = ContaminationFilter(benchmarks=cfg.data.quality.contamination.benchmarks)
@@ -699,7 +731,20 @@ class DataPipeline:
         return ds
 
     def _get_cache_key(self, ds_info: DatasetEntryConfig, stage_name: str) -> str:
-        raw = f"{ds_info.path}_{ds_info.max_samples}_{self.cfg.training.max_seq_length}_{self.cfg.model.architecture.vocab_size}_v3_foundation"
+        # Dataset identity + preprocessing/quality config must all be part of
+        # the key, otherwise changing dedup/quality/filtering settings (or the
+        # dataset name) silently reuses the previously cached packed dataset.
+        pp = self.cfg.data.preprocessing
+        q = self.cfg.data.quality
+        raw = "|".join([
+            ds_info.path, ds_info.name or "", ds_info.split, str(ds_info.max_samples),
+            str(self.cfg.training.max_seq_length),
+            str(self.cfg.model.architecture.vocab_size),
+            q.deduplication.method, f"{q.deduplication.threshold:.4f}",
+            str(self.cfg.data.ast_filter.code_filtering),
+            str(pp.remove_boilerplate), str(pp.min_text_length),
+            "v2",
+        ])
         return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
     def _cached_dataset_path(self, ds_info: DatasetEntryConfig, stage_name: str) -> Path:
@@ -807,7 +852,7 @@ class DataPipeline:
                 (Dataset.from_list(e["packed"]), e["weight"], e["path"], e["category"], e["avg_qs"])
                 for e in entries
             ]
-            result = self._construct_mixed_dataset(all_tokenized)
+            result = self._unit_or_mixed(all_tokenized)
             result._entries = all_tokenized
             result._dataset_metas = [e.get("meta") or {} for e in entries]
             meta = obj.get("meta") or {}
@@ -898,7 +943,8 @@ class DataPipeline:
                         or self.cfg.data.max_samples_per_dataset
                         or DEFAULT_MAX_SAMPLES_PER_DATASET)
         return hashlib.sha256("|".join([
-            "unit-v1", info.path, info.name or "", info.split, str(ds_limit),
+            "unit-v1", info.path, info.name or "", info.split,
+            info.category, str(ds_limit),
             self.processing_signature(), self.tokenizer_signature,
         ]).encode()).hexdigest()[:16]
 
@@ -992,10 +1038,18 @@ class DataPipeline:
 
         logger.info("[UNIT] %d/%d %s/%s — building (no cache)",
                     unit_index, unit_total, info.path, info.name or "default")
-        dataset = self.build_pretrain_dataset_from_registry(
-            include=[(info.path, info.name)],
-            max_samples_per_dataset=info.max_samples or self.cfg.data.max_samples_per_dataset,
-        )
+        try:
+            dataset = self.build_pretrain_dataset_from_registry(
+                include=[(info.path, info.name)],
+                max_samples_per_dataset=info.max_samples or self.cfg.data.max_samples_per_dataset,
+            )
+        except Exception as e:  # noqa: BLE001 — phase-tagged for the prefetch worker
+            from src.training.asyncprefetch import _tag_phase
+            _tag_phase(e, "construction",
+                       dataset=info.path, name=info.name or "",
+                       split=info.split, unit=f"{stage_index}/{unit_index}",
+                       intended_type="Dataset")
+            raise
         entries = getattr(dataset, "_entries", None)
         if not entries:
             raise RuntimeError(
@@ -1087,7 +1141,7 @@ class DataPipeline:
             raw_count = len(samples)
             total_raw += raw_count
             ledger = {"boilerplate_skip": 0, "too_short": 0, "quality_fail": 0,
-                      "dedup": 0, "ast_reject": 0, "empty_trivial": 0}
+                      "dedup": 0, "ast_reject": 0, "empty_trivial": 0, "contaminated": 0}
             cleaned: List[str] = []
             for s in samples:
                 text = s.get("output") or s.get("text") or s.get("content") or ""
@@ -1107,6 +1161,10 @@ class DataPipeline:
                 if not passes_quality_filter(text, category, quality_score=ds_qs):
                     ledger["quality_fail"] += 1
                     continue
+                if self.contamination.is_contaminated(text):
+                    ledger["contaminated"] += 1
+                    rejection_reasons["contamination"] += 1
+                    continue
                 if category in ('code',) and ast_filter_cfg.code_filtering:
                     lang = ds_info.language or detect_language(text, ds_name)
                     ok, reason = filter_code(text, lang, ast_filter_cfg)
@@ -1118,10 +1176,13 @@ class DataPipeline:
                     ledger["dedup"] += 1
                     rejection_reasons["exact_dedup"] += 1
                     continue
-                if self.cfg.data.quality.deduplication.method == "simhash":
-                    if isinstance(self.dedup, SimHashDeduplicator) and self.dedup.is_duplicate(text):
+                # Dedup: use whichever method was configured (the old code only
+                # consulted SimHash even when minhash/exact/embedding was selected,
+                # so those methods were constructed-but-never-called dummies).
+                if hasattr(self.dedup, "is_duplicate") and self.dedup is not self.exact_dedup:
+                    if self.dedup.is_duplicate(text):
                         ledger["dedup"] += 1
-                        rejection_reasons["simhash_dedup"] += 1
+                        rejection_reasons[f"{self.cfg.data.quality.deduplication.method}_dedup"] += 1
                         continue
                 if category in ('code',) and func_sampling_cfg.enabled and ds_info.function_sampling:
                     lang = ds_info.language or detect_language(text, ds_name)
@@ -1133,11 +1194,11 @@ class DataPipeline:
                 cleaned.append(text)
             total_after_boilerplate += raw_count - ledger["boilerplate_skip"] - ledger["too_short"]
             total_after_quality += raw_count - ledger["boilerplate_skip"] - ledger["too_short"] - ledger["quality_fail"]
-            dedup_total = ledger["dedup"] + ledger["ast_reject"] + ledger["empty_trivial"]
+            dedup_total = ledger["dedup"] + ledger["ast_reject"] + ledger["empty_trivial"] + ledger["contaminated"]
             total_after_dedup += raw_count - ledger["boilerplate_skip"] - ledger["too_short"] - ledger["quality_fail"] - dedup_total
             total_after_ast += len(cleaned)
-            logger.info("    Boilerplate skipped: %d | too short: %d | quality fail: %d",
-                        ledger["boilerplate_skip"], ledger["too_short"], ledger["quality_fail"])
+            logger.info("    Boilerplate skipped: %d | too short: %d | quality fail: %d | contaminated: %d",
+                        ledger["boilerplate_skip"], ledger["too_short"], ledger["quality_fail"], ledger["contaminated"])
             logger.info("    AST reject: %d | dedup: %d | empty/trivial: %d",
                         ledger["ast_reject"], ledger["dedup"], ledger["empty_trivial"])
             logger.info("    Survived: %d (%.1f%%)", len(cleaned), len(cleaned) / max(raw_count, 1) * 100)
@@ -1213,7 +1274,7 @@ class DataPipeline:
             weighted = [(ds, ds_info.weight, ds_info.path) for ds, ds_info in all_tokenized]
             balance_tokens = self.cfg.data.sampler.balance_by == "tokens"
             if balance_tokens:
-                token_counts = [sum(1 for _ in iter(ds)) if hasattr(ds, '__len__') else 1 for ds, _ in all_tokenized]
+                token_counts = [len(ds) if hasattr(ds, '__len__') else 1 for ds, _ in all_tokenized]
                 total_tok = sum(token_counts)
                 if total_tok > 0:
                     weighted = [
@@ -1280,11 +1341,11 @@ class DataPipeline:
         if pool is not None:
             try:
                 pool.close()
-                pool.join(timeout=5)
+                pool.join()  # drain: idle workers exit promptly on close()
             except Exception as e:
-                logger.warning("Cleanup pool close failed (%s) — terminating", e)
+                logger.warning("Cleanup pool join failed (%s) — terminating", e)
             try:
-                pool.terminate()
+                pool.terminate()  # backstop: never leak worker processes
             except Exception:
                 pass
 
@@ -1437,12 +1498,12 @@ class DataPipeline:
                                    key, entry.fallbacks if entry is info else "none")
                     continue
                 if stats.resolve_error:
-                    # Detection already failed with the same error the cold
-                    # load would hit (gated/404/offline) — log the access
-                    # guidance once instead of retrying the Hub.
+                    # Detection failed (gated/404/offline) — log access
+                    # guidance once, then try the NEXT fallback entry instead
+                    # of giving up on the whole chain.
                     from src.data.metadata_cache import _handle_load_error
                     _handle_load_error(entry.path, RuntimeError(stats.resolve_error))
-                    return
+                    continue
                 yield from self._stream_cold(entry, limit, text_fields, stats)
                 return
             except Exception:
@@ -1467,9 +1528,7 @@ class DataPipeline:
         n_shards = len(files)
         if n_shards == 0:
             raise RuntimeError(f"No file sources in record for {rec.get('repo')}")
-        fingerprint = hashlib.sha256(
-            f"{entry.path}|{entry.name or ''}|{entry.split}|{ppsig}|{self.tokenizer_signature}"
-            .encode()).hexdigest()
+        fingerprint = self._shard_progress_fingerprint(entry, rec, ppsig)
         prect = (store.load(entry.path, entry.name, entry.split, fingerprint)
                  if store is not None else None)
         t_sel = time.perf_counter()
@@ -1506,6 +1565,22 @@ class DataPipeline:
                     stats.shard_accepted or {},
                 )
 
+    def _shard_progress_fingerprint(
+        self, entry: DatasetInfo, rec: Dict[str, Any], ppsig: str,
+    ) -> str:
+        """Shard-progress key fingerprint.
+
+        The record fingerprint (repo/name/split + resolved FILE LIST +
+        revision + preprocess/tokenizer signatures) is folded into the
+        shard-progress key: when upstream files change, a fresh progress
+        record starts instead of re-using stale per-shard offsets.
+        """
+        rec_fp = (rec or {}).get("fingerprint") or ""
+        return hashlib.sha256(
+            f"{entry.path}|{entry.name or ''}|{entry.split}|{ppsig}|"
+            f"{self.tokenizer_signature}|{rec_fp}"
+            .encode()).hexdigest()
+
     def _shard_stats_from_stream(self, coord: ShardCoordinator) -> Dict[str, Any]:
         stats: Dict[str, Any] = {}
         for sidx, raw in coord._raw_done.items():
@@ -1525,10 +1600,19 @@ class DataPipeline:
         try:
             state = coord.progress_state()
             stats = prect.setdefault("stats", {})
-            # Finished shards are marked complete (yield-order safe).
+            failed = set(coord.failed_shards())
+            # Finished shards are marked complete (yield-order safe) — except
+            # FAILED shards, which must NOT be skipped on resume: their
+            # progress is reset so the next run retries them from scratch
+            # instead of silently losing their rows.
             for sidx in coord._raw_done:
                 st = stats.setdefault(str(sidx), {})
-                st["complete"] = 1
+                if sidx in failed:
+                    st["complete"] = 0
+                    st.pop("streamed", None)
+                    st.pop("accepted", None)
+                else:
+                    st["complete"] = 1
             if all(str(i) in stats and stats[str(i)].get("complete")
                    for i in range(n_shards)):
                 store.delete(entry.path, entry.name, entry.split,
@@ -1729,6 +1813,13 @@ class DataPipeline:
         rejection_reasons: Dict[str, int] = defaultdict(int)
         lang_dist: Dict[str, int] = defaultdict(int)
         domain_dist: Dict[str, int] = defaultdict(int)
+        # Driver-layer cache accounting (exposed to callers via the result's
+        # _driver_stats attribute → surfaced in the ASYNC PIPELINE REPORT).
+        driver_stats = {
+            "metadata_hits": 0, "metadata_attempts": 0,
+            "builder_hits": 0, "builder_attempts": 0,
+            "local_entries": 0, "streaming_fallback": 0,
+        }
 
         ast_filter_cfg = self.cfg.data.ast_filter
         func_sampling_cfg = self.cfg.data.function_sampling
@@ -1757,7 +1848,8 @@ class DataPipeline:
             ledger = {"loaded": 0, "accepted": 0,
                       "rejected_boilerplate": 0, "rejected_short": 0,
                       "rejected_quality": 0, "rejected_dedup": 0,
-                      "rejected_ast": 0, "rejected_empty": 0}
+                      "rejected_ast": 0, "rejected_empty": 0,
+                      "rejected_contamination": 0}
             quality_scores: List[float] = []
             cleaned_texts: List[str] = []
             shard_streamed: Dict[int, int] = defaultdict(int)
@@ -1775,6 +1867,12 @@ class DataPipeline:
                 hit = self._load_registry_dataset_cache(cache_path, cache_key, ds_key, info)
                 if hit is not None:
                     cached_ds, meta = hit
+                    # Restore language/domain hints lost when the packed
+                    # dataset was saved to disk (needed for stratification).
+                    if info.language:
+                        cached_ds.language = info.language
+                    if info.domain:
+                        cached_ds.domain = info.domain
                     all_tokenized.append((cached_ds, info.weight, info.path, info.category, meta["avg_qs"]))
                     dataset_metas.append(meta)
                     for k, v in meta["global_delta"].items():
@@ -1881,6 +1979,15 @@ class DataPipeline:
                                     continue
                                 quality_kept.append((text, ds_lang, comp_score, _sh))
 
+                            contamination_kept: List[Tuple[str, str, float, int]] = []
+                            for text, ds_lang, comp_score, _sh in quality_kept:
+                                if self.contamination.is_contaminated(text):
+                                    ledger["rejected_contamination"] += 1
+                                    rejection_reasons["contamination"] += 1
+                                    continue
+                                contamination_kept.append((text, ds_lang, comp_score, _sh))
+                            quality_kept = contamination_kept
+
                             code_filtering = cat in ("code",) and ast_filter_cfg.code_filtering
                             if code_filtering and quality_kept:
                                 t_stage = time.perf_counter()
@@ -1972,6 +2079,19 @@ class DataPipeline:
                     streamer.stats.shard_streamed = dict(shard_streamed)
                     streamer.stats.shard_accepted = dict(shard_accepted)
                     streamer.close()
+                ds_drv = getattr(streamer.stats, "driver_kind", None)
+                if ds_drv:
+                    driver_stats["metadata_attempts"] += int(
+                        ds_drv in (DRIVER_KIND_FILE, DRIVER_KIND_LOCAL))
+                    driver_stats["builder_attempts"] += int(
+                        ds_drv == DRIVER_KIND_SCRIPT)
+                    driver_stats["local_entries"] += int(ds_drv == DRIVER_KIND_LOCAL)
+                    driver_stats["streaming_fallback"] += int(
+                        ds_drv == DRIVER_KIND_STREAMING)
+                driver_stats["metadata_hits"] += int(
+                    getattr(streamer.stats, "metadata_hit", False))
+                driver_stats["builder_hits"] += int(
+                    getattr(streamer.stats, "builder_hit", False))
                 if not stream_ok:
                     continue
                 stage_acc["extract_empty"] = max(
@@ -2063,6 +2183,13 @@ class DataPipeline:
                 p["_language"] = info.language or ""
                 p["_domain"] = info.domain
             ds = Dataset.from_list(packed)
+            # Attach language/domain hints so WeightedMixedDataset's
+            # balance_languages/balance_domains stratification can group this
+            # dataset instead of collapsing every entry into 'other'.
+            if info.language:
+                ds.language = info.language
+            if info.domain:
+                ds.domain = info.domain
             all_tokenized.append((ds, info.weight, info.path, info.category, avg_qs))
             raw_tok_lengths = [len(t["input_ids"]) for t in tokenized[:1000]]
             ds_meta = {
@@ -2133,13 +2260,22 @@ class DataPipeline:
                 "(3) network connectivity, (4) disk space."
             )
 
-        result = self._construct_mixed_dataset(all_tokenized)
+        try:
+            result = self._unit_or_mixed(all_tokenized)
+        except Exception as e:  # noqa: BLE001 — phase-tagged for the prefetch worker
+            from src.training.asyncprefetch import _tag_phase
+            _tag_phase(e, "wrapper",
+                       n_datasets=len(all_tokenized),
+                       paths=[t[2] for t in all_tokenized if len(t) > 2],
+                       intended_type="Dataset")
+            raise
 
         # Attach raw entries so callers (e.g. staged pretraining) can persist
         # the stage-level cache without re-streaming.
         result._entries = all_tokenized
         result._dataset_metas = dataset_metas
         result._global_stats = global_stats
+        result._driver_stats = driver_stats
         result._lang_dist = dict(lang_dist)
         result._domain_dist = dict(domain_dist)
         result._rejection_reasons = dict(rejection_reasons)

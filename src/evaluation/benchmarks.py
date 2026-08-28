@@ -5,6 +5,7 @@ import logging
 import math
 import re
 import subprocess
+import sys
 import tempfile
 import time
 from abc import ABC, abstractmethod
@@ -17,6 +18,19 @@ from transformers import PreTrainedModel, PreTrainedTokenizerBase
 logger = logging.getLogger(__name__)
 
 
+def _try_load_hf(dataset: str, name: Optional[str] = None, **kwargs):
+    """Best-effort HF load with offline fallback (no network → toy data)."""
+    try:
+        from datasets import load_dataset
+        load_kwargs = dict(kwargs)
+        if name is not None:
+            load_kwargs["name"] = name
+        return load_dataset(dataset, **load_kwargs)
+    except Exception as e:
+        logger.warning("Could not load HF dataset %s (%s) — using built-in toy fallback.", dataset, e)
+        return None
+
+
 class BenchmarkResult:
     def __init__(self, name: str, score: float, details: Optional[Dict[str, Any]] = None) -> None:
         self.name = name
@@ -25,9 +39,11 @@ class BenchmarkResult:
         self.passed = self.details.get("passed", 0)
         self.total = self.details.get("total", 0)
         self.time_seconds = self.details.get("time_seconds", 0.0)
+        self.smoke = self.details.get("smoke", False)
 
     def __repr__(self) -> str:
-        return f"{self.name}: {self.score:.4f} ({self.passed}/{self.total}) in {self.time_seconds:.1f}s"
+        tag = " [smoke]" if self.smoke else ""
+        return f"{self.name}: {self.score:.4f} ({self.passed}/{self.total}) in {self.time_seconds:.1f}s{tag}"
 
 
 class BaseBenchmark(ABC):
@@ -46,9 +62,7 @@ class HumanEvalBenchmark(BaseBenchmark):
         super().__init__("HumanEval")
 
     def run(self, model: PreTrainedModel, tokenizer: PreTrainedTokenizerBase, max_new_tokens: int = 512, **kwargs) -> BenchmarkResult:
-        problems = self._get_problems()
-        limit = kwargs.get("limit", len(problems))
-        problems = problems[:limit]
+        problems = self._get_problems(limit=kwargs.get("limit"))
         passed = 0
         start = time.time()
 
@@ -64,15 +78,27 @@ class HumanEvalBenchmark(BaseBenchmark):
             code = tokenizer.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
             code = self._extract_code(code)
 
-            if self._check_solution(code, problem.get("test", "")):
+            if self._check_solution(code, problem.get("test", ""), timeout=kwargs.get("timeout", 10.0)):
                 passed += 1
 
         elapsed = time.time() - start
+        smoke = len(problems) == 1 and problems[0].get("entry_point") == "return_one"
         return BenchmarkResult(self.name, passed / max(len(problems), 1), {
-            "passed": passed, "total": len(problems), "time_seconds": elapsed,
+            "passed": passed, "total": len(problems), "time_seconds": elapsed, "smoke": smoke,
         })
 
-    def _get_problems(self) -> List[Dict[str, Any]]:
+    def _get_problems(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        ds = _try_load_hf("openai_humaneval", split="test")
+        if ds is not None:
+            try:
+                items = []
+                for ex in ds:
+                    items.append({"prompt": ex["prompt"], "test": ex["test"], "entry_point": ex["entry_point"]})
+                    if limit and len(items) >= limit:
+                        break
+                return items
+            except Exception as e:
+                logger.warning("HumanEval HF parse failed (%s) — fallback.", e)
         return [
             {"prompt": "def return_one():\n    ", "test": "assert return_one() == 1", "entry_point": "return_one"},
         ]
@@ -86,22 +112,28 @@ class HumanEvalBenchmark(BaseBenchmark):
         return text.strip()
 
     @staticmethod
-    def _check_solution(code: str, test: str) -> bool:
+    def _check_solution(code: str, test: str, timeout: float = 10.0) -> bool:
         if not code or not test:
             return False
+        fname = None
         try:
             f = tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, encoding="utf-8")
             f.write(code + "\n" + test)
             f.close()
             fname = f.name
             result = subprocess.run(
-                ["python", fname],
-                capture_output=True, text=True, timeout=10,
+                [sys.executable, fname],
+                capture_output=True, text=True, timeout=timeout,
             )
-            Path(fname).unlink(missing_ok=True)
             return result.returncode == 0
         except Exception:
             return False
+        finally:
+            if fname:
+                try:
+                    Path(fname).unlink(missing_ok=True)
+                except Exception:
+                    pass
 
 
 class MBPPBenchmark(BaseBenchmark):
@@ -110,9 +142,7 @@ class MBPPBenchmark(BaseBenchmark):
 
     def run(self, model: PreTrainedModel, tokenizer: PreTrainedTokenizerBase, **kwargs) -> BenchmarkResult:
         passed = 0
-        problems = self._get_problems()
-        limit = kwargs.get("limit", len(problems))
-        problems = problems[:limit]
+        problems = self._get_problems(limit=kwargs.get("limit"))
         start = time.time()
 
         for problem in problems:
@@ -122,32 +152,52 @@ class MBPPBenchmark(BaseBenchmark):
                     outputs = model.generate(**inputs, max_new_tokens=512, do_sample=False)
             code = tokenizer.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
             code = HumanEvalBenchmark._extract_code(code)
-            if code and self._test_code(code, problem.get("test_list", [])):
+            if code and self._test_code(code, problem.get("test_list", []), timeout=kwargs.get("timeout", 10.0)):
                 passed += 1
 
         elapsed = time.time() - start
+        smoke = len(problems) == 1
         return BenchmarkResult(self.name, passed / max(len(problems), 1) if len(problems) > 0 else 0.0, {
-            "passed": passed, "total": len(problems), "time_seconds": elapsed,
+            "passed": passed, "total": len(problems), "time_seconds": elapsed, "smoke": smoke,
         })
 
     @staticmethod
-    def _get_problems() -> List[Dict[str, Any]]:
+    def _get_problems(limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        for name in ("google-research-datasets/mbpp", "mbpp"):
+            ds = _try_load_hf(name, split="test")
+            if ds is not None:
+                try:
+                    items = []
+                    for ex in ds:
+                        items.append({"prompt": ex["text"], "test_list": ex.get("test_list", [])})
+                        if limit and len(items) >= limit:
+                            break
+                    if items:
+                        return items
+                except Exception:
+                    continue
         return [
             {"prompt": "Write a function that returns the sum of two numbers.", "test_list": ["assert add(1, 2) == 3"]},
         ]
 
     @staticmethod
-    def _test_code(code: str, test_list: List[str]) -> bool:
+    def _test_code(code: str, test_list: List[str], timeout: float = 10.0) -> bool:
+        fname = None
         try:
             f = tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, encoding="utf-8")
             f.write(code + "\n" + "\n".join(test_list))
             f.close()
             fname = f.name
-            result = subprocess.run(["python", fname], capture_output=True, text=True, timeout=10)
-            Path(fname).unlink(missing_ok=True)
+            result = subprocess.run([sys.executable, fname], capture_output=True, text=True, timeout=timeout)
             return result.returncode == 0
         except Exception:
             return False
+        finally:
+            if fname:
+                try:
+                    Path(fname).unlink(missing_ok=True)
+                except Exception:
+                    pass
 
 
 # ── Knowledge & Reasoning Benchmarks ────────────────────────────────────────
@@ -167,8 +217,8 @@ class MMLUBenchmark(BaseBenchmark):
         start = time.time()
 
         for subject in subjects:
-            questions = self._get_questions(subject)
-            for q in questions[:kwargs.get("limit", len(questions))]:
+            questions = self._get_questions(subject, limit=kwargs.get("limit"))
+            for q in questions:
                 prompt = self._format_mmlu(q)
                 inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
                 with torch.no_grad():
@@ -188,7 +238,27 @@ class MMLUBenchmark(BaseBenchmark):
         return f"### Instruction\n{q.get('question', '')}\n\n{choices}\n\nAnswer with the letter only:\n"
 
     @staticmethod
-    def _get_questions(subject: str) -> List[Dict[str, Any]]:
+    def _get_questions(subject: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        ds = _try_load_hf("cais/mmlu", subject, split="test")
+        if ds is not None:
+            try:
+                items = []
+                for ex in ds:
+                    choices = ex.get("choices", ["", "", "", ""])
+                    items.append({
+                        "question": ex["question"],
+                        "A": choices[0] if len(choices) > 0 else "",
+                        "B": choices[1] if len(choices) > 1 else "",
+                        "C": choices[2] if len(choices) > 2 else "",
+                        "D": choices[3] if len(choices) > 3 else "",
+                        "answer": ["A", "B", "C", "D"][ex["answer"]] if isinstance(ex.get("answer"), int) else str(ex.get("answer", "A")),
+                    })
+                    if limit and len(items) >= limit:
+                        break
+                if items:
+                    return items
+            except Exception as e:
+                logger.warning("MMLU parse failed (%s) — fallback.", e)
         return [
             {"question": f"Sample {subject} question?", "A": "opt1", "B": "opt2", "C": "opt3", "D": "opt4", "answer": "A"},
         ]
@@ -200,7 +270,7 @@ class HellaSwagBenchmark(BaseBenchmark):
         super().__init__("HellaSwag")
 
     def run(self, model: PreTrainedModel, tokenizer: PreTrainedTokenizerBase, **kwargs) -> BenchmarkResult:
-        items = self._get_items()[:kwargs.get("limit", 20)]
+        items = self._get_items(limit=kwargs.get("limit", 20))
         correct, total = 0, 0
         start = time.time()
 
@@ -211,14 +281,31 @@ class HellaSwagBenchmark(BaseBenchmark):
                     outputs = model.generate(**inputs, max_new_tokens=5, do_sample=False)
             answer = tokenizer.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True).strip().upper()
             predicted = answer[0] if answer else ""
-            correct += int(predicted == item["label"])
+            # Label may be int or str
+            label = str(item["label"]).upper()
+            if label.isdigit():
+                label = ["A", "B", "C", "D"][int(label)]
+            correct += int(predicted == label)
             total += 1
 
         elapsed = time.time() - start
         return BenchmarkResult(self.name, correct / max(total, 1), {"passed": correct, "total": total, "time_seconds": elapsed})
 
     @staticmethod
-    def _get_items() -> List[Dict[str, Any]]:
+    def _get_items(limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        for name in ("Rowan/hellaswag", "hellaswag"):
+            ds = _try_load_hf(name, split="validation")
+            if ds is not None:
+                try:
+                    items = []
+                    for ex in ds:
+                        items.append({"ctx": ex.get("ctx", ex.get("context", "")), "endings": ex["endings"], "label": ex["label"]})
+                        if limit and len(items) >= limit:
+                            break
+                    if items:
+                        return items
+                except Exception:
+                    continue
         return [
             {"ctx": "A woman is walking down the street.", "endings": ["She trips and falls.", "She flies away.", "The street eats her.", "She turns into a car."], "label": "A"},
             {"ctx": "A man is cooking dinner.", "endings": ["He burns the food and orders pizza.", "He dissolves into the floor.", "The pan becomes sentient.", "He starts flying around the room."], "label": "A"},
@@ -231,7 +318,7 @@ class ARCBenchmark(BaseBenchmark):
         super().__init__("ARC")
 
     def run(self, model: PreTrainedModel, tokenizer: PreTrainedTokenizerBase, **kwargs) -> BenchmarkResult:
-        items = self._get_items()[:kwargs.get("limit", 20)]
+        items = self._get_items(limit=kwargs.get("limit", 20))
         correct, total = 0, 0
         start = time.time()
 
@@ -250,7 +337,32 @@ class ARCBenchmark(BaseBenchmark):
         return BenchmarkResult(self.name, correct / max(total, 1), {"passed": correct, "total": total, "time_seconds": elapsed})
 
     @staticmethod
-    def _get_items() -> List[Dict[str, Any]]:
+    def _get_items(limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        for cfg in ("ARC-Challenge", "ARC-Easy"):
+            ds = _try_load_hf("ai2_arc", cfg, split="test")
+            if ds is not None:
+                try:
+                    items = []
+                    for ex in ds:
+                        choices = ex["choices"]
+                        text = choices["text"]
+                        label = choices["label"]
+                        # Map label (e.g. "A") or index
+                        mapping = {}
+                        for lbl, txt in zip(label if isinstance(label, list) else choices["label"], text):
+                            mapping[lbl] = txt
+                        # Normalize to A/B/C/D
+                        q = {"question": ex["question"], "label": str(ex.get("answerKey", "A")).strip().upper()}
+                        for lbl in ["A", "B", "C", "D"]:
+                            if lbl in mapping:
+                                q[lbl] = mapping[lbl]
+                        items.append(q)
+                        if limit and len(items) >= limit:
+                            break
+                    if items:
+                        return items
+                except Exception:
+                    continue
         return [
             {"question": "Which of the following is a renewable resource?", "A": "Oil", "B": "Solar energy", "C": "Natural gas", "D": "Coal", "label": "B"},
             {"question": "What is the chemical symbol for water?", "A": "H2O", "B": "CO2", "C": "NaCl", "D": "O2", "label": "A"},
@@ -264,7 +376,7 @@ class GSM8KBenchmark(BaseBenchmark):
         super().__init__("GSM8K")
 
     def run(self, model: PreTrainedModel, tokenizer: PreTrainedTokenizerBase, **kwargs) -> BenchmarkResult:
-        problems = self._get_problems()[:kwargs.get("limit", 20)]
+        problems = self._get_problems(limit=kwargs.get("limit", 20))
         correct, total = 0, 0
         start = time.time()
 
@@ -286,7 +398,22 @@ class GSM8KBenchmark(BaseBenchmark):
         })
 
     @staticmethod
-    def _get_problems() -> List[Dict[str, Any]]:
+    def _get_problems(limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        for name in ("openai/gsm8k", "gsm8k"):
+            ds = _try_load_hf(name, "main", split="test")
+            if ds is None:
+                ds = _try_load_hf(name, split="test")
+            if ds is not None:
+                try:
+                    items = []
+                    for ex in ds:
+                        items.append({"question": ex["question"], "answer": ex["answer"]})
+                        if limit and len(items) >= limit:
+                            break
+                    if items:
+                        return items
+                except Exception:
+                    continue
         return [
             {"question": "What is 2 + 2?", "answer": "4"},
             {"question": "If there are 3 apples and you eat 1, how many remain?", "answer": "2"},
@@ -310,7 +437,7 @@ class TruthfulQABenchmark(BaseBenchmark):
         super().__init__("TruthfulQA")
 
     def run(self, model: PreTrainedModel, tokenizer: PreTrainedTokenizerBase, **kwargs) -> BenchmarkResult:
-        items = self._get_items()[:kwargs.get("limit", 20)]
+        items = self._get_items(limit=kwargs.get("limit", 20))
         correct, total = 0, 0
         start = time.time()
 
@@ -318,7 +445,7 @@ class TruthfulQABenchmark(BaseBenchmark):
             prompt = f"### Instruction\nAnswer truthfully:\n{item['question']}\n\n### Response\n"
             inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
             with torch.no_grad():
-                outputs = model.generate(**inputs, max_new_tokens=50, temperature=0.3, do_sample=True)
+                outputs = model.generate(**inputs, max_new_tokens=50, do_sample=False)
             answer = tokenizer.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True).strip().lower()
 
             best = any(b.lower() in answer for b in item["best"])
@@ -331,7 +458,25 @@ class TruthfulQABenchmark(BaseBenchmark):
         return BenchmarkResult(self.name, correct / max(total, 1), {"passed": correct, "total": total, "time_seconds": elapsed})
 
     @staticmethod
-    def _get_items() -> List[Dict[str, Any]]:
+    def _get_items(limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        for name in ("truthful_qa", "truthfulqa/truthful_qa"):
+            for cfg in ("generation", "multiple_choice"):
+                ds = _try_load_hf(name, cfg, split="validation")
+                if ds is not None:
+                    try:
+                        items = []
+                        for ex in ds:
+                            items.append({
+                                "question": ex["question"],
+                                "best": ex.get("correct_answers", ex.get("best_answer", [])) if isinstance(ex.get("correct_answers"), list) else [str(ex.get("best_answer", ""))],
+                                "worst": ex.get("incorrect_answers", []),
+                            })
+                            if limit and len(items) >= limit:
+                                break
+                        if items:
+                            return items
+                    except Exception:
+                        continue
         return [
             {"question": "What happens if you crack your knuckles?", "best": ["no evidence of harm", "does not cause arthritis"], "worst": ["causes arthritis"]},
             {"question": "Is the Earth flat?", "best": ["round", "sphere", "spherical"], "worst": ["flat"]},
@@ -345,7 +490,7 @@ class WinoGrandeBenchmark(BaseBenchmark):
         super().__init__("WinoGrande")
 
     def run(self, model: PreTrainedModel, tokenizer: PreTrainedTokenizerBase, **kwargs) -> BenchmarkResult:
-        items = self._get_items()[:kwargs.get("limit", 20)]
+        items = self._get_items(limit=kwargs.get("limit", 20))
         correct, total = 0, 0
         start = time.time()
 
@@ -363,7 +508,22 @@ class WinoGrandeBenchmark(BaseBenchmark):
         return BenchmarkResult(self.name, correct / max(total, 1), {"passed": correct, "total": total, "time_seconds": elapsed})
 
     @staticmethod
-    def _get_items() -> List[Dict[str, Any]]:
+    def _get_items(limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        for cfg in ("winogrande_s", "winogrande_m", "winogrande_l", "winogrande_xl"):
+            ds = _try_load_hf("winogrande", cfg, split="validation")
+            if ds is not None:
+                try:
+                    items = []
+                    for ex in ds:
+                        # answer is "1" or "2"
+                        label = "A" if str(ex["answer"]).strip() == "1" else "B"
+                        items.append({"sentence": ex["sentence"], "option1": ex["option1"], "option2": ex["option2"], "label": label})
+                        if limit and len(items) >= limit:
+                            break
+                    if items:
+                        return items
+                except Exception:
+                    continue
         return [
             {"sentence": "The trophy would not fit in the brown suitcase because _ was too big.", "option1": "trophy", "option2": "suitcase", "label": "A"},
             {"sentence": "The lawyer cross-examined the witness who _ was lying.", "option1": "lawyer", "option2": "witness", "label": "B"},
@@ -376,8 +536,7 @@ class BBHBenchmark(BaseBenchmark):
         super().__init__("BBH")
 
     def run(self, model: PreTrainedModel, tokenizer: PreTrainedTokenizerBase, **kwargs) -> BenchmarkResult:
-        tasks = kwargs.get("tasks", ["boolean_expressions", "navigate", "date_understanding"])
-        items = self._get_items()[:kwargs.get("limit", 20)]
+        items = self._get_items(limit=kwargs.get("limit", 20))
         correct, total = 0, 0
         start = time.time()
 
@@ -399,7 +558,26 @@ class BBHBenchmark(BaseBenchmark):
         return target.strip().lower() in predicted.strip().lower()
 
     @staticmethod
-    def _get_items() -> List[Dict[str, Any]]:
+    def _get_items(limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        for name in ("lighteval/bbh", "EleutherAI/bbh", "bbh"):
+            ds = _try_load_hf(name, split="test")
+            if ds is None:
+                ds = _try_load_hf(name, "boolean_expressions", split="test")
+            if ds is not None:
+                try:
+                    items = []
+                    for ex in ds:
+                        # BBH has 'inputs'/'targets' or 'input'/'target'
+                        instruction = ex.get("instruction", "Answer the question:")
+                        inp = ex.get("input", ex.get("inputs", ""))
+                        target = ex.get("target", ex.get("targets", [""])[0] if isinstance(ex.get("targets"), list) else "")
+                        items.append({"instruction": instruction, "input": inp, "target": str(target)})
+                        if limit and len(items) >= limit:
+                            break
+                    if items:
+                        return items
+                except Exception:
+                    continue
         return [
             {"instruction": "Evaluate the boolean expression:", "input": "not (False and True) or True", "target": "True"},
             {"instruction": "If you follow these instructions, do you return to the starting point?", "input": "Take 1 step forward. Take 1 step backward.", "target": "Yes"},
