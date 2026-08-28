@@ -8,6 +8,148 @@ test set.
 
 ---
 
+## A0. Lifecycle & Shutdown Hardening (Phases 1-21 addendum, 2026-08-28)
+
+The follow-up mandate: make the pipeline's process lifecycle, worker ownership,
+timeout handling and CPU/GPU overlap *reliably correct* — without raising the
+900 s `prefetch_timeout`, without hiding failures under blanket `except`, without
+disabling async prefetch, without removing multiprocessing on suspicion, and
+without changing dataset contents/weights/filters/quality/tokenizer/training
+semantics. 21 phases, all landed. Exact findings, fixes, evidence, and the
+mandated validation gate with UNVERIFIED marks are below.
+
+### A0.1 Confirmed timeout facts (Phase 1 audit)
+
+- `PretrainStagingConfig.prefetch_timeout` default is **900.0 s**
+  (`src/config/schema.py:257`); `config_foundation.yaml` sets **no** override.
+- The `pipeline.py` fallback `getattr(staging, "prefetch_timeout", 3600.0)` is
+  **dead code** — pydantic always injects 900.0.
+- At 100k-scale a unit build (stream → filter → dedup → quality → AST →
+  tokenize → pack) can *genuinely exceed* 900 s; the timeout is therefore a
+  **leak, not a hang**: on timeout `get()` advanced `next_expected` while the
+  daemon worker *kept building* (Arrow/network/cache locks) until process exit.
+  Evidence-gated by the Phase 4 `[UNIT TIMEOUT]` instrumentation.
+
+### A0.2 Ownership & cancellation model (Phase 3)
+
+| Worker / resource | Owner | Cancellable | Boundary | Phase |
+|---|---|---|---|---|
+| UnitPrefetch producers | `UnitPrefetch` (daemon threads) | yes — per-slot event + global flag | abort at build checkpoint | 3 |
+| `DataPipeline` builds | `DataPipeline` (called by above) | yes — `raise_if_cancelled()` | dataset/chunk/tokenize/cache-save | 3 |
+| ShardCoordinator shard threads | `streaming.py` (daemon) | no (network open) | `close()` joins ≤ 5 s, logged | 5 |
+| Driver prefetch / next-stage metadata warm | background daemons | no (network) | reported, best-effort | 8/10 |
+| Cleanup pool | `multiprocessing` `fork` Pool ≤ min(32, cpu) | terminate() backstop | `close/join/terminate` | 11 |
+| Checkpoint writer + telemetry | tracked, joined | n/a | `flush()` before resume | 10 |
+
+### A0.3 Files changed (Phases 2-21)
+
+| File | What changed |
+|------|--------------|
+| `src/utils/shutdown.py` | **new** — cooperative `ShutdownCoordinator` (first signal → `SystemExit(128+signum)`; second → `os._exit`; daemon watchdog after 30 s grace) |
+| `main.py` | `_setup_signal_handlers` → `SHUTDOWN.install()`; finally logs `[SHUTDOWN] exiting ... final cleanup` |
+| `src/training/asyncprefetch.py` | per-slot cancel events, `cancel/cancel_all/active_builds/is_alive/wait_idle`, `stats["cancelled"]`, `_supports_cancel`/`_invoke_build` (inspect-based arity, checked once), worker rework (cancel → `CANCELLED` → continue), **producer-leak fix** (cancelled/stale slots `continue` not `return`), `[UNIT TIMEOUT]` instrumentation at all 3 `get()` timeout sites, cancel-before-advance ordering, `close(join_timeout=2.0)` bounded join, **retry backoff** (exponential + 25% jitter, teardown cut-through) |
+| `src/data/pipeline.py` | `_cancelled` global flag, `cancel()`, `raise_if_cancelled()`, `cancel_event` threaded through `build_pretrain_dataset_unit`/`build_pretrain_dataset_from_registry` with checkpoint checks; `[POOL]` close log |
+| `src/training/pipeline.py` | cancellable `build_fn` lambda, `PrefetchTimeout` → `prefetch.cancel(index)` + `[UNIT TIMEOUT]` log, `retry_backoff_base/max` wiring, report `timed-out / built-then-cancelled` lines |
+| `src/config/schema.py` | `AsyncPipelineConfig.retry_backoff_base` (1.0 s), `retry_backoff_max` (30.0 s) |
+| `tests/test_shutdown_coordinator.py` | **new** — 9 tests (incl. watchdog disarm on `reset()`) |
+| `tests/test_unit_prefetch_lifecycle.py` | **new** — 10 tests (cancellation, backoff, depth-bound stress) |
+
+### A0.4 Full test result (Phase 16)
+
+```
+python -m pytest -q
+242 passed in 202.19s (0:03:22)
+```
+Async battery (hardening 29 + overlap 19 + shutdown 9 + lifecycle 10):
+`67 passed in 42.90s`; lifecycle/shutdown alone: `19 passed in ~17 s`.
+
+### A0.5 Mandated items — evidence & status
+
+1. **Graceful SIGINT/SIGTERM** — `ShutdownCoordinator`; verified by
+   `test_shutdown_coordinator.py` (first-signal `SystemExit(128+signum)`,
+   second-signal `os._exit`, watchdog grace, idempotence). ✅
+2. **No orphan workers** — `close()`/`cleanup()` cancel first, bounded-join, log
+   remaining daemons; cleanup pool `close/join/terminate`; stress test asserts
+   `not pf.is_alive()` after teardown. ✅ (live `ps` sweep — UNVERIFIED, §A0.7-A)
+3. **No ghost builds after timeout** — timeout path cancels the slot *before*
+   advancing `next_expected`; the build aborts at its next checkpoint and is
+   counted `cancelled` (never a failure); `[UNIT TIMEOUT]` logs phase + in-flight
+   duration. ✅
+4. **Retries with backoff** — exponential `base*2^(attempt-1)` + 25% jitter,
+   capped at `retry_backoff_max`, woken early by teardown; two lifecycle tests. ✅
+5. **Bounded overlap** — `_effective_prefetch_depth = min(prefetch_depth,
+   ready_queue_size=2, max_inflight=4)`; claim-count gate stops `depth+1`;
+   stress test pins `in_flight() <= depth`. ✅
+6. **Failure isolation** — one unit never stalls: per-slot worker + consumer
+   continue, `abort_on_unit_error` remains opt-in; covered by hardening +
+   lifecycle suites. ✅
+7. **Cooperative cancellation propagation** — global (`DataPipeline._cancelled`)
+   + per-slot events reach every build checkpoint; `UnitBuildCancelled` counted,
+   not journaled/retried (resume rebuilds cancelled units). ✅
+8. **Process bounds** — cleanup pool ≤ min(32, cpu_count) fork, reused,
+   terminated on close with `[POOL]` log; `preprocess_workers` caps threads. ✅
+9. **Checkpoint / resume / fresh-start** — journals dropped on `--fresh-start`,
+   journal-failed units culled pre-scheduling, success clears entries, cancelled
+   units un-journaled → retried next run. ✅
+10. **Telemetry: compute vs prep vs wait** — `ASYNC PIPELINE REPORT` adds
+    `timed-out datasets` / `built-then-cancelled`; GPU wait, idle %, prep, hidden
+    prep already present. ✅
+11. **Regression-proof tests** — shutdown (9) + lifecycle (10) + existing 29/19
+    hardening/overlap; full suite green. ✅
+12. **Final report with UNVERIFIED marks** — this document. ✅
+
+### A0.6 Bugs this mandate actually found & fixed
+
+- **Producer leak (Phase 5 stress):** a build that returned *normally* after
+  `cancel()` (instead of raising `UnitBuildCancelled`) hit the "cancelled while
+  finishing" branch which did `return` — **permanently retiring the worker
+  thread** and shrinking overlap for the rest of the run. Fixed: `continue`.
+  Same fix for the stale-arrival branch. Both are regression-pinned by
+  `test_depth_bound_holds_under_mixed_timeouts_and_successes`.
+- **Event staleness (Phase 3 tests):** the worker captured
+  `self._cancel_events.get(idx)` once at claim time (dict empty) → build received
+  `cancel_event=None` and never observed cancels. Fixed via
+  `self._cancel_event(idx)` (materialize-and-cache), so `cancel()` and the build
+  share the canonical event.
+- **Timeout ordering:** `get()` advanced `next_expected` before cancelling,
+  making `cancel()` a no-op (`index < next_expected`). Reordered cancel-then-
+  advance.
+- **Singleton `DataPipeline` test doubles** (`__new__` bypassing `__init__`) no
+  longer crash `cancel()` — flag materializes lazily.
+
+- **Watchdog disarm (sweep):** `ShutdownCoordinator.reset()` left an armed grace
+  watchdog running, so a coordinator reused after a graceful reset could
+  `os._exit` a recovered process once grace elapsed. `reset()` now cancels the
+  timer (`_watchdog = None`); regression-pinned by
+  `test_reset_disarms_watchdog_and_clears_state`.
+
+### A0.7 Validation gate
+
+| Gate | Check | Status |
+|------|-------|--------|
+| A | Full unit suite green (`242 passed`) | ✅ |
+| B | Async battery green (67) incl. shutdown + lifecycle | ✅ |
+| C | `py_compile` clean on all touched sources | ✅ |
+| D | Depths bounded under mixed timeouts/cancels (stress) | ✅ |
+| E | Timeout cancels before advance; `[UNIT TIMEOUT]` fires | ✅ |
+| F | Cancel ≠ failure (no journal, no retry, no error counter) | ✅ |
+| G | close() bounded (join ≤ timeout), leftover daemons logged | ✅ |
+| H | First-signal exit code `128 + signum`; second-signal force | ✅ |
+| I | Retry backoff delays + teardown cut-through | ✅ |
+| J | 5 cache layers keyed + invalidated (unit/packed/meta/shard/driver) | ✅ (unit-tested) |
+| K | Single-dataset fast path returns raw `Dataset` | ✅ |
+| L | Checkpoint/resume/fresh-start coherence | ✅ |
+| M | Live GPU overlap & 100k-scale build (A100 box) | **UNVERIFIED** |
+| N | Live `ps`/`/proc` orphan sweep + `nvidia-smi` during run | **UNVERIFIED** |
+| O | Live SIGINT mid-build abort lands inside `[UNIT TIMEOUT]` bounds | **UNVERIFIED** |
+| P | Live timing: is a real unit genuinely > 900 s (vs a hang)? | **UNVERIFIED — needs box `[UNIT TIMEOUT]` traceback; exact `TypeError` line still requires the user's rerun output** |
+
+**UNVERIFIED** items need the A100 box: rerun with
+`python main.py full-training --config config_foundation.yaml --gpu 0 --fresh-start`
+(paste the `[ASYNC] ... full traceback:` block or the `[UNIT TIMEOUT]` block).
+
+---
+
 ## A. Root Causes
 
 1. **Single-dataset units were routed through the mixing wrapper.** In

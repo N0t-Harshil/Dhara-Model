@@ -45,6 +45,7 @@ from src.data.streaming import (
 )
 from src.data.registry import DatasetRegistry, DatasetInfo, build_registry, extract_text
 from src.data.shards import ShardProgressStore, build_shard_plan
+from src.training.asyncprefetch import UnitBuildCancelled
 from src.data.ast_filter import (
     _pool_filter_code,
     extract_functions,
@@ -532,6 +533,29 @@ class DataPipeline:
         )
         self._driver_cache: Dict[str, tuple] = {}
         self._driver_lock = threading.Lock()
+        # Global cancellation: set on close()/shutdown so in-flight unit builds
+        # stop at their next checkpoint instead of running to completion on
+        # daemon threads while the process tears down.
+        self._cancelled = threading.Event()
+
+    def cancel(self) -> None:
+        """Request cancellation of all in-flight builds. Cooperative: builds
+        observe the flag at chunk/loop boundaries and raise
+        ``UnitBuildCancelled``. Idempotent."""
+        if getattr(self, "_cancelled", None) is None:
+            # __new__-constructed test doubles skip __init__; materialize the
+            # flag lazily so cancellation still works.
+            self._cancelled = threading.Event()
+        self._cancelled.set()
+
+    def raise_if_cancelled(self, cancel_event=None) -> None:
+        """Raise ``UnitBuildCancelled`` when the pipeline is shutting down or
+        the slot's owner cancelled it. Checked at cheap, bounded cadence so a
+        build never runs away past a cancellation request."""
+        cancelled = getattr(self, "_cancelled", None)
+        if ((cancelled is not None and cancelled.is_set())
+                or (cancel_event is not None and cancel_event.is_set())):
+            raise UnitBuildCancelled()
 
     def processing_signature(self) -> str:
         """Signature of all preprocessing/quality settings that affect what a
@@ -1001,14 +1025,23 @@ class DataPipeline:
                            info.path, info.name or "default", e)
             return False
 
-    def build_pretrain_dataset_unit(self, info, stage_index: int, unit_index: int, unit_total: int):
+    def build_pretrain_dataset_unit(self, info, stage_index: int, unit_index: int,
+                                 unit_total: int,
+                                 cancel_event=None):
         """Build the packed dataset for ONE registry dataset ("training unit")
         with its own disk cache at <stage_cache_dir>/stage<N>/u<M>/.
 
         The unit cache key covers the dataset identity + sample cap + full
         preprocessing/tokenizer signature, so a warm cache skips streaming,
         tokenization and HF resolution entirely. Returns (WeightedMixedDataset,
-        meta_dict)."""
+        meta_dict).
+
+        ``cancel_event`` (threading.Event) enables cooperative cancellation:
+        when set, the build aborts at its next checkpoint by raising
+        ``UnitBuildCancelled`` (the prefetch worker treats that as a quiet
+        out-of-band stop, never as a failure).
+        """
+        self.raise_if_cancelled(cancel_event)
         staging = self.cfg.training.pretrain.staging
         unit_dir = Path(staging.stage_cache_dir) / f"stage{stage_index}" / f"u{unit_index:03d}"
         ds_limit = (info.max_samples
@@ -1042,6 +1075,7 @@ class DataPipeline:
             dataset = self.build_pretrain_dataset_from_registry(
                 include=[(info.path, info.name)],
                 max_samples_per_dataset=info.max_samples or self.cfg.data.max_samples_per_dataset,
+                cancel_event=cancel_event,
             )
         except Exception as e:  # noqa: BLE001 — phase-tagged for the prefetch worker
             from src.training.asyncprefetch import _tag_phase
@@ -1060,6 +1094,7 @@ class DataPipeline:
                 "weight": weight0, "avg_qs": avg_qs0, "packed_count": len(ds0)}
         if self.cfg.data.use_packed_cache:
             try:
+                self.raise_if_cancelled(cancel_event)
                 unit_dir.mkdir(parents=True, exist_ok=True)
                 torch.save({
                     "packed": ds0.to_list(),
@@ -1333,12 +1368,19 @@ class DataPipeline:
         return self._cleanup_pool
 
     def close(self) -> None:
-        """Terminate the persistent cleanup pool. Idempotent, safe to call at
-        any point; used on pipeline shutdown so spawned workers never leak
-        child processes."""
+        """Terminate the persistent cleanup pool and cancel any in-flight
+        unit builds. Idempotent, safe to call at any point; used on pipeline
+        shutdown so spawned workers never leak child processes and lone
+        builds stop at their next checkpoint."""
+        self.cancel()
         pool = self._cleanup_pool
         self._cleanup_pool = None
         if pool is not None:
+            try:
+                n_pool = getattr(pool, "_processes", "?")
+            except Exception:  # noqa: BLE001
+                n_pool = "?"
+            logger.info("[POOL] closing shared cleanup pool (%s workers)", n_pool)
             try:
                 pool.close()
                 pool.join()  # drain: idle workers exit promptly on close()
@@ -1792,6 +1834,7 @@ class DataPipeline:
         max_samples_per_dataset: Optional[int] = None,
         dataset_filter: Optional[List[str]] = None,
         include: Optional[List[Tuple[str, Optional[str]]]] = None,
+        cancel_event=None,
     ) -> Dataset:
         registry = build_registry()
         all_infos = registry.all_entries()
@@ -1833,6 +1876,7 @@ class DataPipeline:
         pool = self._get_cleanup_pool()
 
         for idx, info in enumerate(all_infos, 1):
+            self.raise_if_cancelled(cancel_event)
             ds_key = f"{info.path}/{info.name or 'default'}"
             cat = info.category
             logger.info("")
@@ -1925,6 +1969,7 @@ class DataPipeline:
                 streamer = self._stream_sharded(info, registry, ds_limit, policy)
                 try:
                     while True:
+                        self.raise_if_cancelled(cancel_event)
                         chunk = list(itertools.islice(streamer, chunk_size))
                         if not chunk:
                             break
@@ -2146,6 +2191,7 @@ class DataPipeline:
             ds_lang_dist: Dict[str, int] = defaultdict(int)
             ds_domain_dist: Dict[str, int] = defaultdict(int)
             for text_idx, text in enumerate(cleaned_texts):
+                self.raise_if_cancelled(cancel_event)
                 tok = self.tokenizer(text, truncation=False, add_special_tokens=False)["input_ids"]
                 tok = random_window_sample(tok, max_len)
                 doc_qs = quality_scores[text_idx] if text_idx < len(quality_scores) else 0.5

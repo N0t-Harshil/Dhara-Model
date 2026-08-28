@@ -430,6 +430,7 @@ class CurriculumStageConfig(BaseModel):
     max_steps: int = Field(default=10000, ge=0)
     dataset_filter: Optional[List[str]] = None
     description: Optional[str] = None
+    weight: Optional[float] = Field(default=None, description="Curriculum stage weight (informational; used by legacy configs)")
 
 
 class CurriculumConfig(BaseModel):
@@ -616,6 +617,8 @@ class AsyncPipelineConfig(BaseModel):
     metadata_workers: int = Field(default=2, ge=1)
     max_inflight: int = Field(default=4, ge=1)
     retry_count: int = Field(default=3, ge=0)
+    retry_backoff_base: float = Field(default=1.0, ge=0.0)
+    retry_backoff_max: float = Field(default=30.0, ge=0.0)
 
 
 class TokenizerConfig(BaseModel):
@@ -623,6 +626,7 @@ class TokenizerConfig(BaseModel):
     huggingface_model: str = "Xenova/claude-tokenizer"
     vocab_size: int = 128000
     max_samples: int = 100000
+    theme: str = "all"
     type: Literal["bpe", "unigram", "wordpiece"] = "bpe"
     force: bool = False
     add_prefix_space: bool = False

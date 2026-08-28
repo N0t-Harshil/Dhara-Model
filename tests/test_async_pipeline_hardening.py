@@ -40,6 +40,7 @@ def _fast_pf(build_fn, total, depth=2, timeout=5.0, retries=0, cache_status=None
         build_fn=build_fn, total=total, depth=depth, timeout=timeout,
         name="test-harden", retries=retries,
         max_workers=max_workers, cache_status=cache_status,
+        retry_backoff_base=0.05, retry_backoff_max=0.2,
     )
 
 

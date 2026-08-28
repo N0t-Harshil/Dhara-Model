@@ -36,7 +36,7 @@ from src.infrastructure.distributed import DistributedSetup
 from src.infrastructure.telemetry import PipelineTelemetry
 from src.infrastructure.tracking import ExperimentTracker
 from src.models.factory import ARCH_FSDP_LAYER_MAP, ModelFactory
-from src.training.asyncprefetch import UnitPrefetch
+from src.training.asyncprefetch import PrefetchTimeout, UnitPrefetch
 from src.training.checkpoint import AsyncCheckpointWriter, verify_checkpoint
 from src.utils.reproducibility import set_seed
 from src.utils.training import dataloader_num_workers, trainer_tokenizer_kwarg
@@ -892,13 +892,18 @@ class TrainingPipeline:
                     # also fed through the queue (its first get() waits for the
                     # build — nothing can overlap before the Trainer exists).
                     prefetch = UnitPrefetch(
-                        build_fn=lambda item, idx: self.data_pipeline.build_pretrain_dataset_unit(
-                            item["u"], i, item["j"], len(units)),
+                        build_fn=lambda item, idx, cancel_event=None: self.data_pipeline.build_pretrain_dataset_unit(
+                            item["u"], i, item["j"], len(units),
+                            cancel_event=cancel_event),
                         total=n_train,
                         depth=self._effective_prefetch_depth(staging, async_cfg),
                         timeout=float(getattr(staging, "prefetch_timeout", 3600.0) or 3600.0),
                         name=f"stage{i}",
                         retries=int(getattr(async_cfg, "retry_count", 0) or 0),
+                        retry_backoff_base=float(
+                            getattr(async_cfg, "retry_backoff_base", 1.0) or 1.0),
+                        retry_backoff_max=float(
+                            getattr(async_cfg, "retry_backoff_max", 30.0) or 30.0),
                         max_workers=getattr(async_cfg, "preprocess_workers", None),
                         cache_status=lambda item, idx: self.data_pipeline.unit_cache_hit(
                             item["u"], i, item["j"]),
@@ -960,9 +965,18 @@ class TrainingPipeline:
                             self.telemetry.record("unit_failures")
                             journal.mark(unit_key,
                                          f"{type(build_exc).__name__}: {build_exc}")
-                            logger.error("[UNIT] %d/%d %s build failed: %s — "
-                                         "marked failed, continuing",
-                                         j, len(units), u_name, build_exc)
+                            if isinstance(build_exc, PrefetchTimeout):
+                                if prefetch is not None:
+                                    prefetch.cancel(iter_k)
+                                logger.error(
+                                    "[UNIT TIMEOUT] %d/%d %s did not finish "
+                                    "within %.0fs — build cancelled, marked "
+                                    "failed, continuing", j, len(units), u_name,
+                                    build_exc.waited)
+                            else:
+                                logger.error("[UNIT] %d/%d %s build failed: %s — "
+                                             "marked failed, continuing",
+                                             j, len(units), u_name, build_exc)
                             if staging.abort_on_unit_error:
                                 logger.error("abort_on_unit_error — aborting staged pretraining")
                                 return results
@@ -1255,6 +1269,10 @@ class TrainingPipeline:
         logger.info("datasets trained: %d", units)
         logger.info("datasets skipped from processed cache: %d", hits)
         logger.info("failed datasets: %d | retried datasets: %d", fails, retries_total)
+        timeouts_total = sum(s.get("timeouts", 0) for s in prefetch_stats)
+        cancelled_total = sum(s.get("cancelled", 0) for s in prefetch_stats)
+        logger.info("timed-out datasets: %d | built-then-cancelled (timeout/shutdown): %d",
+                    timeouts_total, cancelled_total)
         logger.info("cache hits: %d | cache misses: %d", hits, max(0, attempts - hits))
         logger.info("metadata cache hits: %d | misses: %d",
                     tm_snap.get("metadata_hits", 0), tm_snap.get("metadata_attempts", 0) - tm_snap.get("metadata_hits", 0))

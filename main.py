@@ -10,6 +10,10 @@ import time
 from pathlib import Path
 from typing import Optional
 
+from src.utils.shutdown import ShutdownCoordinator
+
+SHUTDOWN = ShutdownCoordinator()
+
 def _resolve_checkpoint(cfg) -> str:
     model_dir = Path(cfg.output.model_dir)
     if (model_dir / "config.json").exists() or (model_dir / "pytorch_model.bin").exists() or (model_dir / "model.safetensors").exists():
@@ -92,11 +96,17 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("datasets").setLevel(logging.WARNING)
 logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(name)s - %(message)s",
-    datefmt="%H:%M:%S",
-)
+try:
+    from src.utils.logging import setup_logging  # idempotent, respects OutputConfig.log_dir
+    # Defer full setup until config is loaded (log_dir comes from OutputConfig);
+    # this early call just ensures console formatting.
+    setup_logging(level=logging.INFO)
+except Exception:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s  %(levelname)-8s  %(name)s - %(message)s",
+        datefmt="%H:%M:%S",
+    )
 logger = logging.getLogger("main")
 
 
@@ -122,6 +132,8 @@ def cmd_full_training(args: argparse.Namespace) -> None:
     config_path = os.path.join(_PROJECT_DIR, args.config)
     cfg = load_config(config_path)
     _apply_hf_token_env(cfg)
+    from src.utils.hf_auth import report_hf_auth
+    report_hf_auth(cfg)
     dist = DistributedSetup(cfg)
 
     if dist.is_main_process():
@@ -136,6 +148,8 @@ def cmd_full_training(args: argparse.Namespace) -> None:
         results = pipeline.full_training_sequence()
         pipeline.save_model()
     finally:
+        if SHUTDOWN.requested():
+            logger.info("[SHUTDOWN] exiting after signal %s — final cleanup", SHUTDOWN.reason())
         pipeline.cleanup()
     logger.info("Training complete!")
 
@@ -378,11 +392,11 @@ def cmd_reserved_training(args: argparse.Namespace) -> None:
 def build_parser() -> argparse.ArgumentParser:
     main_parent_parser = argparse.ArgumentParser(add_help=False)
     main_parent_parser.add_argument("--config", default="config.yaml", help="Path to config file (default: config.yaml)")
-    main_parent_parser.add_argument("--gpu", type=str, default=argparse.SUPPRESS, help="GPU index to use (e.g. '0', '3'). Overrides auto-detection.")
+    main_parent_parser.add_argument("--gpu", type=str, default=None, help="GPU index to use (e.g. '0', '3'). Overrides auto-detection.")
 
     sub_parent_parser = argparse.ArgumentParser(add_help=False)
     sub_parent_parser.add_argument("--config", default=argparse.SUPPRESS, help="Path to config file")
-    sub_parent_parser.add_argument("--gpu", type=str, default=argparse.SUPPRESS, help="GPU index to use (e.g. '0', '3'). Overrides auto-detection.")
+    sub_parent_parser.add_argument("--gpu", type=str, default=None, help="GPU index to use (e.g. '0', '3'). Overrides auto-detection.")
 
     parser = argparse.ArgumentParser(prog="main.py", description="Methos Class Model - Neural-State Liquid Transformer", parents=[main_parent_parser])
 
@@ -427,12 +441,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _setup_signal_handlers() -> None:
-    import signal
-    def _handler(signum, frame):
-        print(f"\n[*] Received signal {signum}, shutting down...")
-        sys.exit(128 + signum)
-    signal.signal(signal.SIGINT, _handler)
-    signal.signal(signal.SIGTERM, _handler)
+    """Install cooperative SIGINT/SIGTERM shutdown.
+
+    First signal requests a graceful shutdown (flag + SystemExit so normal
+    finally-cleanup still drains pools/checkpoints); a second signal or the
+    grace watchdog forces an immediate exit so a hung teardown can never
+    block an operator kill. Only main() installs handlers — worker modules
+    poll SHUTDOWN.requested().
+    """
+    SHUTDOWN.install()
 
 
 def main() -> None:

@@ -580,7 +580,8 @@ def test_unit_prefetch_retries_failed_build():
             raise TimeoutError("transient network failure")
         return f"dataset_{idx}"
 
-    pf = UnitPrefetch(build_fn=flaky, total=1, depth=1, timeout=5.0, retries=3)
+    pf = UnitPrefetch(build_fn=flaky, total=1, depth=1, timeout=5.0, retries=3,
+                      retry_backoff_base=0.05, retry_backoff_max=0.2)
     pf.start([0])
     res = pf.get(0)
     pf.close()
@@ -596,7 +597,8 @@ def test_unit_prefetch_retries_failed_build():
         calls2["n"] += 1
         raise ValueError("permanent failure")
 
-    pf2 = UnitPrefetch(build_fn=always_fail, total=1, depth=1, timeout=5.0, retries=2)
+    pf2 = UnitPrefetch(build_fn=always_fail, total=1, depth=1, timeout=5.0, retries=2,
+                       retry_backoff_base=0.05, retry_backoff_max=0.2)
     pf2.start([0])
     try:
         pf2.get(0)

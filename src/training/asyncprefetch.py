@@ -30,10 +30,12 @@ Key properties (each is covered by tests in test_pipeline_async.py)
                          attempts are counted in ``stats["retries"]``.
 """
 
+import inspect
 import logging
+import random
 import threading
 import time
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +148,17 @@ class PrefetchTimeout(TimeoutError):
 _FAILED = object()
 
 
+class UnitBuildCancelled(Exception):
+    """Raised by a cooperatively-cancellable build when its slot's cancel
+    event (or the pipeline's global cancellation) fired mid-build.
+
+    This is NOT a failure: the consumer already stopped waiting for the slot
+    (timeout, shutdown, duplicate discard). The worker treats it as a quiet
+    out-of-band stop — no failure journaling, no error counter, no retry —
+    and moves on to the next unit.
+    """
+
+
 class UnitPrefetch:
     def __init__(
         self,
@@ -157,6 +170,8 @@ class UnitPrefetch:
         retries: int = 0,
         max_workers: Optional[int] = None,
         cache_status: Optional[Callable[[Any, int], bool]] = None,
+        retry_backoff_base: float = 1.0,
+        retry_backoff_max: float = 30.0,
     ) -> None:
         self._build = build_fn
         self._total = int(total)
@@ -164,8 +179,18 @@ class UnitPrefetch:
         self._timeout = float(timeout)
         self._name = name
         self._retries = max(0, int(retries))
+        self._retry_backoff_base = max(0.0, float(retry_backoff_base))
+        self._retry_backoff_max = max(self._retry_backoff_base,
+                                      float(retry_backoff_max))
         self._max_workers = max(1, int(max_workers)) if max_workers else None
         self._cache_status = cache_status
+        # Cooperative cancellation: a per-index Event lets the consumer cancel
+        # a slot whose build is no longer awaited (timeout / shutdown). The
+        # build only observes it if it accepts ``cancel_event`` (see
+        # ``_invoke_build``); DataPipeline builds do.
+        self._build_accepts_cancel = self._supports_cancel(build_fn)
+        self._cancel_events: Dict[int, threading.Event] = {}
+        self._active_builds: Dict[int, float] = {}
         self._cv = threading.Condition()
         self._stop = threading.Event()
         self._next_produce = 0
@@ -181,6 +206,7 @@ class UnitPrefetch:
             "duplicates_prevented": 0,
             "retries": 0,
             "nonretryable": 0,
+            "cancelled": 0,
             "prefetch_hits": 0,
             "prefetch_misses": 0,
             "total_prep_sec": 0.0,
@@ -301,10 +327,16 @@ class UnitPrefetch:
             self._threads.append(t)
             t.start()
 
-    def close(self) -> None:
-        """Signal all producers, drop buffered results without awaiting the
-        workers (they are daemons and may be blocked in an unbounded build)."""
+    def close(self, join_timeout: float = 2.0) -> None:
+        """Signal all producers, drop buffered results, cancel in-flight
+        cancellable builds, and join the workers for a bounded window.
+
+        A build still inside a non-abortable section (e.g. blocked in a
+        network open) is logged as a leftover daemon instead of being awaited
+        forever — close() never blocks the caller beyond ``join_timeout``.
+        """
         self._stop.set()
+        self.cancel_all()
         with self._cv:
             self._results.clear()
             self._timing.clear()
@@ -312,6 +344,7 @@ class UnitPrefetch:
             self._duplicates.clear()
             self._dup_remaining.clear()
             self._cv.notify_all()
+        self.wait_idle(timeout=join_timeout)
 
     def discard(self, index: int) -> None:
         """Drop a result that will never be consumed (skipped unit) so the
@@ -348,6 +381,78 @@ class UnitPrefetch:
         with self._cv:
             return len(self._results)
 
+    # -- ownership / cancellation -----------------------------------
+
+    @staticmethod
+    def _supports_cancel(build_fn: Callable) -> bool:
+        """Whether the build callable accepts a ``cancel_event`` third kwarg
+        (DataPipeline builds do). Signature inspection is done once so a
+        runtime TypeError inside a build can never be confused with an arity
+        mismatch."""
+        try:
+            sig = inspect.signature(build_fn)
+        except (TypeError, ValueError):
+            return False
+        params = list(sig.parameters.values())
+        if any(p.name == "cancel_event" for p in params):
+            return True
+        if any(p.kind in (inspect.Parameter.VAR_POSITIONAL,
+                          inspect.Parameter.VAR_KEYWORD) for p in params):
+            return True
+        req = [p for p in params if p.default is inspect.Parameter.empty
+               and p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                              inspect.Parameter.POSITIONAL_ONLY)]
+        return len(req) >= 3
+
+    def _cancel_event(self, index: int) -> threading.Event:
+        with self._cv:
+            ev = self._cancel_events.get(index)
+            if ev is None:
+                ev = threading.Event()
+                self._cancel_events[index] = ev
+            return ev
+
+    def cancel(self, index: int) -> None:
+        """Cancel the in-flight build for one slot. The consumer already
+        advanced past the slot (timeout / failure); the build observes the
+        event at its next checkpoint and exits without producing. No-op for
+        slots that already delivered or never started."""
+        with self._cv:
+            if index < self._next_expected or index in self._results:
+                return
+        self._cancel_event(index).set()
+
+    def cancel_all(self) -> None:
+        for idx, ev in list(self._cancel_events.items()):
+            ev.set()  # noqa: B909 — iterating a snapshot is fine
+
+    def active_builds(self) -> Dict[int, float]:
+        """index -> monotonic seconds since the build started, for every slot
+        a worker is currently inside (the 'ghost work' window)."""
+        with self._cv:
+            return dict(self._active_builds)
+
+    def is_alive(self) -> bool:
+        return any(t.is_alive() for t in self._threads)
+
+    def wait_idle(self, timeout: float = 2.0) -> bool:
+        """Join every producer thread (bounded). Returns True when all exited,
+        False if some are still inside a build (logged as leftover daemons)."""
+        deadline = time.monotonic() + max(0.0, timeout)
+        threads = list(self._threads)
+        for t in threads:
+            remain = deadline - time.monotonic()
+            if remain <= 0:
+                break
+            t.join(timeout=remain)
+        alive = [t.name for t in threads if t.is_alive()]
+        if alive:
+            logger.warning(
+                "[ASYNC] prefetch '%s' left %d daemon worker(s) still building: %s — "
+                "builds are not abortable at this point; they end when the "
+                "process exits", self._name, len(alive), ", ".join(alive))
+        return not alive
+
     # -- producers -------------------------------------------------
 
     def _worker(self, units) -> None:
@@ -374,66 +479,104 @@ class UnitPrefetch:
             self._set_state(idx, "BUILDING")
             t_start = time.monotonic()
             logger.info("[ASYNC] dataset %d prefetch start", idx + 1)
+            cancel_ev = self._cancel_event(idx)
+            if cancel_ev.is_set():
+                logger.info("[ASYNC] dataset %d already cancelled before build", idx + 1)
+                self.stats["cancelled"] += 1
+                self._set_state(idx, "CANCELLED")
+                continue
             payload, exc = None, None
+            cancelled = False
             attempt = 0
-            while True:
-                attempt += 1
-                try:
-                    payload = self._build(units[idx], idx)
-                    exc = None
-                    break
-                except Exception as e:  # noqa: BLE001 — retried, then delivered
-                    cstat = None
-                    if self._cache_status is not None:
-                        try:
-                            cstat = bool(self._cache_status(units[idx], idx))
-                        except Exception:  # noqa: BLE001
-                            cstat = None
-                    phase, pctx = _phase_of(e)
-                    retryable = _retryable(e)
-                    if not retryable:
-                        from src.utils.hf_auth import format_sanitized_traceback
-                        logger.error(
-                            "[ASYNC] dataset %d build failed (non-retryable, "
-                            "phase=%s, cache=%s) — full traceback:\n%s",
-                            idx + 1, phase, cstat,
-                            format_sanitized_traceback(e))
-                        self.stats["nonretryable"] += 1
-                        self._record_failure(
-                            idx, e, phase, pctx, attempt,
-                            cache_status=cstat, retryable=False,
-                            identity=units[idx])
-                        self._set_state(idx, "FAILED_PERMANENT")
-                        payload = None
-                        exc = e
+            with self._cv:
+                self._active_builds[idx] = time.monotonic()
+            try:
+                while True:
+                    attempt += 1
+                    try:
+                        payload = self._invoke_build(units[idx], idx,
+                                                     cancel_ev=cancel_ev)
+                        exc = None
                         break
-                    if attempt <= self._retries:
-                        self.stats["retries"] += 1
+                    except UnitBuildCancelled:
+                        # Slot no longer awaited (timeout / shutdown): this is
+                        # not a build failure — exit quietly and keep covering
+                        # the remaining units.
+                        cancelled = True
+                        break
+                    except Exception as e:  # noqa: BLE001 — retried, then delivered
+                        cstat = None
+                        if self._cache_status is not None:
+                            try:
+                                cstat = bool(self._cache_status(units[idx], idx))
+                            except Exception:  # noqa: BLE001
+                                cstat = None
+                        phase, pctx = _phase_of(e)
+                        retryable = _retryable(e)
+                        if not retryable:
+                            from src.utils.hf_auth import format_sanitized_traceback
+                            logger.error(
+                                "[ASYNC] dataset %d build failed (non-retryable, "
+                                "phase=%s, cache=%s) — full traceback:\n%s",
+                                idx + 1, phase, cstat,
+                                format_sanitized_traceback(e))
+                            self.stats["nonretryable"] += 1
+                            self._record_failure(
+                                idx, e, phase, pctx, attempt,
+                                cache_status=cstat, retryable=False,
+                                identity=units[idx])
+                            self._set_state(idx, "FAILED_PERMANENT")
+                            payload = None
+                            exc = e
+                            break
+                        if attempt <= self._retries:
+                            self.stats["retries"] += 1
+                            self._record_failure(
+                                idx, e, phase, pctx, attempt,
+                                cache_status=cstat, retryable=True,
+                                identity=units[idx])
+                            if attempt == 1:
+                                from src.utils.hf_auth import format_sanitized_traceback
+                                logger.warning(
+                                    "[ASYNC] dataset %d build failed (attempt 1/%d, "
+                                    "phase=%s, cache=%s) — full traceback:\n%s",
+                                    idx + 1, self._retries + 1, phase, cstat,
+                                    format_sanitized_traceback(e))
+                            else:
+                                logger.warning("[ASYNC] dataset %d build failed "
+                                               "(attempt %d/%d, phase=%s) — retrying: "
+                                               "%s: %s",
+                                               idx + 1, attempt, self._retries + 1,
+                                               phase, type(e).__name__, e)
+                            delay = min(
+                                self._retry_backoff_max,
+                                self._retry_backoff_base * (2 ** (attempt - 1)))
+                            wake = delay + random.uniform(0.0, delay * 0.25)
+                            logger.info(
+                                "[ASYNC] dataset %d retry backoff — next attempt "
+                                "in %.1fs (attempt %d/%d)",
+                                idx + 1, wake, attempt + 1, self._retries + 1)
+                            with self._cv:
+                                # Wait is woken early by close()/stop (notify_all)
+                                # so a teardown never waits out the full backoff.
+                                self._cv.wait(timeout=wake)
+                            continue
                         self._record_failure(
                             idx, e, phase, pctx, attempt,
                             cache_status=cstat, retryable=True,
                             identity=units[idx])
-                        if attempt == 1:
-                            from src.utils.hf_auth import format_sanitized_traceback
-                            logger.warning(
-                                "[ASYNC] dataset %d build failed (attempt 1/%d, "
-                                "phase=%s, cache=%s) — full traceback:\n%s",
-                                idx + 1, self._retries + 1, phase, cstat,
-                                format_sanitized_traceback(e))
-                        else:
-                            logger.warning("[ASYNC] dataset %d build failed "
-                                           "(attempt %d/%d, phase=%s) — retrying: "
-                                           "%s: %s",
-                                           idx + 1, attempt, self._retries + 1,
-                                           phase, type(e).__name__, e)
-                        continue
-                    self._record_failure(
-                        idx, e, phase, pctx, attempt,
-                        cache_status=cstat, retryable=True,
-                        identity=units[idx])
-                    payload = None
-                    exc = e
-                    break
+                        payload = None
+                        exc = e
+                        break
+            finally:
+                with self._cv:
+                    self._active_builds.pop(idx, None)
+            if cancelled:
+                self.stats["cancelled"] += 1
+                self._set_state(idx, "CANCELLED")
+                logger.info("[ASYNC] dataset %d build cancelled (slot no longer "
+                            "awaited — timed out or shutdown)", idx + 1)
+                continue
             if self._stop.is_set():
                 return
             t_end = time.monotonic()
@@ -452,20 +595,27 @@ class UnitPrefetch:
             with self._cv:
                 if self._stop.is_set():
                     return
+                if cancel_ev is not None and cancel_ev.is_set():
+                    # Cancelled while finishing the build — drop the payload
+                    # and keep covering the remaining units (a lone cancelled
+                    # slot must never retire a producer permanently).
+                    self.stats["cancelled"] += 1
+                    self._set_state(idx, "CANCELLED")
+                    continue
                 if idx < self._next_expected:
                     # Stale arrival: the slot was discarded (skipped unit),
                     # timed out, or delivered early while the build was in
                     # flight. Drop the result so this worker's buffer slot is
                     # not leaked for the rest of the run (a leaked slot would
                     # permanently shrink the depth budget and could stall every
-                    # producer at the backpressure wait).
+                    # producer at the backpressure wait), then keep covering.
                     self.stats["produced"] += 1
                     if idx in self._dup_remaining:
                         # First slot died before producing — fail its duplicates.
                         if self._shared.get(idx) is None:
                             self._shared[idx] = _FAILED
                         self._cv.notify_all()
-                    return
+                    continue
                 self._results[idx] = (payload, exc)
                 self._timing[idx] = {"start": t_start, "end": t_end, "duration": prep_dur}
                 if exc is None and idx in self._dup_remaining:
@@ -477,6 +627,15 @@ class UnitPrefetch:
                 elif self._state.get(idx) not in ("FAILED_PERMANENT",):
                     self._set_state(idx, "FAILED_RETRYABLE")
                 self._cv.notify_all()
+
+    def _invoke_build(self, unit: Any, index: int,
+                      cancel_ev: Optional[threading.Event]) -> Any:
+        """Call the build, forwarding the cooperative cancel event when the
+        build is cancellable. The three-argument form is used by the training
+        pipeline's ``build_pretrain_dataset_unit(..., cancel_event=...)``."""
+        if self._build_accepts_cancel:
+            return self._build(unit, index, cancel_ev)
+        return self._build(unit, index)
 
     # -- consumer --------------------------------------------------
 
@@ -498,8 +657,14 @@ class UnitPrefetch:
                     while first not in self._shared:
                         remain = deadline - time.monotonic()
                         if remain <= 0:
+                            self.cancel(index)
                             self.stats["timeouts"] += 1
                             self._next_expected = max(self._next_expected, index + 1)
+                            logger.error(
+                                "[UNIT TIMEOUT] dataset %d exceeded "
+                                "prefetch_timeout (%.0fs) while waiting for "
+                                "duplicate of %d — build cancelled, continuing",
+                                index + 1, self._timeout, first + 1)
                             raise PrefetchTimeout(index, self._timeout)
                         self._cv.wait(timeout=max(0.05, remain))
                     if self._shared[first] is _FAILED:
@@ -514,6 +679,10 @@ class UnitPrefetch:
                             self._shared.pop(first, None)
                             self._dup_remaining.pop(first, None)
                         self._cv.notify_all()
+                        logger.error(
+                            "[UNIT TIMEOUT] dataset %d (duplicate of %d) — "
+                            "first occurrence failed; failing duplicate, continuing",
+                            index + 1, first + 1)
                         raise PrefetchTimeout(index, self._timeout)
                     wait_dur = time.monotonic() - get_start
                     payload = self._shared[first]
@@ -570,11 +739,25 @@ class UnitPrefetch:
                     return payload, wait_dur, timing
                 remain = deadline - time.monotonic()
                 if remain <= 0:
+                    self.cancel(index)
                     self.stats["timeouts"] += 1
                     if index in self._dup_remaining and self._shared.get(index) is None:
                         # First slot timed out — fail its duplicates now.
                         self._shared[index] = _FAILED
                         self._cv.notify_all()
                     self._next_expected = max(self._next_expected, index + 1)
+                    active = self._active_builds.get(index)
+                    phase_hint = ""
+                    st = self._state.get(index)
+                    if st:
+                        phase_hint = f", in-flight state={st}"
+                    if active is not None:
+                        phase_hint += (f", build running for "
+                                       f"{time.monotonic() - active:.0f}s")
+                    logger.error(
+                        "[UNIT TIMEOUT] dataset %d exceeded prefetch_timeout "
+                        "(%.0fs) — build cancelled and will be aborted at its "
+                        "next checkpoint%s; marking failed, continuing to the "
+                        "next dataset", index + 1, self._timeout, phase_hint)
                     raise PrefetchTimeout(index, self._timeout)
                 self._cv.wait(timeout=max(0.05, remain))
