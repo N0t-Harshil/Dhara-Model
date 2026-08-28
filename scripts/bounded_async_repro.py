@@ -49,12 +49,21 @@ def main() -> int:
     parser.add_argument("--n-units", type=int, default=2)
     parser.add_argument("--max-samples", type=int, default=300)
     parser.add_argument("--depth", type=int, default=2)
+    parser.add_argument("--cache", dest="cache", action="store_true",
+                        help="mirror production: enable the packed dataset cache")
+    parser.add_argument("--no-cache", dest="cache", action="store_false",
+                        help="disable the packed dataset cache (hermetic repro)")
+    parser.add_argument("--metadata", dest="metadata", action="store_true",
+                        help="enable HF metadata caching (mirrors production)")
+    parser.add_argument("--no-metadata", dest="metadata", action="store_false",
+                        help="disable HF metadata caching")
+    parser.set_defaults(cache=True, metadata=True)
     args = parser.parse_args()
 
     cfg = load_config(str(PROJECT_ROOT / args.config))
     cfg.data.max_samples_per_dataset = args.max_samples
-    cfg.data.use_packed_cache = False
-    cfg.data.metadata_cache.enabled = False
+    cfg.data.use_packed_cache = args.cache
+    cfg.data.metadata_cache.enabled = args.metadata
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
@@ -78,6 +87,8 @@ def main() -> int:
     print("=" * 72)
     print(f"stage 0 categories : {cats}")
     print(f"units to build     : {len(units)} (cap {args.max_samples} samples each)")
+    print(f"packed cache       : {'ON' if args.cache else 'OFF'}   "
+          f"HF metadata cache : {'ON' if args.metadata else 'OFF'}")
     for i, u in enumerate(units, 1):
         print(f"  [{i}] {getattr(u, 'path', '?')}/{getattr(u, 'name', 'default')} "
               f"cat={getattr(u, 'category', '?')} "

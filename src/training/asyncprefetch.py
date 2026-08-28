@@ -392,6 +392,12 @@ class UnitPrefetch:
                     phase, pctx = _phase_of(e)
                     retryable = _retryable(e)
                     if not retryable:
+                        from src.utils.hf_auth import format_sanitized_traceback
+                        logger.error(
+                            "[ASYNC] dataset %d build failed (non-retryable, "
+                            "phase=%s, cache=%s) — full traceback:\n%s",
+                            idx + 1, phase, cstat,
+                            format_sanitized_traceback(e))
                         self.stats["nonretryable"] += 1
                         self._record_failure(
                             idx, e, phase, pctx, attempt,
@@ -432,7 +438,15 @@ class UnitPrefetch:
                 return
             t_end = time.monotonic()
             prep_dur = t_end - t_start
-            logger.info("[ASYNC] dataset %d preprocessing complete (%.2fs)", idx + 1, prep_dur)
+            if exc is None:
+                logger.info("[ASYNC] dataset %d preprocessing complete (%.2fs)",
+                            idx + 1, prep_dur)
+            else:
+                phase, _pctx = _phase_of(exc)
+                logger.error("[ASYNC] dataset %d build FAILED after %.2fs "
+                             "(phase=%s, %s: %s) — not a preprocessing "
+                             "completion; consumer will re-raise it",
+                             idx + 1, prep_dur, phase, type(exc).__name__, exc)
             if self._stop.is_set():
                 return
             with self._cv:
@@ -533,7 +547,13 @@ class UnitPrefetch:
                         self.stats["prefetch_hits"] += 1
                     else:
                         self.stats["prefetch_misses"] += 1
-                    logger.info("[ASYNC] dataset %d consumed (GPU wait: %.2fs)", index + 1, wait_dur)
+                    if exc is None:
+                        logger.info("[ASYNC] dataset %d consumed (GPU wait: %.2fs)",
+                                    index + 1, wait_dur)
+                    else:
+                        logger.error("[ASYNC] dataset %d build failure delivered "
+                                     "after %.2fs — re-raising: %s: %s",
+                                     index + 1, wait_dur, type(exc).__name__, exc)
                     # Wake producers that may be blocked on buffer depth
                     self._cv.notify_all()
                     if exc is not None:

@@ -11,6 +11,7 @@ predicate so a future production drift shows up as a failing assertion here.
 """
 
 import json
+import logging
 import os
 import tempfile
 import threading
@@ -121,6 +122,42 @@ def test_async_typeerror_full_traceback():
     assert pf.stats["nonretryable"] == 1
     assert pf.states()[0] == "FAILED_PERMANENT"
     pf.close()
+
+
+def test_nonretryable_failure_logs_traceback_not_completion(caplog):
+    """Objective-2/7 phase boundary: a non-retryable build failure logs its
+    full traceback under a FAILED banner and must NEVER be logged as a
+    'preprocessing complete'; a successful build logs 'preprocessing
+    complete' + 'consumed' instead."""
+    def build_fn(item, idx):
+        raise TypeError("unsupported format string passed to NoneType.__format__")
+    caplog.set_level(logging.INFO, logger="src.training.asyncprefetch")
+    pf = _fast_pf(build_fn, total=1, depth=1)
+    pf.start([SimpleNamespace(path="org/repo", name="train")])
+    with pytest.raises(TypeError):
+        pf.get(0)
+    records = caplog.text
+    assert "build failed (non-retryable" in records
+    assert "full traceback:" in records
+    assert "NoneType.__format__" in records
+    assert "preprocessing complete" not in records
+    assert "consumed (GPU wait" not in records
+    assert "build FAILED after" in records
+    pf.close()
+
+    caplog.clear()
+
+    def ok_fn(item, idx):
+        return ("dataset", {"key": "k"})
+    pf2 = _fast_pf(ok_fn, total=1, depth=1)
+    pf2.start([SimpleNamespace(path="org/repo", name="train")])
+    ds, _wait, _timing = pf2.get(0)
+    assert ds == ("dataset", {"key": "k"})
+    records = caplog.text
+    assert "preprocessing complete" in records
+    assert "consumed (GPU wait" in records
+    assert "build FAILED after" not in records
+    pf2.close()
 
 
 # ---------------------------------------------------------------------------
