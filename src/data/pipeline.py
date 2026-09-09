@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import fnmatch
 import gc
@@ -45,7 +45,6 @@ from src.data.streaming import (
 )
 from src.data.registry import DatasetRegistry, DatasetInfo, build_registry, extract_text
 from src.data.shards import ShardProgressStore, build_shard_plan
-from src.training.asyncprefetch import UnitBuildCancelled
 from src.data.ast_filter import (
     _pool_filter_code,
     extract_functions,
@@ -58,7 +57,7 @@ from src.data.function_sampler import (
     is_code_empty_or_trivial,
 )
 from src.data.health_reporter import DatasetHealthReport
-from src.data.metadata_cache import DatasetMetadataCache
+from src.data.metadata_cache import DatasetMetadataCache, SCHEMA_VERSION as METADATA_CACHE_SCHEMA_VERSION
 from src.data.sanity import run_sanity_checks
 from src.data.drivers import (
     BuilderCache,
@@ -114,6 +113,19 @@ QUALITY_THRESHOLDS = {
 # is multi-TB / ~150M samples) in a `list(...)` during dataset construction.
 # Matches the existing convention (TokenizerConfig.max_samples default = 100000).
 DEFAULT_MAX_SAMPLES_PER_DATASET = 100_000
+
+# Default size for the persistent cleanup/filter process pool when no explicit
+# cleanup_pool_size is configured. Previously fell back to min(32, cpu_count),
+# which oversubscribed many-core hosts (box log: "32 workers (fork context)")
+# and fought the CUDA/IO threads for the same cores. 8 is a deliberate,
+# observable bound for filter-stage parallelism.
+DEFAULT_CLEANUP_POOL_WORKERS = 8
+
+# Format epoch for EVERY packed-cache key (unit + registry + stage + legacy
+# tokenized). Bump ONLY when the on-disk cache format/semantics change so the
+# whole cache family invalidates in lockstep (mandate Phase 11: a metadata-
+# cache format change must not silently reuse stale packed units).
+PACKED_CACHE_FORMAT_VERSION = 1
 
 
 class ShardedStreamIterator:
@@ -253,10 +265,10 @@ def passes_quality_filter(text: str, category: str, quality_score: Optional[floa
     return compute_quality_score(text, category, lang) >= threshold
 
 
-# ── Process-pool workers ──────────────────────────────────────────
+# â”€â”€ Process-pool workers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Pure, picklable worker functions used to parallelize the expensive
 # per-sample stages. They live in src.data.quality / src.data.ast_filter
-# (light import chains) so that worker processes start fast — importing
+# (light import chains) so that worker processes start fast â€” importing
 # this pipeline module inside a spawned worker would drag in the full
 # torch/transformers/datasets stack. Nothing stateful runs in workers:
 # deduplicators keep their running state in the main process.
@@ -354,8 +366,8 @@ class WeightedMixedDataset(TorchDataset):
         total_w = sum(eff)
         if total_w <= 0:
             # All-zero weights (e.g. after normalization with zero category
-            # targets) would divide by zero — fall back to uniform.
-            logger.warning("All dataset weights are zero — using uniform weights")
+            # targets) would divide by zero â€” fall back to uniform.
+            logger.warning("All dataset weights are zero â€” using uniform weights")
             eff = [1.0] * len(eff)
             total_w = float(len(eff))
         self.weights = [w / total_w for w in eff]
@@ -423,7 +435,7 @@ class WeightedMixedDataset(TorchDataset):
         n = self.total_samples if num_samples is None else num_samples
         for _ in range(n):
             if self._all_exhausted():
-                # Every dataset fully consumed — start a fresh pass instead of
+                # Every dataset fully consumed â€” start a fresh pass instead of
                 # re-sampling consumed indices (that would fabricate an epoch
                 # of ~100% duplicate samples).
                 self._consumed = [0] * len(self.datasets)
@@ -450,7 +462,7 @@ class WeightedMixedDataset(TorchDataset):
         adjusted = sum(group_samples.values())
         # Correct overflow/underflow on a group that actually contributes
         # datasets (previously always the first key, even when that group's
-        # dataset list was empty → samples silently lost).
+        # dataset list was empty â†’ samples silently lost).
         def _adjust_key(delta: int):
             # Prefer the group with the most backing datasets.
             ranked = sorted(group_samples.keys(),
@@ -552,10 +564,19 @@ class DataPipeline:
         """Raise ``UnitBuildCancelled`` when the pipeline is shutting down or
         the slot's owner cancelled it. Checked at cheap, bounded cadence so a
         build never runs away past a cancellation request."""
-        cancelled = getattr(self, "_cancelled", None)
-        if ((cancelled is not None and cancelled.is_set())
-                or (cancel_event is not None and cancel_event.is_set())):
+        if self._is_cancelled(cancel_event):
+            # Lazy import: ``src.training/__init__`` eagerly re-exports
+            # ``TrainingPipeline``, which imports back into this module, so a
+            # top-level import here forms a circular-import hazard that breaks
+            # ``tests/test_data_pipeline.py`` / ``test_async_pipeline_overlap.py``
+            # when this module loads first in a fresh process.
+            from src.training.asyncprefetch import UnitBuildCancelled
             raise UnitBuildCancelled()
+
+    def _is_cancelled(self, cancel_event=None) -> bool:
+        cancelled = getattr(self, "_cancelled", None)
+        return ((cancelled is not None and cancelled.is_set())
+                or (cancel_event is not None and cancel_event.is_set()))
 
     def processing_signature(self) -> str:
         """Signature of all preprocessing/quality settings that affect what a
@@ -767,7 +788,7 @@ class DataPipeline:
             q.deduplication.method, f"{q.deduplication.threshold:.4f}",
             str(self.cfg.data.ast_filter.code_filtering),
             str(pp.remove_boilerplate), str(pp.min_text_length),
-            "v2",
+            f"v{PACKED_CACHE_FORMAT_VERSION}",  # family-wide epoch (Phase 11)
         ])
         return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
@@ -791,7 +812,7 @@ class DataPipeline:
             str(pp.remove_boilerplate), str(pp.min_text_length),
             "|".join(sorted(pp.boilerplate_file_patterns or [])),
             f"{QUALITY_THRESHOLDS.get(info.category, 0.30):.4f}",
-            "v1",
+            f"v{PACKED_CACHE_FORMAT_VERSION}",  # family-wide epoch (Phase 11)
         ])
         return hashlib.sha256(sig.encode()).hexdigest()[:16]
 
@@ -806,10 +827,10 @@ class DataPipeline:
                 return None
             obj = torch.load(cache_path)
             if obj.get("cache_key") != cache_key:
-                logger.warning("    [CACHE] key mismatch for %s — rebuilding", ds_key)
+                logger.warning("    [CACHE] key mismatch for %s â€” rebuilding", ds_key)
                 return None
             if obj.get("version") != 1:
-                logger.warning("    [CACHE] version mismatch for %s — rebuilding", ds_key)
+                logger.warning("    [CACHE] version mismatch for %s â€” rebuilding", ds_key)
                 return None
             packed = obj["packed"]
             meta = obj["meta"]
@@ -817,7 +838,7 @@ class DataPipeline:
             logger.info("[TIMER] cache load %s: %d packed results", ds_key, len(packed))
             return ds, meta
         except Exception as e:
-            logger.warning("    [CACHE] load failed for %s (%s) — rebuilding", ds_key, e)
+            logger.warning("    [CACHE] load failed for %s (%s) â€” rebuilding", ds_key, e)
             return None
 
     def _save_registry_dataset_cache(self, cache_path: Path, cache_key: str, packed: list, meta: dict) -> None:
@@ -851,7 +872,7 @@ class DataPipeline:
             "|".join(sorted(pp.boilerplate_file_patterns or [])),
             "|".join(f"{c}:{QUALITY_THRESHOLDS.get(c, 0.30):.4f}" for c in cats),
             str(self.cfg.data.sampler.balance_by),
-            "v1",
+            f"v{PACKED_CACHE_FORMAT_VERSION}",  # family-wide epoch (Phase 11)
         ])
         return hashlib.sha256(sig.encode()).hexdigest()[:16]
 
@@ -863,14 +884,14 @@ class DataPipeline:
                 return None
             obj = torch.load(packed_path)
             if obj.get("cache_key") != cache_key:
-                logger.warning("[STAGE] key mismatch for %s — rebuilding", stage_dir)
+                logger.warning("[STAGE] key mismatch for %s â€” rebuilding", stage_dir)
                 return None
             if obj.get("version") != 1:
-                logger.warning("[STAGE] version mismatch for %s — rebuilding", stage_dir)
+                logger.warning("[STAGE] version mismatch for %s â€” rebuilding", stage_dir)
                 return None
             entries = obj.get("datasets") or []
             if not entries:
-                logger.warning("[STAGE] empty cache %s — rebuilding", stage_dir)
+                logger.warning("[STAGE] empty cache %s â€” rebuilding", stage_dir)
                 return None
             all_tokenized = [
                 (Dataset.from_list(e["packed"]), e["weight"], e["path"], e["category"], e["avg_qs"])
@@ -889,7 +910,7 @@ class DataPipeline:
             )
             return result, meta
         except Exception as e:
-            logger.warning("[STAGE] cache load failed for %s (%s) — rebuilding", stage_dir, e)
+            logger.warning("[STAGE] cache load failed for %s (%s) â€” rebuilding", stage_dir, e)
             return None
 
     def _save_stage_dataset_cache(self, stage_dir: Path, cache_key: str, stage_cfg,
@@ -923,17 +944,17 @@ class DataPipeline:
         with its own disk cache under <stage_cache_dir>/stage<stage_index>/.
 
         Returns (WeightedMixedDataset, meta_dict). On a cache hit no streaming or
-        tokenization happens — packed sequences are loaded straight from disk."""
+        tokenization happens â€” packed sequences are loaded straight from disk."""
         stage_dir = Path(self.cfg.training.pretrain.staging.stage_cache_dir) / f"stage{stage_index}"
         cache_key = self._stage_cache_key(stage_cfg, stage_index)
         if self.cfg.data.use_packed_cache:
             cached = self._load_stage_dataset_cache(stage_dir, cache_key, stage_cfg)
             if cached is not None:
                 dataset, meta = cached
-                logger.info("[STAGE] %d/%d %s — cache hit (no streaming)",
+                logger.info("[STAGE] %d/%d %s â€” cache hit (no streaming)",
                             stage_index, total_stages, stage_cfg.name or "")
                 return dataset, meta
-        logger.info("[STAGE] %d/%d %s — building (no cache)",
+        logger.info("[STAGE] %d/%d %s â€” building (no cache)",
                     stage_index, total_stages, stage_cfg.name or "")
         dataset = self.build_pretrain_dataset_from_registry(
             dataset_filter=stage_cfg.categories or None,
@@ -941,7 +962,7 @@ class DataPipeline:
         )
         entries = getattr(dataset, "_entries", None)
         if not entries:
-            logger.warning("[STAGE] per-dataset entries unavailable — skipping stage cache save")
+            logger.warning("[STAGE] per-dataset entries unavailable â€” skipping stage cache save")
             return dataset, getattr(dataset, "_global_stats", {})
         meta = {
             "cache_key": cache_key,
@@ -970,6 +991,11 @@ class DataPipeline:
             "unit-v1", info.path, info.name or "", info.split,
             info.category, str(ds_limit),
             self.processing_signature(), self.tokenizer_signature,
+            # Phase 11: the metadata-cache schema and the packed-cache family
+            # epoch are part of the unit key, so a metadata format/web fork
+            # change and a packed-format change BOTH invalidate every unit.
+            f"mcs{METADATA_CACHE_SCHEMA_VERSION}",
+            f"pcf{PACKED_CACHE_FORMAT_VERSION}",
         ]).encode()).hexdigest()[:16]
 
     def unit_cache_dir(self, stage_index: int, unit_index: int) -> Path:
@@ -1004,7 +1030,7 @@ class DataPipeline:
 
     def has_metadata_record(self, info) -> bool:
         """True if a verified driver record (file metadata OR script builder)
-        exists for this dataset — no HF resolution needed to stream it."""
+        exists for this dataset â€” no HF resolution needed to stream it."""
         ppsig = self.processing_signature()
         toksig = self.tokenizer_signature
         return (
@@ -1024,6 +1050,44 @@ class DataPipeline:
             logger.warning("Metadata warm failed for %s/%s (%s)",
                            info.path, info.name or "default", e)
             return False
+
+    def _health_stats_from_meta(self, meta: dict, info, max_len: int) -> dict:
+        """Map a persisted dataset meta dict to add_dataset_stats kwargs.
+
+        The per-text language/domain distributions stored in the meta are the
+        authoritative source for the health report. The collapsed single-key
+        ``{lang_d: accepted}`` form is only a legacy fallback when the meta has
+        no distribution â€” otherwise a mixed dataset whose static
+        ``info.language`` is None would collapse to a single 'unknown' bucket
+        on cache replay (the box-run "unknown 44548 (100.0%)" regression).
+        """
+        cached_lang = meta.get("lang_d") or info.language
+        cached_domain = meta.get("domain_d") or info.domain
+        lang_dist = meta.get("lang_dist")
+        domain_dist = meta.get("domain_dist")
+        accepted = meta.get("accepted", 0)
+        lang_report = dict(lang_dist) if lang_dist else (
+            {cached_lang: accepted} if cached_lang else {})
+        domain_report = dict(domain_dist) if domain_dist else (
+            {cached_domain: accepted} if cached_domain else {})
+        return {
+            "path": info.path,
+            "category": info.category,
+            "weight": info.weight,
+            "raw_count": meta.get("loaded", 0),
+            "after_boilerplate": accepted,
+            "after_quality": accepted,
+            "after_dedup": accepted,
+            "packed_count": meta.get("packed_count", 0),
+            "total_tokens": meta.get("total_tokens", 0),
+            "duplicate_removed": meta.get("rejected_dedup", 0),
+            "rejection_reasons": meta.get("ledger", {}) or {},
+            "quality_scores": meta.get("quality_scores", []),
+            "lang_dist": lang_report,
+            "domain_dist": domain_report,
+            "token_lengths": meta.get("token_lengths", []),
+            "max_seq_length": max_len,
+        }
 
     def build_pretrain_dataset_unit(self, info, stage_index: int, unit_index: int,
                                  unit_total: int,
@@ -1063,13 +1127,22 @@ class DataPipeline:
                         result = self._unit_or_mixed(entries, info)
                         result._entries = entries
                         result._dataset_metas = [meta_from_cache]
-                        logger.info("[UNIT] %d/%d %s/%s — cache hit (no stream, no tokenize)",
+                        # Warm unit cache replays its persisted dataset meta
+                        # (which carries the per-text lang/domain distributions)
+                        # so the health report reflects this run instead of
+                        # silently showing "no datasets" on resumed runs.
+                        if meta_from_cache:
+                            self.health_report.add_dataset_stats(
+                                **self._health_stats_from_meta(
+                                    meta_from_cache, info,
+                                    self.cfg.training.max_seq_length))
+                        logger.info("[UNIT] %d/%d %s/%s â€” cache hit (no stream, no tokenize)",
                                     unit_index, unit_total, info.path, info.name or "default")
                         return result, rec
                 except Exception as e:
-                    logger.warning("[UNIT] cache load failed for %s (%s) — rebuilding", unit_dir, e)
+                    logger.warning("[UNIT] cache load failed for %s (%s) â€” rebuilding", unit_dir, e)
 
-        logger.info("[UNIT] %d/%d %s/%s — building (no cache)",
+        logger.info("[UNIT] %d/%d %s/%s â€” building (no cache)",
                     unit_index, unit_total, info.path, info.name or "default")
         try:
             dataset = self.build_pretrain_dataset_from_registry(
@@ -1077,7 +1150,7 @@ class DataPipeline:
                 max_samples_per_dataset=info.max_samples or self.cfg.data.max_samples_per_dataset,
                 cancel_event=cancel_event,
             )
-        except Exception as e:  # noqa: BLE001 — phase-tagged for the prefetch worker
+        except Exception as e:  # noqa: BLE001 â€” phase-tagged for the prefetch worker
             from src.training.asyncprefetch import _tag_phase
             _tag_phase(e, "construction",
                        dataset=info.path, name=info.name or "",
@@ -1087,7 +1160,7 @@ class DataPipeline:
         entries = getattr(dataset, "_entries", None)
         if not entries:
             raise RuntimeError(
-                f"Unit build produced no dataset: {info.path}/{info.name or ''} — "
+                f"Unit build produced no dataset: {info.path}/{info.name or ''} â€” "
                 "check HF access/fallbacks for this entry")
         ds0, weight0, path0, cat0, avg_qs0 = entries[0]
         meta = {"key": key, "path": path0, "name": info.name, "category": cat0,
@@ -1167,11 +1240,11 @@ class DataPipeline:
                 limit = max_samples_per_dataset or ds_info.max_samples or DEFAULT_MAX_SAMPLES_PER_DATASET
                 samples = list(self.collector.stream_single_dataset(ds_info, limit=limit, raw_text=True))
             except Exception as e:
-                logger.error("    FAILED: %s — skipping", e)
+                logger.error("    FAILED: %s â€” skipping", e)
                 self.health_report.add_error(f"{ds_info.path}: {e}")
                 continue
             if not samples:
-                logger.warning("    No valid samples — skipping")
+                logger.warning("    No valid samples â€” skipping")
                 continue
             raw_count = len(samples)
             total_raw += raw_count
@@ -1238,18 +1311,22 @@ class DataPipeline:
                         ledger["ast_reject"], ledger["dedup"], ledger["empty_trivial"])
             logger.info("    Survived: %d (%.1f%%)", len(cleaned), len(cleaned) / max(raw_count, 1) * 100)
             if not cleaned:
-                logger.warning("    No samples survived — skipping")
+                logger.warning("    No samples survived â€” skipping")
                 self.health_report.add_error(f"{ds_info.path}: all {raw_count} samples rejected")
                 continue
             tokenized_samples = []
             eos_id = self.tokenizer.eos_token_id or 0
             max_len = self.cfg.training.max_seq_length
             quality_scores: List[float] = []
+            ds_lang_dist: Dict[str, int] = defaultdict(int)
+            ds_domain_dist: Dict[str, int] = defaultdict(int)
             for text in cleaned:
                 lang = detect_language(text, ds_name)
                 lang_dist[lang] += 1
+                ds_lang_dist[lang] += 1
                 domain = detect_domain(text, category)
                 domain_dist[domain] += 1
+                ds_domain_dist[domain] += 1
                 tokens = self.tokenizer(text, truncation=False, add_special_tokens=False)["input_ids"]
                 tokens = random_window_sample(tokens, max_len)
                 tokenized_samples.append({"input_ids": tokens})
@@ -1277,8 +1354,8 @@ class DataPipeline:
                 duplicate_removed=ledger["dedup"],
                 rejection_reasons=dict(ledger),
                 quality_scores=quality_scores,
-                lang_dist=dict(lang_dist),
-                domain_dist=dict(domain_dist),
+                lang_dist=dict(ds_lang_dist),
+                domain_dist=dict(ds_domain_dist),
             )
             del samples, cleaned, tokenized_samples, packed
             gc.collect()
@@ -1294,9 +1371,19 @@ class DataPipeline:
         if top_rejections:
             logger.info("Top rejection reasons: %s", top_rejections)
         if total_packed:
-            logger.info("Est steps @ bs=%d: %d",
-                        self.cfg.training.pretrain.batch_size,
-                        total_packed // self.cfg.training.pretrain.batch_size)
+            from src.utils.steps import (
+                estimate_pretrain_steps,
+                format_step_estimate,
+            )
+            ga = int(getattr(self.cfg.training.pretrain,
+                             "gradient_accumulation_steps", None) or 1)
+            _est = estimate_pretrain_steps(
+                total_packed,
+                self.cfg.training.pretrain.batch_size,
+                gradient_accumulation_steps=ga,
+                world_size=int(os.environ.get("WORLD_SIZE", "1") or 1),
+            )
+            logger.info("Est steps: %s", format_step_estimate(_est))
         if not all_tokenized:
             logger.warning("No datasets produced any samples!")
             self.health_report.compute_global_stats()
@@ -1348,23 +1435,53 @@ class DataPipeline:
     def _get_cleanup_pool(self):
         """Process pool for parallel cleanup/filtering, created once and kept
         alive for the lifetime of the pipeline (reused across datasets/stages
-        instead of being recreated on every build)."""
+        instead of being recreated on every build).
+
+        Worker topology is bounded and observable: the size is
+        ``cleanup_pool_size`` when configured, otherwise a documented default
+        cap (DEFAULT_CLEANUP_POOL_WORKERS) instead of every core on the host.
+
+        The context is deterministic: `fork` is preferred where the platform
+        provides it, but a fork that is *refused at pool creation* (e.g. the
+        "os.fork is unsafe while filelock is changing descriptor ownership"
+        guard) immediately falls back to `spawn` â€” never a silent
+        "cleanup will run sequentially" followed by a second, contradictory
+        32-worker fork attempt like the box log showed.
+        """
         if self._cleanup_pool is None:
             n_cpu = os.cpu_count() or 2
             if n_cpu > 1:
+                configured = getattr(self.cfg.data, "cleanup_pool_size", None)
+                if configured and int(configured) > 0:
+                    n_workers = min(32, int(configured))
+                    source = "config"
+                else:
+                    n_workers = min(DEFAULT_CLEANUP_POOL_WORKERS, n_cpu)
+                    source = "default-bound"
+                pool = None
+                ctx = None
+                fork_note = None
                 try:
-                    size = getattr(self.cfg.data, "cleanup_pool_size", None)
-                    n_workers = min(32, size) if size and size > 0 else min(32, n_cpu)
+                    ctx = multiprocessing.get_context("fork")
+                    pool = ctx.Pool(n_workers)
+                except ValueError:
+                    fork_note = "fork backend unavailable on this platform"
+                except Exception as e:  # noqa: BLE001 â€” guard/fork refusal
+                    fork_note = f"fork refused at pool creation ({e})"
+                if pool is None:
+                    if fork_note:
+                        logger.warning("[WORKERS] %s â€” cleanup pool falls back to spawn", fork_note)
                     try:
-                        ctx = multiprocessing.get_context("fork")
-                    except ValueError:
                         ctx = multiprocessing.get_context("spawn")
-                    self._cleanup_pool = ctx.Pool(n_workers)
-                    logger.info("[TIMER] cleanup pool: %d workers (%s context)",
-                                self._cleanup_pool._processes, ctx.get_start_method())
-                except Exception as e:
-                    logger.warning("Process pool unavailable (%s) — cleanup will run sequentially", e)
-                    self._cleanup_pool = None
+                        pool = ctx.Pool(n_workers)
+                    except Exception as e:  # noqa: BLE001 â€” final fallback
+                        logger.warning("Process pool unavailable (%s) â€” cleanup will run sequentially", e)
+                        pool = None
+                if pool is not None:
+                    self._cleanup_pool = pool
+                    logger.info("[WORKERS] cleanup pool: %d workers (context=%s, "
+                                "source=%s) â€” kept alive for the run",
+                                pool._processes, ctx.get_start_method(), source)
         return self._cleanup_pool
 
     def close(self) -> None:
@@ -1385,11 +1502,22 @@ class DataPipeline:
                 pool.close()
                 pool.join()  # drain: idle workers exit promptly on close()
             except Exception as e:
-                logger.warning("Cleanup pool join failed (%s) — terminating", e)
+                logger.warning("Cleanup pool join failed (%s) â€” terminating", e)
             try:
                 pool.terminate()  # backstop: never leak worker processes
             except Exception:
                 pass
+        # Deferred health-report emission: warm unit-cache runs never enter the
+        # per-dataset build paths that save the report, so persist the
+        # aggregated report here (guard against re-invocation races).
+        hr = getattr(getattr(self.cfg, "data", None), "health_reporting", None)
+        if hr is not None and getattr(hr, "enabled", False) and getattr(hr, "output_dir", None):
+            try:
+                self.health_report.compute_global_stats()
+                out = self.health_report.save(hr.output_dir)
+                logger.info("Health report saved at close: %s", out)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Health report close-save failed: %s", e)
 
     def _shard_progress_store(self) -> Optional[ShardProgressStore]:
         d = self.cfg.data
@@ -1419,7 +1547,7 @@ class DataPipeline:
     def _prefetch_driver(self, info: DatasetInfo) -> None:
         """Warm the driver record for an upcoming dataset on a background
         thread so its resolution (network) overlaps the current dataset's
-        streaming/processing — CPU/GPU/network overlap across datasets."""
+        streaming/processing â€” CPU/GPU/network overlap across datasets."""
         key = f"{info.path}/{info.name or 'default'}"
         if key in self._driver_cache:
             return
@@ -1521,7 +1649,7 @@ class DataPipeline:
                                     entry.name or "default")
                         logger.info("  Repository unchanged | metadata reused (%d shards)",
                                     len(drv.record.get("files") or []))
-                        logger.info("  Arrow reused — direct iterable, no HF resolution")
+                        logger.info("  Arrow reused â€” direct iterable, no HF resolution")
                         logger.info("  Streaming begins (no HF resolution)")
                     yield from self._stream_record(entry, drv.record, limit, policy,
                                                    text_fields, store, ppsig,
@@ -1540,7 +1668,7 @@ class DataPipeline:
                                    key, entry.fallbacks if entry is info else "none")
                     continue
                 if stats.resolve_error:
-                    # Detection failed (gated/404/offline) — log access
+                    # Detection failed (gated/404/offline) â€” log access
                     # guidance once, then try the NEXT fallback entry instead
                     # of giving up on the whole chain.
                     from src.data.metadata_cache import _handle_load_error
@@ -1643,7 +1771,7 @@ class DataPipeline:
             state = coord.progress_state()
             stats = prect.setdefault("stats", {})
             failed = set(coord.failed_shards())
-            # Finished shards are marked complete (yield-order safe) — except
+            # Finished shards are marked complete (yield-order safe) â€” except
             # FAILED shards, which must NOT be skipped on resume: their
             # progress is reset so the next run retries them from scratch
             # instead of silently losing their rows.
@@ -1691,7 +1819,7 @@ class DataPipeline:
         Mirrors ShardCoordinator semantics: gated samples carry (_shard=0,
         _raw_seq) and stats; the resume state is persisted when the stream is
         interrupted (limit / accepted target) and reset when the dataset is
-        exhausted naturally — the same delete-on-complete contract as the
+        exhausted naturally â€” the same delete-on-complete contract as the
         shard progress store."""
         stats.script_resumed = driver.resumed
         if stats.builder_hit:
@@ -1716,7 +1844,7 @@ class DataPipeline:
             stats.raw_rows = driver.raw_consumed()
             if driver.natural_end():
                 driver.reset_resume()
-                logger.info("Script dataset exhausted — iterator state reset "
+                logger.info("Script dataset exhausted â€” iterator state reset "
                             "(next run starts fresh)")
             else:
                 driver.save_resume()
@@ -1798,7 +1926,7 @@ class DataPipeline:
         if threshold and threshold > 0:
             flagged = {k: v for k, v in timings.items() if v >= threshold}
             if flagged:
-                logger.warning("BOTTLENECK DETECTED — %s (stage >= %.0fs):", ds_key, threshold)
+                logger.warning("BOTTLENECK DETECTED â€” %s (stage >= %.0fs):", ds_key, threshold)
                 for k, v in sorted(flagged.items(), key=lambda x: -x[1]):
                     logger.warning("  %-26s %8.1fs", k, v)
                 logger.warning("  Fixes: raise shard_workers, enable metadata/Arrow reuse, "
@@ -1808,7 +1936,7 @@ class DataPipeline:
         if inv_thr and inv_thr > 0 and raw > 0:
             rate = ledger["accepted"] / raw
             if rate < inv_thr:
-                logger.warning("LOW ACCEPTANCE — %s: %.2f%% (accepted=%d / raw=%d) — investigating:",
+                logger.warning("LOW ACCEPTANCE â€” %s: %.2f%% (accepted=%d / raw=%d) â€” investigating:",
                                ds_key, rate * 100, ledger["accepted"], raw)
                 filters = [
                     ("boilerplate", ledger["rejected_boilerplate"]),
@@ -1857,7 +1985,7 @@ class DataPipeline:
         lang_dist: Dict[str, int] = defaultdict(int)
         domain_dist: Dict[str, int] = defaultdict(int)
         # Driver-layer cache accounting (exposed to callers via the result's
-        # _driver_stats attribute → surfaced in the ASYNC PIPELINE REPORT).
+        # _driver_stats attribute â†’ surfaced in the ASYNC PIPELINE REPORT).
         driver_stats = {
             "metadata_hits": 0, "metadata_attempts": 0,
             "builder_hits": 0, "builder_attempts": 0,
@@ -1894,8 +2022,14 @@ class DataPipeline:
                       "rejected_quality": 0, "rejected_dedup": 0,
                       "rejected_ast": 0, "rejected_empty": 0,
                       "rejected_contamination": 0}
+            # quality_scores holds EVERY candidate's score (declared before the
+            # quality threshold). Only a subset survives into cleaned_texts —
+            # from the surviving (text, score) pairs we rebuild an
+            # aligned `cleaned_quality` list so doc_qs / avg_qs / health stats
+            # reflect the texts actually packed, never a mis-indexed candidate.
             quality_scores: List[float] = []
             cleaned_texts: List[str] = []
+            cleaned_quality: List[float] = []
             shard_streamed: Dict[int, int] = defaultdict(int)
             shard_accepted: Dict[int, int] = defaultdict(int)
 
@@ -1927,23 +2061,9 @@ class DataPipeline:
                         domain_dist[k] += v
                     for reason, n in meta["rejections"].items():
                         rejection_reasons[reason] += n
-                    cached_lang = meta.get("lang_d") or info.language
-                    cd = meta.get("domain_d") or info.domain
                     self.health_report.add_dataset_stats(
-                        path=info.path, category=cat, weight=info.weight,
-                        raw_count=meta["loaded"], after_boilerplate=meta["accepted"],
-                        after_quality=meta["accepted"], after_dedup=meta["accepted"],
-                        packed_count=meta["packed_count"],
-                        total_tokens=meta["total_tokens"],
-                        duplicate_removed=meta["rejected_dedup"],
-                        rejection_reasons=meta.get("ledger", {}),
-                        quality_scores=meta.get("quality_scores", []),
-                        lang_dist={cached_lang: meta["accepted"]},
-                        domain_dist={cd: meta["accepted"]} if cd else {},
-                        token_lengths=meta.get("token_lengths", []),
-                        max_seq_length=max_len,
-                    )
-                    logger.info("    CACHED: %s — %d packed results loaded from disk",
+                        **self._health_stats_from_meta(meta, info, max_len))
+                    logger.info("    CACHED: %s â€” %d packed results loaded from disk",
                                 ds_key, meta["packed_count"])
                     continue
 
@@ -1954,10 +2074,10 @@ class DataPipeline:
                 # Accepted-sample-driven streaming: pull chunks from the
                 # shard-parallel streamer and run the identical filter chain
                 # per chunk (same order, same pure functions, same stateful
-                # dedup — sequential-equivalent, so the accepted set matches
+                # dedup â€” sequential-equivalent, so the accepted set matches
                 # the pre-optimization pipeline exactly). Stop pulling as soon
                 # as the accepted target is met instead of materializing the
-                # full ds_limit (The Stack V2: 20k streamed → 79 accepted).
+                # full ds_limit (The Stack V2: 20k streamed â†’ 79 accepted).
                 t_clean = time.perf_counter()
                 stage_acc: Dict[str, float] = {k: 0.0 for k in (
                     "extract_empty", "boilerplate", "length", "language",
@@ -2002,7 +2122,7 @@ class DataPipeline:
                             stage_acc["language"] += time.perf_counter() - t3
                         loop_total += time.perf_counter() - t_stage
 
-                        # Quality scoring, then AST validation — parallelized (pure functions).
+                        # Quality scoring, then AST validation â€” parallelized (pure functions).
                         # Stage order mirrors the original pipeline (quality -> AST -> dedup),
                         # so the accepted set is identical to pre-optimization behavior.
                         eff_threshold = max(QUALITY_THRESHOLDS.get(cat, 0.30), 0.15)
@@ -2055,7 +2175,7 @@ class DataPipeline:
                         else:
                             accepted = []
 
-                        # Duplicates last — same stage sequence as the original pipeline, so the
+                        # Duplicates last â€” same stage sequence as the original pipeline, so the
                         # accepted set is unchanged; dedup runs only on quality+AST survivors.
                         # Stateful dedup carries across chunks (sequential-equivalent).
                         t_stage = time.perf_counter()
@@ -2095,29 +2215,33 @@ class DataPipeline:
                         func_enabled = cat in ("code",) and func_sampling_cfg.enabled and info.function_sampling
                         if func_enabled:
                             final_texts: List[str] = []
+                            final_scores: List[float] = []
                             final_shards: List[int] = []
-                            for text, ds_lang, _score, _sh in accepted:
+                            for text, ds_lang, score, _sh in accepted:
                                 lang = info.language or detect_language(text, info.path)
                                 extracted = sample_functions_or_fallback(text, lang, func_sampling_cfg)
                                 if is_code_empty_or_trivial(extracted):
                                     ledger["rejected_empty"] += 1
                                     continue
                                 final_texts.append(extracted)
+                                final_scores.append(score)
                                 final_shards.append(_sh)
                         else:
                             final_texts = [t for t, _l, _sc, _sh in accepted]
+                            final_scores = [_sc for _t, _l, _sc, _sh in accepted]
                             final_shards = [_sh for _t, _l, _sc, _sh in accepted]
                         stage_acc["function_sampling"] += time.perf_counter() - t_stage
                         cleaned_texts.extend(final_texts)
+                        cleaned_quality.extend(final_scores)
                         for _sh in final_shards:
                             shard_accepted[_sh] += 1
                         ledger["accepted"] = len(cleaned_texts)
                         if accepted_target and ledger["accepted"] >= accepted_target:
-                            logger.info("    Accepted target reached: %d/%d — stopping stream",
+                            logger.info("    Accepted target reached: %d/%d â€” stopping stream",
                                         ledger["accepted"], accepted_target)
                             break
                 except Exception as e:
-                    logger.error("    FAILED: %s — %s", ds_key, e)
+                    logger.error("    FAILED: %s â€” %s", ds_key, e)
                     self.health_report.add_error(f"{ds_key}: {e}")
                     stream_ok = False
                 finally:
@@ -2146,12 +2270,12 @@ class DataPipeline:
                             ds_key, ds_limit, streamer.stats.raw_rows, ledger["loaded"],
                             time.perf_counter() - t0)
             except Exception as e:
-                logger.error("    FAILED: %s — %s", ds_key, e)
+                logger.error("    FAILED: %s â€” %s", ds_key, e)
                 self.health_report.add_error(f"{ds_key}: {e}")
                 continue
 
             if ledger["loaded"] == 0:
-                logger.warning("    EMPTY: %s — 0 samples loaded", ds_key)
+                logger.warning("    EMPTY: %s â€” 0 samples loaded", ds_key)
                 self.health_report.add_error(f"{ds_key}: empty")
                 continue
 
@@ -2174,7 +2298,7 @@ class DataPipeline:
             logger.info("      empty/triv:  %d", ledger["rejected_empty"])
 
             if not cleaned_texts:
-                logger.warning("    SKIP: %s — 0 accepted", ds_key)
+                logger.warning("    SKIP: %s â€” 0 accepted", ds_key)
                 self.health_report.add_error(f"{ds_key}: all {ledger['loaded']} rejected")
                 continue
 
@@ -2194,7 +2318,7 @@ class DataPipeline:
                 self.raise_if_cancelled(cancel_event)
                 tok = self.tokenizer(text, truncation=False, add_special_tokens=False)["input_ids"]
                 tok = random_window_sample(tok, max_len)
-                doc_qs = quality_scores[text_idx] if text_idx < len(quality_scores) else 0.5
+                doc_qs = cleaned_quality[text_idx] if text_idx < len(cleaned_quality) else 0.5
                 tokenized.append({"input_ids": tok, "quality_score": doc_qs})
                 lang_d = info.language or detect_language(text, info.path)
                 lang_dist[lang_d] += 1
@@ -2213,9 +2337,9 @@ class DataPipeline:
 
             self._report_dataset_diagnostics(ds_key, streamer, stage_acc, ledger, tok_pack_sec)
 
-            avg_qs = sum(quality_scores) / max(len(quality_scores), 1)
-            if quality_scores:
-                sorted_qs = sorted(quality_scores)
+            avg_qs = sum(cleaned_quality) / max(len(cleaned_quality), 1)
+            if cleaned_quality:
+                sorted_qs = sorted(cleaned_quality)
                 p10 = sorted_qs[len(sorted_qs) // 10] if len(sorted_qs) >= 10 else sorted_qs[0]
                 p90 = sorted_qs[(9 * len(sorted_qs)) // 10] if len(sorted_qs) >= 10 else sorted_qs[-1]
                 logger.info("    Quality: mean=%.3f p10=%.3f p90=%.3f range=[%.3f, %.3f]",
@@ -2245,7 +2369,7 @@ class DataPipeline:
                 "packed_count": len(packed),
                 "total_tokens": sum(len(p["input_ids"]) for p in packed),
                 "rejected_dedup": ledger["rejected_dedup"],
-                "quality_scores": quality_scores,
+                "quality_scores": cleaned_quality,
                 "token_lengths": raw_tok_lengths,
                 "lang_dist": dict(ds_lang_dist),
                 "domain_dist": dict(ds_domain_dist),
@@ -2274,8 +2398,11 @@ class DataPipeline:
                 total_tokens=sum(len(p["input_ids"]) for p in packed),
                 duplicate_removed=ledger["rejected_dedup"],
                 rejection_reasons=dict(ledger),
-                quality_scores=quality_scores,
-                lang_dist=dict(lang_dist), domain_dist=dict(domain_dist),
+                quality_scores=cleaned_quality,
+                # Per-dataset distributions only — never the run-global
+                # cumulative dict, or every dataset would report (and inflate
+                # the aggregate by) the union of all datasets' languages.
+                lang_dist=dict(ds_lang_dist), domain_dist=dict(ds_domain_dist),
                 token_lengths=raw_tok_lengths,
                 max_seq_length=max_len,
             )
@@ -2293,7 +2420,7 @@ class DataPipeline:
         )
 
         if not all_tokenized:
-            logger.error("ALL DATASETS FAILED — no samples produced by any dataset in registry")
+            logger.error("ALL DATASETS FAILED â€” no samples produced by any dataset in registry")
             if hasattr(self.cfg, '_registry_errors'):
                 for err in self.cfg._registry_errors:
                     logger.error("  Error: %s", err)
@@ -2308,7 +2435,7 @@ class DataPipeline:
 
         try:
             result = self._unit_or_mixed(all_tokenized)
-        except Exception as e:  # noqa: BLE001 — phase-tagged for the prefetch worker
+        except Exception as e:  # noqa: BLE001 â€” phase-tagged for the prefetch worker
             from src.training.asyncprefetch import _tag_phase
             _tag_phase(e, "wrapper",
                        n_datasets=len(all_tokenized),
@@ -2355,7 +2482,7 @@ class DataPipeline:
         max_len = self.cfg.training.max_seq_length
         logger.info("")
         logger.info("=" * 70)
-        logger.info("PIPELINE SUMMARY — REGISTRY MODE")
+        logger.info("PIPELINE SUMMARY â€” REGISTRY MODE")
         logger.info("=" * 70)
         logger.info("  Datasets listed:   %d", n_listed)
         logger.info("  Datasets loaded:   %d", len(all_tokenized))
@@ -2383,8 +2510,16 @@ class DataPipeline:
         if global_stats.get("total_packed", 0):
             eff = global_stats["total_packed"] * max_len / max(global_stats.get("total_tokens", 0), 1)
             logger.info("  Overall util:      %.1f%%", eff * 100)
-            bs = self.cfg.training.pretrain.batch_size
-            logger.info("  Est training steps: %d", global_stats["total_packed"] // bs)
+            from src.utils.steps import estimate_pretrain_steps, format_step_estimate
+            ga = int(getattr(self.cfg.training.pretrain,
+                             "gradient_accumulation_steps", None) or 1)
+            _est = estimate_pretrain_steps(
+                global_stats["total_packed"],
+                self.cfg.training.pretrain.batch_size,
+                gradient_accumulation_steps=ga,
+                world_size=int(os.environ.get("WORLD_SIZE", "1") or 1),
+            )
+            logger.info("  Est training steps: %s", format_step_estimate(_est))
         logger.info("=" * 70)
 
     def _unit_or_mixed(

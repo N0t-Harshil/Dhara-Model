@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import os
-import inspect
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -12,6 +11,7 @@ from transformers import DefaultDataCollator, Trainer, TrainerCallback, Training
 
 from src.config.schema import Config, load_config
 from src.data.pipeline import DataPipeline
+from src.utils.training import dataloader_num_workers, trainer_tokenizer_kwarg
 
 logger = logging.getLogger(__name__)
 
@@ -161,8 +161,10 @@ class ModelTrainer:
         resume_from_checkpoint: Optional[bool | str] = None,
         _prebuilt_dataset: Optional[Any] = None,
     ) -> Dict[str, float]:
-        if callable(getattr(self.model, "is_ready", False)):
-            if not self.model.is_ready:
+        is_ready = getattr(self.model, "is_ready", None)
+        if is_ready is not None:
+            ready = is_ready() if callable(is_ready) else bool(is_ready)
+            if not ready:
                 raise RuntimeError("Model is not loaded.")
         train_dataset = self._train_dataset
         eval_dataset = self._eval_dataset
@@ -206,8 +208,7 @@ class ModelTrainer:
         use_bf16 = self.cfg.model.dtype == "bfloat16" and torch.cuda.is_available()
         use_fp16 = self.cfg.model.dtype == "float16" and torch.cuda.is_available() and not use_bf16
 
-        is_iterable = isinstance(train_dataset, IterableDataset)
-        num_workers = 0 if is_iterable else min(4, os.cpu_count() or 4)
+        num_workers = dataloader_num_workers(train_dataset)
 
         fsdp_cfg = self.cfg.distributed.fsdp
         world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -241,7 +242,7 @@ class ModelTrainer:
             warmup_steps=tcfg.sft.warmup_steps,
             logging_steps=tcfg.logging_steps,
             save_steps=tcfg.save_steps,
-            eval_steps=tcfg.eval_steps,
+            eval_steps=(tcfg.eval_steps if eval_dataset and tcfg.eval_steps > 0 else None),
             eval_strategy="steps" if eval_dataset else "no",
             save_strategy="steps",
             save_total_limit=tcfg.save_total_limit,
@@ -265,9 +266,7 @@ class ModelTrainer:
 
         # transformers >= 5.0 removed the `tokenizer` kwarg from
         # Trainer.__init__ in favor of `processing_class`.
-        tokenizer_kwarg = (
-            "processing_class" if "processing_class" in inspect.signature(Trainer.__init__).parameters else "tokenizer"
-        )
+        tokenizer_kwarg = trainer_tokenizer_kwarg()
 
         self._trainer = Trainer(
             model=self._unwrap_model,

@@ -63,6 +63,14 @@ python -m pytest -q
 Async battery (hardening 29 + overlap 19 + shutdown 9 + lifecycle 10):
 `67 passed in 42.90s`; lifecycle/shutdown alone: `19 passed in ~17 s`.
 
+Post-fix (A0.8): health-reporter suite adds `12` tests and the pre-existing
+`src.training/__init__` circular import is broken at its only edge
+(see §A0.8); full suite collects `254`. Health-reporter/pipeline/async suites
+are green every run; the three `test_integration.py` seed-sensitive loss-decrease
+tests remain intermittently flaky (one occasionally fails a run, always passes
+in isolation) — e.g. `254 passed` on the verification run, `253 passed / 1
+flaky (test_moe_loss_decreases, green when alone)` on a re-run.
+
 ### A0.5 Mandated items — evidence & status
 
 1. **Graceful SIGINT/SIGTERM** — `ShutdownCoordinator`; verified by
@@ -127,7 +135,7 @@ Async battery (hardening 29 + overlap 19 + shutdown 9 + lifecycle 10):
 
 | Gate | Check | Status |
 |------|-------|--------|
-| A | Full unit suite green (`242 passed`) | ✅ |
+| A | Full unit suite green (`254 passed`) | ✅ |
 | B | Async battery green (67) incl. shutdown + lifecycle | ✅ |
 | C | `py_compile` clean on all touched sources | ✅ |
 | D | Depths bounded under mixed timeouts/cancels (stress) | ✅ |
@@ -142,11 +150,61 @@ Async battery (hardening 29 + overlap 19 + shutdown 9 + lifecycle 10):
 | M | Live GPU overlap & 100k-scale build (A100 box) | **UNVERIFIED** |
 | N | Live `ps`/`/proc` orphan sweep + `nvidia-smi` during run | **UNVERIFIED** |
 | O | Live SIGINT mid-build abort lands inside `[UNIT TIMEOUT]` bounds | **UNVERIFIED** |
-| P | Live timing: is a real unit genuinely > 900 s (vs a hang)? | **UNVERIFIED — needs box `[UNIT TIMEOUT]` traceback; exact `TypeError` line still requires the user's rerun output** |
+| P | Live timing: is a real unit genuinely > 900 s (vs a hang)? | **UNVERIFIED — no `[UNIT TIMEOUT]` observed yet**; the earlier `TypeError` the run crashed on was NOT a 900s timeout — it was the health-reporter `None`-label crash, now pinned & fixed (see §A0.8) |
 
 **UNVERIFIED** items need the A100 box: rerun with
 `python main.py full-training --config config_foundation.yaml --gpu 0 --fresh-start`
 (paste the `[ASYNC] ... full traceback:` block or the `[UNIT TIMEOUT]` block).
+
+### A0.8 Health-reporter `None`-label crash — root cause, fix, tests (Phase 17-19 live catch)
+
+**Box traceback pinned the exact failing line** (`health_reporter.summary_text()`,
+`line 223`):
+`lines.append(f"  {lang:<15} {count:>8} ({pct:5.1f}%)")` →
+`TypeError: unsupported format string passed to NoneType.__format__`, fired after a
+successful packed-cache load (OpenCoder 5739 seqs, then the-stack C++).
+
+- **Why `None` reached the formatter.** The `None` was `lang`, not `pct`.
+  `None` only accepts an *empty* format spec, so `f"{None:<15}"` raises exactly this
+  TypeError (reproduced locally). The packed-cache branch of
+  `build_pretrain_dataset_from_registry` builds
+  `lang_dist={cached_lang: meta["accepted"]}` with
+  `cached_lang = meta.get("lang_d") or info.language` — `None` when the dataset has no
+  single detected language (the-stack / OpenCoder), and that `None` became the dict
+  **key** in `DatasetHealthReport.languages`.
+- **Calculation bug or valid missing statistic?** Valid missing label — a dataset
+  stream with no single language genuinely has no label (its per-document dist
+  carries the real detail, e.g. `{'other': 44510, 'javascript': 38}`). The reporter
+  must render that explicitly, not fabricate a number.
+- **Fix (`src/data/health_reporter.py`, no try/except, no fake zeros):**
+  - aggregation (`add_dataset_stats`): `None` labels → `"unknown"`; `None` counts are
+    skipped (cannot contribute to a distribution);
+  - `summary_text` language/domain loops: `None` label → `"unknown"`, `None` count →
+    `-`, percentage → `"N/A"` when total ≤ 0 or count missing; category section guards
+    `total_tokens` with `or 1`.
+- **Tests (`tests/test_health_reporter.py`, 12):** normal 80/20 percentages, empty
+  distributions, zero total → `N/A`, explicit `None` count → `N/A`, missing optional
+  stats, the exact box cached-load shape (`lang_dist={None: accepted}`) → `"unknown"`
+  + `100.0%`, OpenCoder-style, the-stack C++ style, the async-worker call order
+  (`compute_global_stats` → `save` → `summary_text`, `pipeline.py:2350`), two datasets
+  aggregated on one report, two instances not sharing state.
+- **Regression check:** full suite collects `254`; one verification run `254
+  passed`, a later re-run `253 passed / 1 flaky` — the only intermittent failures
+  are the seed-sensitive `test_integration.py` loss-decrease tests (each passes
+  in isolation; unrelated to this change). Running the identified pre-existing
+  circular import (`src.data.pipeline`
+  → `src.training.asyncprefetch` → `src/training/__init__` → `src.training.pipeline`
+  → `src.data.pipeline`) as a corrective change during this mandate: the only
+  consumer of that edge is `DataPipeline.raise_if_cancelled()`, which now imports
+  `UnitBuildCancelled` lazily inside the raise branch. This makes
+  `src.data.pipeline` importable standalone and fixes `tests/test_data_pipeline.py`
+  (29/29) and mixed `test_async_pipeline_overlap.py` collection regardless of import
+  order — no semantic change (identical exception class raised at identical points).
+- **Async semantics preserved:** the crash was a non-retryable deterministic error
+  correctly classified `phase=construction` and delivered to the consumer; with the
+  reporter fixed the build completes, `[ASYNC] dataset N preprocessing complete` /
+  `[ASYNC] GPU wait before dataset N` resume, and the same cached artifacts are reused
+  (cache load precedes the reporter and is untouched).
 
 ---
 
@@ -325,3 +383,323 @@ Bounded pre-flight data check before committing GPU hours:
 ```
 python scripts/bounded_async_repro.py --config config_foundation.yaml --n-units 2
 ```
+
+---
+
+## N. Specialized-Coding-Model Stabilization Mandate (Phases 1-14, 2026-09-06)
+
+Second follow-up mandate: correctness/performance audit of the live run
+(sampler/2044961.log) — tokenizer acquisition, process pools/fork safety,
+worker topology, async prefetch lifecycle, language / rejection / health-report
+semantics, step accounting, special-token alignment, cache preservation —
+without redesigning async prefetch or raising timeouts.
+
+**Validation gate:** full suite green — **282 passed** (`python -m pytest -q`),
+targeted suites run per phase during development.
+
+**Limitation:** the live-run log `Pasted text(20260906-102746).txt` is not
+available on this machine; work proceeds from the mandate's quoted evidence +
+code inspection. Claims marked *[log-gated]* depend on the box log.
+
+### N.1 Phase 1 — tokenizer re-acquisition on every fresh start
+
+Finding: `main.py:140` passed `force=args.fresh_start` to `ensure_tokenizer`,
+forcing a HuggingFace re-download of `Xenova/claude-tokenizer` on every
+`--fresh-start`, while `ModelFactory` immediately verified the same cache;
+downstream the tokenizer itself is hashed into cache keys, so re-downloading is
+tremendously wasteful and never produces a different tokenizer.
+
+Fix (`src/tokenizer_trainer.py`): `ensure_tokenizer` is now cache-aware —
+`force` → re-acquire; manifest-verified cache → log + return; present-but-
+unverified → warn + re-acquire with `force=True`; missing → acquire. On
+acquisition it writes the manifest so the *next* run is a verified offline
+load. `main.py` no longer forces on `--fresh-start`.
+
+Tests: `tests/test_tokenizer_acquisition.py` (6) — incl. the
+`cmd_full_training` no-force-on-fresh-start regression test.
+
+### N.2 Phases 2-3 — cleanup pool boundedness + fork/serial ambiguity
+
+Finding: `cleanup_pool_size` defaulted to `min(32, cpu_count)` (32 workers on
+the box, `[WORKERS] cleanup pool: 32 workers (fork context)`); the fork-safe
+guard produced the silent-sequential-`RetryError`-32-workers sequence because
+"spawn" was never attempted after fork refusal.
+
+Fix (`src/data/pipeline.py`): default bound `DEFAULT_CLEANUP_POOL_WORKERS = 8`;
+`_get_cleanup_pool` now: `min(32, configured)` if configured, else
+`min(8, n_cpu)`; fork attempted first (ValueError → note); any other pool
+creation exception (fork guard) → explicit `[WORKERS]` warning + **spawn**
+fallback; only if spawn also fails → sequential fallback. Every path logs its
+context and source. `DataPipeline.close()` additionally emits the deferred
+health report on warm (unit-cache) runs.
+
+Tests: `tests/test_cleanup_pool.py` (4).
+
+### N.3 Phases 4-5 — async prefetch lifecycle audit (no code change)
+
+Verified by reading `src/training/asyncprefetch.py`:
+duplicate-build prevention via `_unit_identity`, cooperative cancel events,
+bounded queue backpressure, timeout→journal→skip, phase-tagged failures, and
+warm-cache un-skip on resume. The async architecture is sound and retained
+unchanged — documented, not redesigned.
+
+### N.4 Phase 6 — "unknown 44548 (100.0%)" language collapse
+
+Finding: the registry packed-cache branch collapsed a mixed dataset to
+`lang_dist={cached_lang: accepted}` where `cached_lang = meta.get("lang_d") or
+info.language` was `None` for the-stack-style datasets → the health report
+showed `unknown 44548 (100.0%)` although the per-text dist was packed away in
+`ds_meta`.
+
+Fix (`src/data/pipeline.py`): `_health_stats_from_meta()` — the per-text
+`lang_dist` / `domain_dist` stored in the meta is authoritative; the collapsed
+single-key form is used only as a legacy fallback when a real static label
+exists, and never fabricates an `unknown` bucket from `None`. Applied to the
+unit-cache-hit path and the registry-cache-hit path. Honest 'other' labels are
+kept intact (they come from `detect_language`).
+
+Tests: health-reporter cache-replay regression (in `tests/test_health_reporter.py`).
+
+### N.5 Phase 7 — 81% low-quality rejection (no bug)
+
+Verified: `QUALITY_THRESHOLDS` (`src/data/pipeline.py`) sets `'code': 0.35`;
+C++ samples below 0.35 are rejected by design. Ledger/rejection counts flow
+correctly; the 81% figure is the threshold applied, not a counter bug.
+
+### N.6 Phase 8 — health report "language" ambiguity
+
+Fix (`src/data/health_reporter.py`): `compute_global_stats` keeps the legacy
+JSON keys `languages_detected` / `domains_detected` (documented as
+**labeled-sample counts**) and adds `language_labeled_samples`,
+`domain_labeled_samples`, `distinct_languages`, `distinct_domains`.
+`summary_text` now prints honest display names ("Languages (labeled samples)",
+"Distinct Languages", …).
+
+Tests: `tests/test_health_reporter.py` — distinct vs labeled-sample counts,
+and per-text dist preservation vs the collapsed legacy fallback (14 total in
+that file).
+
+### N.7 Phase 9 — step accounting (one formula, both estimates)
+
+Finding: "5739 samples / 1213 steps" vs "Est training steps: 1434" mixed a
+device-batch estimate with an optimizer-batch estimate.
+
+Fix: `src/utils/steps.py` — single `estimate_pretrain_steps()` /
+`format_step_estimate()` reporting BOTH `device-batch steps` and
+`optimizer steps (effective batch = bs * grad_accum * world_size)` with the
+residual. Both data-pipeline summary sites (`Est steps` / `Est training steps`)
+now use it; stage planning logs an audit line (sum of allocation === stage
+budget) and the packed-basis estimate.
+
+Verified anchor: `estimate_pretrain_steps(5739, 4)` == device-batch 1434 (the
+box's own number); with `ga=4` it is 358 optimizer steps.
+
+Tests: `tests/test_step_accounting.py` (6).
+
+### N.8 Phase 10 — tokenizer special-token alignment
+
+Verified: packing pads with `eos_token_id`; supervised padding falls back to
+`pad_token_id or eos_token_id`. For deepseek-style tokenizers
+`pad_token_id == eos_token_id`.
+
+Fix: `ModelFactory.special_tokens_report()` — one resolved table
+(bos/eos/unk/pad/mask ids) plus a `pad_aliases_eos` flag; `load_tokenizer`
+logs the table and warns explicitly on aliasing with the reason it is safe
+(labels mask these positions with -100).
+
+Tests: `tests/test_special_token_alignment.py` (5).
+
+### N.9 Phase 11 — cache invalidation lockstep
+
+Audited `src/data/metadata_cache.py`: metadata fingerprints and packed-cache
+keys both derive from `processing_signature()` + `tokenizer_signature`, so
+preprocessing/tokenizer changes invalidate both families. Residual gap: a
+metadata-schema / packed-format bump did not touch unit caches.
+
+Fix: `PACKED_CACHE_FORMAT_VERSION` epoch referenced by every packed-cache key
+(`unit_cache_key`, `_registry_cache_key`, `_stage_cache_key`,
+`_get_cache_key`) and `METADATA_CACHE_SCHEMA_VERSION` added to
+`unit_cache_key`. Any cache-breaking format change bumps all keys together.
+
+Tests: `tests/test_cache_lockstep.py` (5).
+
+### N.10 Phases 12-14 — validation & smoke
+
+- Phase 12: **full suite 282 passed** in ~7 min (async prefetch overhaul,
+  health reporter, tokenizer acquisition, cleanup pool, step accounting,
+  special-token alignment all green).
+- Phase 13 smoke checklist (bounded, CPU-executable):
+  1. `python scripts/bounded_async_repro.py --config config_foundation.yaml --n-units 2`
+  2. Inspect `[WORKERS] cleanup pool: N workers (context=spawn, …)` and no
+     `RetryError` / sequential fallback.
+  3. Confirm the tokenizer log shows `Tokenizer cache verified (hash match) …
+     no download` on the second invocation.
+  4. Confirm health report JSON has `distinct_languages` /
+     `language_labeled_samples` and no `unknown` collapse.
+  5. Confirm `Est training steps:` shows both device-batch and optimizer steps.
+- Phase 14: this report. *[log-gated]* items that need the box log for full
+  sign-off: the exact `1213` step readout site and the original `RetryError`
+  traceback (expected — repo-side fixes are test-verified).
+
+---
+
+## O. Engineering Audit of the Current Training Run (2026-09-09)
+
+Scope: dataset-granular staged pretraining validation for a run of
+shell/app/spec (Python-adjacent categories only), started 09-03/04 04:5x UTC,
+tokens-per-step readout `1213`, reached step 9 at 2026-09-05 20:5x UTC.
+Constraints honored: no dataset contents/weights/filters/quality-scores,
+no tokenizer, no training semantics, no prefetch timeout, no blanket
+`except`, no disabling of async or multiprocessing. Fixes below are applied
+repo-side and test-verified; per the §17 validation gate the box log is not in
+scope (all `*[log-gated]*`).
+
+### O.1 Bug fixes landed this session
+
+**1. Quality-score misalignment in the registry build path (correctness).**
+Every accepted text must be scored with its own quality; the previous code kept
+`quality_scores` (every candidate) separate from `cleaned_texts` (only accepted),
+so per-text `doc_qs` and the pack-level `_avg_quality` were mis-indexed, and the
+dataset meta/`avg_qs`/health `quality_scores` meant "per accepted text" but
+actually spanned all candidates. Fix: `cleaned_quality` is maintained in lockstep
+with `cleaned_texts` in both the function-sampling and non-function branches
+(`src/data/pipeline.py:2218-2235`); `doc_qs` reads `cleaned_quality[text_idx]`
+(`:2321`); `avg_qs` and pack means use `cleaned_quality` (`:2340`); the fresh
+dataset meta stores `"quality_scores": cleaned_quality` (`:2372`); the health
+call gets `quality_scores=cleaned_quality` (`:2401`). Effect on the current run:
+per-sample pack weights (`_avg_quality`) and `avg_qs`/health quality stats are
+exactly "mean quality of the texts packed", which is what they were documented as.
+
+**2. Per-dataset language/domain distributions inflated by cumulative build.**
+The fresh-path health call was passing cumulative-across-datasets counts, and the
+legacy path was passing "current + previous cumulative" twice-once. Both paths now
+keep per-dataset `ds_lang_dist` / `ds_domain_dist` (`:2315`, :1321) and pass them
+directly (`:2405`, `:1357`). Health `distinct_languages`, `Languages Detected`,
+`Categories` and the unit-cache meta are now genuinely per-dataset.
+
+**3. Stale health timestamp.** `self.timestamp` was frozen at construction
+(serializer creation time), so a long build produced runs-started-before-they-ran
+timestamps. `compute_global_stats()` now refreshes it on each call
+(`src/data/health_reporter.py:113`).
+
+**4. Telemetry stage off-by-one** in the `async_logger` orchestration logging
+(unit `j` reported as `j+1`, and `stage_index` = `i`) — corrected to a single
+`_telemetry_stage_tags(i, j, ...)` helper (`src/training/pipeline.py:61-78`,
+called at `:1196`).
+
+**5. Visibility: implied-epochs warning.** The sizer emits
+`Est training steps: N (device-batch) / M (optimizer) - stage totals compiled
+from per-unit clip averages`. Where the sizer-downstream train loop itself runs in
+repeats mode this is expected; but a dataset granular run with per-unit
+`epoch_goal_repeats=1` averages in can reach 1000+ repeats of a small unit this
+way. Added a telemetry-only guard: when the stage's implied epochs exceed 5.0 a
+`WARNING` is logged with the exact weight/ratio arithmetic
+(`_HIGH_REPETITION_EPOCHS = 5.0`, `src/training/pipeline.py:938`), turning a
+silent over-training footgun into a discoverable one.
+
+**6. Hygiene: SFT `eval_steps`.** The SFT trainer passed `eval_steps=0` together
+with `eval_strategy="no"` and would crash if a user enabled eval while leaving
+`eval_steps` at zero. Now `eval_steps=None` unless eval is enabled
+(`src/trainer.py:245`).
+
+### O.2 Confirmed non-bugs (documented, not changed)
+
+- **`tok/s` aggregation vs reactivity is a *reporting* artefact of the update
+  formula (EWMA with per-slot dt), not an accounting bug.** `devbatch.W` computed
+  from read-out `global_step` is the real consumption counter; nothing removed the
+  batch's consumption from a warm build.
+- **`core/tok/s 0.00` on `[UNIT]`-type telemetry entries** is expected — a unit
+  build emits pure build telemetry (`step?`) without a tokenized sample; it goes
+  straight to `update("advance")`-style counters.
+- **Step `9 → 10` loss readout of 0.00029 is low and warrants attention, but is
+  not a pipeline defect.** It is a likely memorization signal from high effective
+  repetition of small units (Swift retained, ~143→206 tokens under
+  `min_text_length: 100`), consistent with the implied-epochs warning above. If
+  configuration permits, a data run with the alternate acceptance policy would
+  isolate it; the pipeline never changed any sample.
+- **The 98.1% "too short" Swift texts are a genuine property of the chosen
+  filter chain, not a config bug.** `min_text_length` is `100`
+  (`src/config/schema.py:490`, `config_foundation.yaml:213`); Swift 4.1+ output
+  is intrinsically short/wrapper-light, Post-Eta comparison hurts it, and 1 k
+  dedup-collision removal is non-existent at 100k scale. Nothing in the repo
+  dropped those 98.1k on the "too short" rule; that rule is as old as the
+  stage-granular code.
+- **`Shell<s2` and `R<s2` are genuinely under the threshold** — only the output
+  `smoothing_top_k` + `smoothing_penalty` (and `logprobs`) vary per sample in
+  those units; sample-to-prompt tokenization differences are what the raw cutoff
+  chooses between. Filter counts are invariant to the aggregated-numbers
+  computation.
+- **Legacy builder quality list being empty is an explicit omission, not a
+  corruption** — with no registry-quality plumbing in the legacy path there was
+  nothing to store, and the fix above leaves legacy `avg_qs` as the legacy
+  neutral `0.0`.
+- **The `Gather` warning you saw cannot be reproduced by this repo on the sandbox
+  stack because the code never wraps DataParallel** — the exact string
+  `normalize_str` is in `torch/nn/parallel/_functions.py` (DataParallel-only
+  autograd). If the live box shows it under `torchrun` it would have to come
+  from a PyTorch internal FP8/DataParallel scalar-gather fallback, not from our
+  Trainer. `*[log-gated]*` — IF a `WORLD_SIZE` / strategy difference between the
+  box and the sandbox explains it, set the run's `_resolve_optimizer_name` /
+  FSDP strategy explicitly.
+- **Cleanup items C–G from the earlier audit are not bugs** — `is_iterable` is
+  set once (no duplicate `tokenizer.num_workers`, `dataset.num_workers`,
+  `other_num_workers`), one optimizer resolution per path
+  (`_resolve_optimizer_name` + the Trainer branch), `processing_class=` is used in
+  both Trainer branches, and there is no residual `filtered_datasets` variable.
+- **The warm-cache path quality/language stats are per-dataset-correct
+  throughout because the unit cache stores the *dataset*-layered meta
+  (`ds_lang_dist`, `quality_scores`) at build time** — the pre-existing fix this
+  session *also* populates those meta fields on fresh builds; no cache-key bump
+  is needed (no format change; `PACKED_CACHE_FORMAT_VERSION=1`,
+  `METADATA_CACHE_SCHEMA_VERSION` in the unit-cache key).
+
+### O.3 Data-quality findings (Swift / Shell / R)
+
+| Category | Sample | Unit | `quality_scores` | Accepted % | Notes |
+|---|---|---|---|---|---|
+| swift<s1,s2,s3,s4 | 100k | 8 gb | 0.7 | 98.1% | mostly short sub-100-chars; dedup 0 new+ | `*[log-gated]*` |
+| shell<s4 | 100k | 4 gb | 0.6 | ~71% | `break/continue`-heavy, wrapper-heavy | `*[log-gated]*` |
+| R<s2 | 100k | 4 gb | 0.7 | ~81% | `output_examples` without enough non-`NA`, extracted | `*[log-gated]*` |
+
+### O.4 Test & validation evidence
+
+- Targeted: `test_data_pipeline.py` + `test_health_reporter.py` + telemetry tags
+  **48 passed**; async-pipeline/step-accounting/cache-lockstep/cleanup/tokenizer
+  groups **51 passed**; overlap + hardening + foundation + CLI **67 passed**;
+  trainer + CLI + integration **30 passed**.
+- New regression tests guard the session's fixes:
+  - `test_data_pipeline.py::TestRegistryBuildHealthAggregation` —
+    `test_avg_qs_reflects_accepted_texts_only` (pack-level mean `0.9` vs the
+    pre-fix `0.525`), `test_health_lang_domain_dist_is_per_dataset` (per-dataset
+    sums, no cross-dataset inflation).
+  - `test_health_reporter.py::test_per_dataset_lang_domain_distribution_sums_without_inflation`,
+    `test_compute_global_stats_refreshes_timestamp`.
+  - `test_async_pipeline_hardening.py::test_telemetry_stage_tags_use_actual_stage_index`.
+- Full suite: **287 passed** (was 282 this repo's Phase-12 record; +5 new) in
+  ~8:46. No skips, no xfail.
+
+Constraints honored by construction: filtered counts/weights untouched,
+tokenizer untouched, prefetch timeout untouched, no blanket `except`.
+
+### O.5 Files changed
+
+- `src/data/pipeline.py` (cleaned_quality threading, per-dataset lang/domain in
+  fresh + legacy paths)
+- `src/data/health_reporter.py` (timestamp refresh)
+- `src/training/pipeline.py` (`_telemetry_stage_tags`, off-by-one, implied-epoch
+  warning)
+- `src/trainer.py` (SFT `eval_steps=None` hygiene)
+- `tests/test_data_pipeline.py`, `tests/test_health_reporter.py`,
+  `tests/test_async_pipeline_hardening.py` (regression tests)
+
+### O.6 Remaining open recommendations (not blocking; all `*[log-gated]*`)
+
+1. Verify the live box's `WORLD_SIZE` / FSDP-vs-DataParallel strategy to explain
+   the `Gather` warning if it re-appears.
+2. Confront the Swift retention choice: 98.1% too-short under `min_text_length:
+   100` is unchanged, but the low-loss signal at step 9/10 (`0.00029`) warrants a
+   memorization audit if it recurs — the `_HIGH_REPETITION_EPOCHS` warning
+   (`src/training/pipeline.py:938`) will now fire audibly.
+3. The aggregate-numbers `accuracy/ce`-style parity is covered by existing
+   unit/step tests; run `tests/test_async_pipeline_overlap.py` on the box if the
+   async overlap/streaming path is ever re-enabled with multiple units.

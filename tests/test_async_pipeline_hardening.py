@@ -31,7 +31,7 @@ from src.training.asyncprefetch import (
     _tag_phase,
     UnitPrefetch,
 )
-from src.training.pipeline import _FailureJournal
+from src.training.pipeline import _FailureJournal, _telemetry_stage_tags
 
 
 def _fast_pf(build_fn, total, depth=2, timeout=5.0, retries=0, cache_status=None,
@@ -1015,6 +1015,22 @@ def test_telemetry_failure_does_not_crash_training(monkeypatch):
     assert snap["samples"] == 2
     assert "gpu" in line
     assert "n/a" in line
+
+
+# ---------------------------------------------------------------------------
+# Audit: telemetry stage numbering is the ACTUAL 1-based stage index
+# ---------------------------------------------------------------------------
+
+def test_telemetry_stage_tags_use_actual_stage_index():
+    """The telemetry log line must carry the real stage group index. The box
+    run reported `stage=2` while training stage 1 because the caller added one
+    on top of an already 1-based loop index (`enumerate(stages, 1)`)."""
+    assert _telemetry_stage_tags(1, 1, 10, 0, 4) == {
+        "stage": 1, "unit": "1/10", "dataset": "1/4"}
+    assert _telemetry_stage_tags(2, 5, 24, 3, 6) == {
+        "stage": 2, "unit": "5/24", "dataset": "4/6"}
+    assert _telemetry_stage_tags(3, 8, 9, 9, 9) == {
+        "stage": 3, "unit": "8/9", "dataset": "10/9"}
 
 
 # ---------------------------------------------------------------------------

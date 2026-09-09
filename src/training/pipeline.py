@@ -54,6 +54,31 @@ def _prefetch_enabled(staging: Any, async_cfg: Any) -> bool:
     return bool(getattr(async_cfg, "enabled", True))
 
 
+# Optimizer steps per packed-sample implied by the step allocation beyond
+# which a dataset is being replayed so many times that loss reduction is
+# almost certainly memorization. Logged as a warning only — never changes
+# scheduling (small datasets legitimately get repeated coverage).
+_HIGH_REPETITION_EPOCHS = 5.0
+
+
+def _telemetry_stage_tags(stage_index: int, unit_index: int, n_units: int,
+                          dataset_index: int, n_train: int) -> Dict[str, str]:
+    """Stage/unit/dataset identifiers for the telemetry log line.
+
+    ``stage_index`` is the 1-based position of the stage group (the loop
+    enumerates stages starting at 1), ``unit_index`` the 1-based registry
+    position, and ``dataset_index`` the 0-based index into the trainable units
+    scheduled for THIS stage (they can differ from the registry position when
+    units were skipped). Callers must pass the ACTUAL stage index — the box
+    run once reported ``stage=2`` while training stage 1 because the caller
+    added one on top of an already 1-based index."""
+    return {
+        "stage": stage_index,
+        "unit": f"{unit_index}/{n_units}",
+        "dataset": f"{dataset_index + 1}/{n_train}",
+    }
+
+
 class _FailureJournal:
     """Per-run failure journal. Identical fingerprint on the next launch causes
     the same units to be skipped (deterministic resume) instead of
@@ -815,6 +840,26 @@ class TrainingPipeline:
                         alloc.append(0)  # step budget exhausted — unit gets no steps
                 logger.info("[UNIT] stage %d — %d datasets, step allocation basis: %s",
                             i, len(units), sizing_basis)
+                # Step accounting audit (mandate Phase 9): the planner must
+                # consume the stage budget exactly (sum(alloc) == s.steps), and
+                # the data-side packed estimate is reported with the SAME
+                # formula (src.utils.steps) so the "Est training steps" numbers
+                # from DataPipeline and the per-stage allocation reconcile.
+                if sum(alloc) != s.steps:
+                    logger.warning("[UNIT] stage %d step allocation does NOT sum to "
+                                   "the stage budget (%d != %d) — accounting drift",
+                                   i, sum(alloc), s.steps)
+                if sizing_basis == "packed":
+                    from src.utils.steps import estimate_pretrain_steps, format_step_estimate
+                    ga = int(getattr(stage_cfg, "gradient_accumulation_steps", 1) or 1)
+                    bs = int(getattr(stage_cfg, "batch_size", 1) or 1)
+                    _est = estimate_pretrain_steps(
+                        sum(c for c in cached_counts if c), bs,
+                        gradient_accumulation_steps=ga,
+                        world_size=int(os.environ.get("WORLD_SIZE", "1") or 1))
+                    logger.info("[UNIT] stage %d packed-basis step accounting: %s "
+                                "| planner optimizer budget=%d (%d units)",
+                                i, format_step_estimate(_est), s.steps, len(units))
                 plan = []
                 for j, u in enumerate(units, 1):
                     unit_end = prev_end + sum(alloc[:j])
@@ -881,6 +926,25 @@ class TrainingPipeline:
                 gb = self._global_batch(stage_cfg)
                 seq_len = int(getattr(self.cfg.training, "max_seq_length", 4096) or 4096)
                 tokens_per_step = gb * seq_len
+
+                # Memorization-risk visibility (logging only — scheduling is
+                # untouched): a small packed dataset that receives many
+                # optimizer steps is replayed implied_epochs times. Flag it so
+                # the operator can distinguish low-loss-from-memorization from
+                # healthy convergence instead of querying it by hand.
+                if sizing_basis == "packed":
+                    for _uj, (_cc, _aa) in enumerate(zip(cached_counts, alloc), 1):
+                        if _cc is not None and _cc > 0 and _aa and _aa > 0:
+                            implied_epochs = (_aa * gb) / float(_cc)
+                            if implied_epochs > _HIGH_REPETITION_EPOCHS:
+                                _uh = plan[_uj - 1]["u"]
+                                logger.warning(
+                                    "[UNIT] %d/%d %s/%s — %d steps x gb=%d vs %d packed seqs "
+                                    "implies ~%.0f dataset repeats — loss on this unit runs "
+                                    "down memorization territory (early epochs expected); "
+                                    "logged for diagnosis, scheduling unchanged",
+                                    _uj, len(units), _uh.path, _uh.name or "default",
+                                    _aa, gb, _cc, implied_epochs)
 
                 n_train = len(next_trainable)
                 prefetch = None
@@ -1129,7 +1193,7 @@ class TrainingPipeline:
                         self.telemetry.set_event("unit_ready_sec", round(build_sec, 1))
                         self.telemetry.set_event("cache_hit_now", int(cache_hit))
                         logger.info("[TELEMETRY] %s", self.telemetry.summary_line(
-                            {"stage": i + 1, "unit": f"{j}/{len(units)}"}))
+                            _telemetry_stage_tags(i, j, len(units), k, n_train)))
                         self.tracker.log_metrics({
                             f"pretrain/stage_{i}/unit_{j}/{k}": v for k, v in metrics.items()})
                         self.tracker.log_metrics({

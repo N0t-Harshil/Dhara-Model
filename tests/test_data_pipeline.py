@@ -169,3 +169,269 @@ class TestDeduplicator:
         dedup.is_duplicate("test")
         dedup.reset()
         assert not dedup.is_duplicate("test")
+
+
+class TestCollectorProductionPathGaps:
+    """_process_entry must cover every format _extract_fields does (it used
+    to silently fall back to raw-text extraction for dolly/flan/orca/tool
+    formats)."""
+
+    def test_process_entry_dolly_format(self):
+        collector = MassiveDataCollector([])
+        entry = {
+            "context": "A long blog post about testing frameworks.",
+            "instruction": "Summarize the post.",
+            "response": "The post argues testing matters for reliability.",
+        }
+        sample = collector._process_entry(entry, "all", [])
+        assert sample is not None
+        assert "blog post" in sample["instruction"]
+        assert "reliability" in sample["output"]
+
+    def test_process_entry_tool_use_format(self):
+        collector = MassiveDataCollector([])
+        entry = {
+            "tool_definition": '{"name": "calculator", "args": ["a", "b"]}',
+            "instruction": "Add 1 and 2.",
+            "response": "The result is 3.",
+        }
+        inst, _, out = collector._extract_fields(entry)
+        assert "calculator" in inst
+        assert out == "The result is 3."
+
+    def test_process_entry_orca_format(self):
+        collector = MassiveDataCollector([])
+        entry = {
+            "system_prompt": "You are a helpful assistant that answers with precision and clarity.",
+            "question": "What is two plus two? Explain your reasoning step by step.",
+            "response": "Four. Two plus two equals four: 2 + 2 = 4, the sum of the two addends.",
+        }
+        sample = collector._process_entry(entry, "all", [])
+        assert sample is not None
+        assert "helpful assistant" in sample["instruction"]
+        assert sample["output"].startswith("Four")
+
+    def test_process_entry_flan_format(self):
+        collector = MassiveDataCollector([])
+        entry = {
+            "inputs": "Translate the following English sentence into French: 'The weather today is beautiful and sunny.'",
+            "targets": "Le temps aujourd'hui est beau et ensoleillé.",
+        }
+        sample = collector._process_entry(entry, "all", [])
+        assert sample is not None
+        assert sample["instruction"].startswith("Translate")
+        assert "ensoleillé" in sample["output"]
+
+
+class TestWeightedMixedDatasetGaps:
+    def test_zero_weights_fall_back_to_uniform(self):
+        from datasets import Dataset
+        from src.data.pipeline import WeightedMixedDataset
+
+        ds1 = Dataset.from_list([{"x": 1}] * 2)
+        ds2 = Dataset.from_list([{"x": 2}] * 2)
+        wm = WeightedMixedDataset(
+            [(ds1, 0.0, "a"), (ds2, 0.0, "b")], total_samples=3,
+        )
+        assert wm.weights == [0.5, 0.5]
+        assert [wm[i]["x"] for i in range(3)]
+
+    def test_exhausted_datasets_start_fresh_pass(self):
+        from datasets import Dataset
+        from src.data.pipeline import WeightedMixedDataset
+
+        ds1 = Dataset.from_list([{"x": 1}])
+        ds2 = Dataset.from_list([{"x": 2}])
+        wm = WeightedMixedDataset(
+            [(ds1, 1.0, "a"), (ds2, 1.0, "b")], total_samples=4,
+        )
+        seen = [wm[i]["x"] for i in range(4)]
+        # Total capacity is 2 — after the first pass a fresh pass must start
+        # (the old code re-sampled consumed indices, fabricating an epoch of
+        # ~100% duplicates).
+        assert len(seen) == 4
+        assert seen.count(1) >= 2
+        assert seen.count(2) >= 2
+
+
+class TestRegistryFallbackOnly:
+    def test_fallback_entries_resolvable_but_never_streamed(self):
+        from src.data.registry import build_registry
+
+        registry = build_registry()
+        assert registry.get_by_path_category("allenai/dolma", "web_text") is not None
+        assert registry.get_by_path_category(
+            "togethercomputer/RedPajama-Data-1T", "web_text") is not None
+        assert registry.get_by_path_category("b-mc2/sql-create-context", "code") is not None
+        streamed = [e.path for e in registry.all_entries()]
+        assert "allenai/dolma" not in streamed
+        assert "b-mc2/sql-create-context" not in streamed
+
+
+class _FakeStreamer:
+    """Iterable stand-in for ShardedStreamIterator with the ``.stats`` surface
+    ``build_pretrain_dataset_from_registry`` and its diagnostics read/write."""
+
+    def __init__(self, records):
+        from types import SimpleNamespace
+
+        self._records = iter(records)
+        self.stats = SimpleNamespace(
+            timings={}, raw_rows=len(records), gated=0, plan=None, record=None,
+            shard_stats={}, shard_streamed={}, shard_accepted={},
+            driver_kind=None, metadata_hit=False, builder_hit=False,
+            repo_resolution_skipped=False, first_resolution=False,
+            script_resumed=False,
+        )
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self._records)
+
+    def close(self):
+        pass
+
+
+class _FakeTokenizer:
+    eos_token_id = 2
+
+    def __call__(self, text, truncation=False, add_special_tokens=False):
+        return {"input_ids": [(ord(c) % 50000) + 3 for c in str(text)][:64]}
+
+
+class TestRegistryBuildHealthAggregation:
+    """Audit regressions on the registry build path.
+
+    * avg_qs / quality stats must come from the ACCEPTED texts only. The old
+      code indexed the all-candidates ``quality_scores`` list with the
+      accepted-text position, so any callback/reject between two accepted
+      texts shifted doc_qs and biased avg_qs low (mean over every scored
+      candidate, rejections included).
+    * add_dataset_stats must receive each dataset's OWN lang/domain
+      distribution — the old code passed the run-global cumulative dict, so a
+      multi-dataset build doubled every label's count in the health report.
+    """
+
+    def _fake_pipe(self, health_report):
+        from types import SimpleNamespace
+
+        from src.data.pipeline import DataPipeline
+
+        pipe = DataPipeline.__new__(DataPipeline)
+        pipe.cfg = SimpleNamespace(
+            data=SimpleNamespace(
+                preprocessing=SimpleNamespace(
+                    remove_boilerplate=False, min_text_length=1,
+                    license_keywords=[], boilerplate_file_patterns=[]),
+                quality=SimpleNamespace(
+                    deduplication=SimpleNamespace(method="exact", threshold=0.85)),
+                ast_filter=SimpleNamespace(code_filtering=False),
+                function_sampling=SimpleNamespace(enabled=False),
+                sampler=SimpleNamespace(balance_by="samples"),
+                language_balancing=SimpleNamespace(enabled=False,
+                                                   target_distribution=None),
+                domain_balancing=SimpleNamespace(enabled=False, include=None),
+                use_packed_cache=False,
+                cache_dir=".",
+                health_reporting=SimpleNamespace(enabled=False, output_dir=""),
+                sanity_checks=SimpleNamespace(enabled=False),
+                dataset_policies=[],
+                shard_workers=4,
+                max_samples_per_dataset=1000,
+                bottleneck_threshold_sec=None,
+                acceptance_investigation_threshold=0,
+            ),
+            training=SimpleNamespace(
+                max_seq_length=64,
+                pretrain=SimpleNamespace(batch_size=8,
+                                         gradient_accumulation_steps=1)),
+            model=SimpleNamespace(architecture=SimpleNamespace(vocab_size=65536)),
+        )
+        pipe.health_report = health_report
+        pipe.tokenizer = _FakeTokenizer()
+        pipe.contamination = SimpleNamespace(is_contaminated=lambda text: False)
+        pipe.exact_dedup = SimpleNamespace(is_duplicate=lambda text: False)
+        pipe._prefetch_driver = lambda *a, **k: None
+        pipe._get_cleanup_pool = lambda *a, **k: None
+        return pipe
+
+    def _records_for(self, texts):
+        return [{"output": t, "_shard": 0, "file_path": ""} for t in texts]
+
+    def _run_build(self, monkeypatch, records_by_name, score_map):
+        from src.data.health_reporter import DatasetHealthReport
+        from src.data.registry import build_registry
+
+        health = DatasetHealthReport("audit-registry")
+        pipe = self._fake_pipe(health)
+
+        def fake_qs(text, cat, lang):
+            return score_map[text]
+
+        monkeypatch.setattr("src.data.pipeline._pool_quality_score", fake_qs)
+        pipe._stream_sharded = (
+            lambda info, registry, limit, policy: _FakeStreamer(
+                self._records_for(records_by_name[info.name])))
+        result = pipe.build_pretrain_dataset_from_registry(
+            include=[("bigcode/the-stack-v2-dedup", "Python"),
+                     ("bigcode/the-stack-v2-dedup", "C++")])
+        health.compute_global_stats()
+        return result, health
+
+    def test_avg_qs_reflects_accepted_texts_only(self, monkeypatch):
+        text_p = ["def add(a, b): return a + b",  # accepted (0.95)
+                  "x",                            # too low quality -> rejected
+                  "def j(): return 2"]            # accepted (0.85)
+        text_c = ["int main(){return 0;}",        # accepted (0.80)
+                  "y"]                            # rejected (0.20)
+        result, health = self._run_build(
+            monkeypatch,
+            records_by_name={"Python": text_p, "C++": text_c},
+            score_map={
+                "def add(a, b): return a + b": 0.95,
+                "x": 0.10,
+                "def j(): return 2": 0.85,
+                "int main(){return 0;}": 0.80,
+                "y": 0.20,
+            })
+        metas = result._dataset_metas
+        assert len(metas) == 2
+        # Accepted-only quality, in dataset order (Python unit then C++ unit).
+        assert len(metas[0]["quality_scores"]) == 2
+        assert sum(metas[0]["quality_scores"]) == pytest.approx(1.80)
+        assert metas[0]["avg_qs"] == pytest.approx(0.90)
+        assert len(metas[1]["quality_scores"]) == 1
+        assert metas[1]["avg_qs"] == pytest.approx(0.80)
+        # Packed per-pack means use each accepted text's own score. Before the
+        # fix, the rejected text's score was mis-indexed into the second
+        # accepted text (pack1 mean = (0.95 + 0.10)/2 = 0.525, not 0.9).
+        py_rows = result._entries[0][0].to_list()
+        assert [float(r["_avg_quality"]) for r in py_rows] == pytest.approx([0.9])
+        cpp_rows = result._entries[1][0].to_list()
+        assert [float(r["_avg_quality"]) for r in cpp_rows] == pytest.approx([0.8])
+        # Health report per-dataset means match the accepted texts.
+        means = sorted(e["quality_scores"]["mean"] for e in health.datasets)
+        assert means == pytest.approx([0.80, 0.90])
+        assert health.global_stats["average_quality_score"] == pytest.approx(0.85)
+
+    def test_health_lang_domain_dist_is_per_dataset(self, monkeypatch):
+        # All accepted — the regression is that the run-global cumulative
+        # dict was passed per dataset, doubling every label's count on a
+        # multi-dataset build (2 datasets -> 2x inflation).
+        text_p = ["def add(a, b): return a + b",
+                  "def sub(a, b): return a - b",
+                  "def mul(a, b): return a * b"]
+        text_c = ["int main(){return 0;}",
+                  "int f(int x){return x + 1;}"]
+        all_texts = text_p + text_c
+        _, health = self._run_build(
+            monkeypatch,
+            records_by_name={"Python": text_p, "C++": text_c},
+            score_map={t: 0.9 for t in all_texts})
+        expected = len(all_texts)
+        assert sum(health.languages.values()) == expected
+        assert sum(health.domains.values()) == expected
+        assert health.global_stats["languages_detected"] == expected
+        assert health.global_stats["domains_detected"] == expected

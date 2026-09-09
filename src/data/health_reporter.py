@@ -85,16 +85,32 @@ class DatasetHealthReport:
             }
         if lang_dist:
             for k, v in lang_dist.items():
-                self.languages[k] = self.languages.get(k, 0) + int(v)
+                # A dataset with no single detected language yields a None
+                # label (e.g. the packed-cache path uses
+                # `meta["lang_d"] or info.language`); render it explicitly
+                # instead of letting None reach the summary formatter, where
+                # format specs like `:<15` raise
+                # TypeError: unsupported format string passed to NoneType.
+                label = k if k is not None else "unknown"
+                if v is None:
+                    continue
+                self.languages[label] = self.languages.get(label, 0) + int(v)
         if domain_dist:
             for k, v in domain_dist.items():
-                self.domains[k] = self.domains.get(k, 0) + int(v)
+                label = k if k is not None else "unknown"
+                if v is None:
+                    continue
+                self.domains[label] = self.domains.get(label, 0) + int(v)
         self.datasets.append(entry)
 
     def add_error(self, msg: str) -> None:
         self.errors.append(msg)
 
     def compute_global_stats(self) -> None:
+        # "Generated:" must reflect the aggregation time, not the pipeline's
+        # construction time (the report can be computed and re-saved hours
+        # after the DataPipeline was created on a warm cache).
+        self.timestamp = datetime.now(timezone.utc).isoformat()
         if not self.datasets:
             self.global_stats = {"error": "no datasets"}
             return
@@ -143,9 +159,14 @@ class DatasetHealthReport:
                 all_qs.append(qs["mean"])
         avg_quality = sum(all_qs) / max(len(all_qs), 1) if all_qs else 0.0
 
-        # Language/domain distribution
+        # Language/domain distribution. Report BOTH the labeled-sample count
+        # AND the distinct-label count so the aggregate can never be mistaken
+        # for a label count (the box run read "Languages Detected 44548" as if
+        # all 44548 samples were one label: they were — 'unknown').
         total_lang = sum(self.languages.values()) if self.languages else 0
         total_domain = sum(self.domains.values()) if self.domains else 0
+        distinct_langs = len(self.languages) if self.languages else 0
+        distinct_domains = len(self.domains) if self.domains else 0
 
         self.global_stats = {
             "total_datasets": len(self.datasets),
@@ -161,8 +182,15 @@ class DatasetHealthReport:
             "long_context_documents": total_long_ctx,
             "long_context_ratio_global": round(total_long_ctx / max(total_docs_for_ratio, 1), 4),
             "categories": len(cats),
+            # Legacy keys kept for JSON backward compatibility: they are the
+            # labeled-SAMPLE counts (sum of per-label counts), not label counts.
             "languages_detected": total_lang,
             "domains_detected": total_domain,
+            # Accurate, non-ambiguous names (source of truth for the report).
+            "language_labeled_samples": total_lang,
+            "domain_labeled_samples": total_domain,
+            "distinct_languages": distinct_langs,
+            "distinct_domains": distinct_domains,
         }
 
     def summary_text(self) -> str:
@@ -176,11 +204,21 @@ class DatasetHealthReport:
             for e in self.errors:
                 lines.append(f"  ! {e}")
         lines.append(f"\n── Global Statistics ────────────────────────────────────────")
+        # Accurate display names: 'languages_detected'/'domains_detected' are
+        # legacy JSON keys that mean labeled-SAMPLE counts — never ambiguous.
+        display_names = {
+            "languages_detected": "Languages (labeled samples)",
+            "domains_detected": "Domains (labeled samples)",
+            "language_labeled_samples": "Language Labeled Samples",
+            "domain_labeled_samples": "Domain Labeled Samples",
+            "distinct_languages": "Distinct Languages",
+            "distinct_domains": "Distinct Domains",
+        }
         for k, v in self.global_stats.items():
             if isinstance(v, float):
-                lines.append(f"  {k.replace('_', ' ').title():45s} {v:.4f}")
+                lines.append(f"  {display_names.get(k, k).replace('_', ' ').title():45s} {v:.4f}")
             else:
-                lines.append(f"  {k.replace('_', ' ').title():45s} {v}")
+                lines.append(f"  {display_names.get(k, k).replace('_', ' ').title():45s} {v}")
         lines.append(f"\n── Per Dataset ─────────────────────────────────────────────")
         header = (f"{'Dataset':<30} {'Cat':<10} {'Raw':>7} {'Packed':>7} "
                   f"{'Tok':>9} {'Ret%':>5} {'PackEff':>7} {'Pad':>5} {'AvgQS':>6} {'LgCtx':>5}")
@@ -200,7 +238,7 @@ class DatasetHealthReport:
             )
         if self.categories:
             lines.append(f"\n── Category Token Distribution ──────────────────────────────")
-            total_tok = self.global_stats.get("total_tokens", 1)
+            total_tok = self.global_stats.get("total_tokens") or 1
             try:
                 from src.data.registry import CATEGORY_WEIGHTS
                 _cat_targets = {k: round(v * 100) for k, v in CATEGORY_WEIGHTS.items()}
@@ -217,16 +255,24 @@ class DatasetHealthReport:
                            f"[target {target_pct}%] [{status}]")
         if self.languages:
             lines.append(f"\n── Language Distribution ───────────────────────────────────")
-            total_l = sum(self.languages.values())
-            for lang, count in sorted(self.languages.items(), key=lambda x: -x[1]):
-                pct = count / max(total_l, 1) * 100
-                lines.append(f"  {lang:<15} {count:>8} ({pct:5.1f}%)")
+            total_l = sum((v or 0) for v in self.languages.values())
+            for lang, count in sorted(self.languages.items(), key=lambda x: -(x[1] or 0)):
+                lang_label = "unknown" if lang is None else str(lang)
+                count_v = count if isinstance(count, (int, float)) else None
+                pct = None if total_l <= 0 or count_v is None else (count_v / total_l) * 100
+                pct_text = f"{pct:5.1f}" if pct is not None else "N/A"
+                count_text = f"{count_v:>8}" if count_v is not None else "       -"
+                lines.append(f"  {lang_label:<15} {count_text} ({pct_text}%)")
         if self.domains:
             lines.append(f"\n── Domain Distribution ─────────────────────────────────────")
-            total_d = sum(self.domains.values())
-            for domain, count in sorted(self.domains.items(), key=lambda x: -x[1]):
-                pct = count / max(total_d, 1) * 100
-                lines.append(f"  {domain:<15} {count:>8} ({pct:5.1f}%)")
+            total_d = sum((v or 0) for v in self.domains.values())
+            for domain, count in sorted(self.domains.items(), key=lambda x: -(x[1] or 0)):
+                domain_label = "unknown" if domain is None else str(domain)
+                count_v = count if isinstance(count, (int, float)) else None
+                pct = None if total_d <= 0 or count_v is None else (count_v / total_d) * 100
+                pct_text = f"{pct:5.1f}" if pct is not None else "N/A"
+                count_text = f"{count_v:>8}" if count_v is not None else "       -"
+                lines.append(f"  {domain_label:<15} {count_text} ({pct_text}%)")
         lines.append(f"\n── Per-Dataset Quality Breakdown ─────────────────────────────")
         for d in self.datasets:
             qs = d.get("quality_scores", {})
