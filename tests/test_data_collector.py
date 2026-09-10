@@ -89,6 +89,55 @@ class TestMassiveDataCollector(unittest.TestCase):
 
         self.assertEqual(len(samples), 2)
 
+    def test_stream_single_dataset_accepts_attribute_style_entry(self):
+        """Training pipeline passes pydantic DatasetEntryConfig models — the
+        collector must handle non-dict entries instead of crashing and
+        silently skipping every dataset."""
+        from types import SimpleNamespace
+
+        collector = _collector()
+        rows = [
+            {
+                "instruction": "Write a Python function that returns one.",
+                "output": "def one():\n    return 1",
+                "language": "python",
+            },
+        ]
+        ds_info = SimpleNamespace(
+            path="local/test", max_samples=1, name=None,
+            split="train", data_dir=None, languages=None,
+        )
+        with patch("src.massive_data_collector.load_dataset", return_value=rows):
+            samples = list(collector.stream_single_dataset(ds_info, theme="all"))
+
+        self.assertEqual(len(samples), 1)
+        self.assertIn("one", samples[0]["output"])
+
+    def test_stream_single_dataset_skip_is_single_pass(self):
+        """skip_samples must not re-load/re-iterate the whole dataset per
+        skipped sample (was: O(skip) full re-streams + infinite-loop risk)."""
+        collector = _collector()
+        rows = [
+            {
+                "instruction": f"Write a Python function that returns {i} and documents it.",
+                "output": f"def f{i}():\n    \"\"\"Returns {i}.\"\"\"\n    return {i}",
+                "language": "python",
+            }
+            for i in range(5)
+        ]
+        with patch("src.massive_data_collector.load_dataset", return_value=rows) as ld:
+            samples = list(
+                collector.stream_single_dataset(
+                    {"path": "local/test", "max_samples": 2},
+                    theme="all",
+                    skip_samples=2,
+                )
+            )
+
+        ld.assert_called_once()
+        self.assertEqual(len(samples), 2)
+        self.assertIn("def f2", samples[0]["output"])
+
 
 if __name__ == "__main__":
     unittest.main()

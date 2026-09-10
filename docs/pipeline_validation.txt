@@ -1,5 +1,5 @@
 ========================================================================
-  PIPELINE VALIDATION REPORT — Methos Foundation
+  PIPELINE VALIDATION REPORT — Dhara Foundation
   Config: config_foundation.yaml
 ========================================================================
 

@@ -11,9 +11,11 @@ class RotaryPositionEncoding(nn.Module):
         self.max_seq_len = max_seq_len
 
     def forward(self, x: torch.Tensor, offsets: torch.LongTensor = None) -> torch.Tensor:
+        assert x.shape[-1] % 2 == 0, f"d_model must be even for RoPE, got {x.shape[-1]}"
         batch, seq_len, d_model = x.shape
         device = x.device
         if offsets is not None:
+            assert offsets.shape == (batch,), f"offsets expected [batch], got {tuple(offsets.shape)}"
             pos = offsets.unsqueeze(1) + torch.arange(seq_len, device=device).unsqueeze(0)
         else:
             pos = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch, -1)
@@ -56,7 +58,10 @@ class ContextAdapterBlock(nn.Module):
         x = self.activation(x)
         x = self.fc2(x)
         x = residual + x
-        x = x + self.norm2(x)
+        # Post-norm (NOT `x + norm(x)`): adding the normalized activation as a
+        # residual injected an extra unit-scale signal per block and compounded
+        # activation growth across blocks.
+        x = self.norm2(x)
         return x
 
 
@@ -79,8 +84,8 @@ class AdaptiveSemanticEmbedding(nn.Module):
         self.task_context = TaskContextEmbedding(d_model, n_task_types)
         self.context_adapter = ContextAdapter(d_model, n_context_adapter_blocks)
 
-    def forward(self, token_embeds: torch.Tensor, task_ids: torch.LongTensor = None) -> torch.Tensor:
-        x = self.rope(token_embeds)
+    def forward(self, token_embeds: torch.Tensor, task_ids: torch.LongTensor = None, offsets: torch.LongTensor = None) -> torch.Tensor:
+        x = self.rope(token_embeds, offsets=offsets)
         if task_ids is not None:
             task_emb = self.task_context(task_ids)
             x = x + task_emb.unsqueeze(1)

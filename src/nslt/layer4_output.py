@@ -223,21 +223,33 @@ class SparseOutputSynthesizer(nn.Module):
         log_probs_list = []
         for start in range(0, total, chunk_size):
             end = min(start + chunk_size, total)
-            x_chunk = x[start:end]
             h_chunk = h[start:end]
             target_chunk = target_ids[start:end]
-            gate_chunk = gate_values[start:end] if gate_values is not None else None
+            gate_chunk = gate_values[start:end]
             top_chunk = top_indices[start:end]
 
             target_emb = F.embedding(target_chunk, self.output_embedding)
             target_logit = torch.sum(target_emb * h_chunk, dim=-1) / (self.logit_temperature.abs() + 0.1)
 
+            # Selected entries are scored and scaled exactly as in forward():
+            # logit = gate * score for selected indices, 0 for everything else.
             selected_embeddings = F.embedding(top_chunk, self.output_embedding)
             selected_logits = torch.sum(
                 selected_embeddings * h_chunk.unsqueeze(1), dim=-1
             ) / (self.logit_temperature.abs() + 0.1)
+            selected_logits = gate_chunk * selected_logits
 
-            all_logits = torch.cat([selected_logits, target_logit.unsqueeze(1)], dim=-1)
+            # The target's effective logit matches the forward convention:
+            # gated score if the target is among the selected indices, else 0.
+            target_in_selected = (top_chunk == target_chunk.unsqueeze(1))  # [chunk, K]
+            target_effective = torch.where(
+                target_in_selected.any(dim=-1, keepdim=True),
+                torch.gather(selected_logits, 1, target_in_selected.to(torch.int64).argmax(dim=-1, keepdim=True)),
+                torch.zeros_like(target_logit.unsqueeze(-1)),
+            )
+            target_effective = target_effective.squeeze(-1)
+
+            all_logits = torch.cat([selected_logits, target_effective.unsqueeze(1)], dim=-1)
             log_probs = F.log_softmax(all_logits, dim=-1)
             log_probs_list.append(log_probs[:, -1])
 

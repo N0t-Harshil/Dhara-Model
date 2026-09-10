@@ -199,28 +199,52 @@ def ensure_tokenizer(
 ) -> None:
     """Ensure a tokenizer exists at output_dir, downloading or training if needed.
 
-    Reads config.yaml to determine the tokenizer source. If source is 'huggingface',
-    downloads from Hub. If 'custom', trains on the project dataset.
+    Cache-aware: a warm, hash-verified tokenizer is never re-downloaded or
+    re-trained (the manifest recorded by ``ModelFactory`` is the single source
+    of truth for what a verified cache is). Only an explicit ``force``, a
+    missing cache, or an unverified/changed cache triggers (re)acquisition.
+
+    Reads config.yaml to determine the tokenizer source. If source is
+    'huggingface', downloads from Hub. If 'custom', trains on the project
+    dataset.
     """
     from src.config.schema import load_config
     cfg = load_config(config_path)
     tok_cfg = cfg.tokenizer
 
+    from src.models.factory import ModelFactory
     output_path = Path(output_dir)
-    if (output_path / "tokenizer.json").exists() and not force:
-        logger.info("Tokenizer already exists at %s", output_dir)
+    verified = ModelFactory._verify_tokenizer_cache(output_path) is not None
+    if force:
+        logger.info("Tokenizer force-update requested for %s — re-acquiring", output_dir)
+    elif verified:
+        logger.info("Tokenizer cache verified (hash match) at %s — "
+                    "loading offline, no download needed", output_dir)
         return
+    elif (output_path / "tokenizer.json").exists():
+        logger.warning("Tokenizer files present at %s but unverified/changed "
+                       "(manifest mismatch) — re-acquiring", output_dir)
+    else:
+        logger.info("Tokenizer cache missing at %s — acquiring", output_dir)
+
+    # ``force`` here doubles as "re-acquire even when files exist": the sub
+    # functions' ``exists() and not force`` early-return must not let a
+    # corrupt-but-present cache skip acquisition.
+    needs_acquire = force or not verified
 
     if tok_cfg.source == "huggingface":
         download_tokenizer(
             output_dir=output_dir,
             model_id=tok_cfg.huggingface_model,
-            force=force,
+            force=needs_acquire,
         )
     else:
         train_custom_tokenizer(
             output_dir=output_dir,
             vocab_size=tok_cfg.vocab_size,
             max_samples=tok_cfg.max_samples,
-            force=force,
+            force=needs_acquire,
         )
+
+    ModelFactory._write_tokenizer_manifest(output_path)
+    logger.info("Tokenizer cache manifest written for %s", output_dir)

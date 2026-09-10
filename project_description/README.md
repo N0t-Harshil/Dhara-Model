@@ -13,7 +13,7 @@ This directory contains comprehensive engineering documentation for the Speciali
 | [05_Data_Pipeline.md](05_Data_Pipeline.md) | Registry → Streaming → Filtering → Packing → Training |
 | [06_Documentation_Builder.md](06_Documentation_Builder.md) | Web scraping for 18 documentation sources |
 | [07_Training_Pipeline.md](07_Training_Pipeline.md) | Config, training stages, checkpointing |
-| [08_Dataset_Registry.md](08_Dataset_Registry.md) | All 55 datasets with weights and metadata |
+| [08_Dataset_Registry.md](08_Dataset_Registry.md) | All 54 primary datasets with weights and metadata |
 | [09_Validation_System.md](09_Validation_System.md) | 8-phase automated validation |
 | [10_Known_Issues.md](10_Known_Issues.md) | 18 issues with root causes and fixes |
 | [11_Future_Work.md](11_Future_Work.md) | Roadmap from critical to research ideas |
@@ -28,11 +28,11 @@ This directory contains comprehensive engineering documentation for the Speciali
 ## Executive Summary
 
 **What problem does this project solve?**
-It provides a complete, production-grade framework for pretraining and aligning large language models with novel SSM-based architectures (MethosV3, NSLT). The framework handles everything from dataset acquisition and quality filtering through distributed training and evaluation.
+It provides a complete, production-grade framework for pretraining and aligning large language models with novel SSM-based architectures (Dhara, NSLT). The framework handles everything from dataset acquisition and quality filtering through distributed training and evaluation.
 
 **How does the system work end-to-end?**
 1. Configuration (YAML → Pydantic schema)
-2. Dataset registry builds 55-entry catalog across 8 categories
+2. Dataset registry builds 54-entry catalog across 8 categories
 3. Streaming loads datasets with automatic fallback chains
 4. Quality pipeline filters, deduplicates, and scores documents
 5. Code-specific processing (AST filtering, function sampling)

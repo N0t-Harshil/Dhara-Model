@@ -137,7 +137,7 @@ def cmd_full_training(args: argparse.Namespace) -> None:
     dist = DistributedSetup(cfg)
 
     if dist.is_main_process():
-        ensure_tokenizer(config_path=args.config, force=args.fresh_start)
+        ensure_tokenizer(config_path=args.config)
     if dist.is_distributed:
         import torch.distributed as dist_pkg
         dist_pkg.barrier()
@@ -398,7 +398,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub_parent_parser.add_argument("--config", default=argparse.SUPPRESS, help="Path to config file")
     sub_parent_parser.add_argument("--gpu", type=str, default=None, help="GPU index to use (e.g. '0', '3'). Overrides auto-detection.")
 
-    parser = argparse.ArgumentParser(prog="main.py", description="Methos Class Model - Neural-State Liquid Transformer", parents=[main_parent_parser])
+    parser = argparse.ArgumentParser(prog="main.py", description="Dhara Class Model - Neural-State Liquid Transformer", parents=[main_parent_parser])
 
     sub = parser.add_subparsers(dest="command", required=True)
 

@@ -287,6 +287,12 @@ class NSLTModel(nn.Module):
         # [batch, seq_len, d_model]
         x = self.rope(x)
 
+        # Mask padded positions out of the pipeline entirely: padding tokens
+        # must not pollute the SSM compressed state, the pooled context, or
+        # the per-position features used for the loss (items 4.1/4.2).
+        if attention_mask is not None:
+            x = x * attention_mask.unsqueeze(-1).float()
+
         # ── Layer 1: SSM Compression Stack ─────────────────────────────────
         # Each SSM block compresses and processes the sequence
         compressed_states = []
@@ -341,12 +347,14 @@ class NSLTModel(nn.Module):
         pos_hidden = self.ssm_to_hidden(x)
 
         if labels is not None:
-            # Compute loss using sparse log-probabilities per position.
-            # Avoids materializing [batch, seq_len, vocab_size] logits tensor.
-            # O(T·top_k) instead of O(T·V).
+            # Causal next-token loss — position t predicts token t+1. The
+            # per-position features come ONLY from the causal SSM output
+            # (position t depends on tokens <= t). The previous code broadcast
+            # the whole-sequence z_final into every position, leaking future
+            # tokens into past predictions; z_final is reserved for the
+            # sequence-level reasoning head instead (see below).
             shift_hidden = pos_hidden[:, :-1, :]  # [batch, seq_len-1, d_hidden]
             shift_labels = labels[:, 1:]          # [batch, seq_len-1]
-            shift_hidden = shift_hidden + z_final.unsqueeze(1)
             flat_hidden = shift_hidden.reshape(-1, self.d_hidden)
             flat_labels = shift_labels.reshape(-1)
             valid_mask = flat_labels != -100
@@ -362,6 +370,18 @@ class NSLTModel(nn.Module):
                 loss = -log_probs[valid_mask].mean()
             else:
                 loss = log_probs.sum() * 0.0
+
+            # Sequence-level reasoning head: predicts the token that follows
+            # the full context from the compressed whole-sequence state (no
+            # per-position leak — it observes the entire input and emits one
+            # prediction). Trained with the final valid label as its target.
+            final_valid = labels[:, -1] != -100
+            if final_valid.any():
+                reason_logits = torch.nan_to_num(
+                    main_logits[final_valid], nan=0.0, posinf=50.0, neginf=-50.0
+                )
+                reason_labels = labels[final_valid, -1]
+                loss = loss + 0.1 * F.cross_entropy(reason_logits, reason_labels)
 
             trajectory_list = [ltc_trajectory, energies] if return_trajectories else None
             return CausalLMOutputWithPast(
@@ -411,6 +431,7 @@ class NSLTModel(nn.Module):
         device = input_ids.device
 
         generated = input_ids.clone()
+        finished = torch.zeros(batch, dtype=torch.bool, device=device)
 
         with torch.no_grad():
             for _ in range(max_new_tokens):
@@ -454,10 +475,22 @@ class NSLTModel(nn.Module):
                 # Concatenate
                 generated = torch.cat([generated, next_token], dim=-1)
 
-                # Check EOS
+                # Per-sequence EOS tracking: only stop when every sequence
+                # has emitted EOS (previously breaking on *any* EOS truncated
+                # the rest of the batch).
                 if eos_token_id is not None:
-                    if (next_token == eos_token_id).any():
+                    finished |= (next_token.squeeze(-1) == eos_token_id)
+                    if finished.all():
                         break
+                    # For finished sequences, keep the last sampled token but
+                    # mask its logits on subsequent steps by forcing eos.
+                    # (The full forward still runs; the next iteration's sampled
+                    # token for finished rows will be overwritten.)
+                    next_token = torch.where(
+                        finished.unsqueeze(-1),
+                        torch.full_like(next_token, eos_token_id),
+                        next_token,
+                    )
 
         return generated
 
@@ -537,7 +570,6 @@ class NSLTModel(nn.Module):
         if labels is not None:
             shift_hidden = pos_hidden[:, :-1, :]
             shift_labels = labels[:, 1:]
-            shift_hidden = shift_hidden + z_final.unsqueeze(1)
             flat_hidden = shift_hidden.reshape(-1, self.d_hidden)
             flat_labels = shift_labels.reshape(-1)
             valid_mask = flat_labels != -100
@@ -547,6 +579,14 @@ class NSLTModel(nn.Module):
                 flat_hidden, safe_labels
             )
             loss = -log_probs[valid_mask].mean() if valid_mask.any() else log_probs.sum() * 0.0
+
+            final_valid = labels[:, -1] != -100
+            if final_valid.any():
+                reason_logits = torch.nan_to_num(
+                    main_logits[final_valid], nan=0.0, posinf=50.0, neginf=-50.0
+                )
+                reason_labels = labels[final_valid, -1]
+                loss = loss + 0.1 * F.cross_entropy(reason_logits, reason_labels)
             return CausalLMOutputWithPast(loss=loss, logits=main_logits)
 
         batch_v = pos_hidden.size(0)

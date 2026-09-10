@@ -4,7 +4,7 @@
 
 ## `src/data/registry.py` — Central Dataset Registry
 
-**Purpose**: Single source of truth for all 55 training datasets across 8 categories. Manages dataset metadata, weights, fallback chains, and category organization.
+**Purpose**: Single source of truth for all 54 primary training datasets (+4 fallback-only entries) across 8 categories. Manages dataset metadata, weights, fallback chains, and category organization.
 
 ### Public Classes
 
@@ -134,7 +134,7 @@ Primary: HuggingFaceFW/fineweb
 
 ## `src/data/pipeline.py` — Data Assembly Pipeline
 
-**Purpose**: Complete pretrain/SFT/preference dataset assembly. The most complex file in the project at 1123 lines. Orchestrates quality filtering, deduplication, boilerplate removal, AST-based code filtering, function sampling, weighted mixing with adaptive resampling, sequence packing, and disk caching.
+**Purpose**: Complete pretrain/SFT/preference dataset assembly. The most complex file in the project at 2604 lines. Orchestrates quality filtering, deduplication, boilerplate removal, AST-based code filtering, function sampling, weighted mixing with adaptive resampling, sequence packing, disk caching, and async prefetch with cancellation.
 
 ### Public Classes
 
@@ -232,7 +232,7 @@ Each dataset is cached to disk (`hf_cache/tokenized/{stage}/{sha256_hash}`) afte
 
 **Purpose**: Web scraping pipeline for building documentation datasets from 18 sources. Used to generate the "docs" category in the registry.
 
-**Size**: 808 lines.
+**Size**: 975 lines.
 
 ### Architecture
 
@@ -282,15 +282,15 @@ Each dataset is cached to disk (`hf_cache/tokenized/{stage}/{sha256_hash}`) afte
 
 ## `src/config/schema.py` — Configuration Schema
 
-**Purpose**: Pydantic v2 configuration validation. 666 lines, 30+ models.
+**Purpose**: Pydantic v2 configuration validation. 765 lines, 30+ models.
 
 ### Key Models
 
 | Model | Fields | Validators |
 |---|---|---|
 | `Config` | 10+ sub-models | Cross-field validation (FSDP ↔ strategy) |
-| `ModelArchitectureConfig` | model_type, vocab_size, hidden_size, methos_v3, nslt | — |
-| `MethosV3Config` | 30+ architecture params | — |
+| `ModelArchitectureConfig` | model_type, vocab_size, hidden_size, dhara_v3, nslt | — |
+| `DharaConfig` | 30+ architecture params | — |
 | `NSLTConfig` | 7 architecture params | — |
 | `TrainingConfig` | pretrain/sft/instruction/alignment/safety stages | — |
 | `DataConfig` | quality, curriculum, preprocessing, ast_filter, function_sampling | — |
@@ -309,7 +309,7 @@ Each dataset is cached to disk (`hf_cache/tokenized/{stage}/{sha256_hash}`) afte
 
 ## `src/training/pipeline.py` — Training Orchestration
 
-**Purpose**: Multi-stage training pipeline. 556 lines. Runs sequential training stages with curriculum learning.
+**Purpose**: Multi-stage training pipeline. 1772 lines. Runs sequential training stages with curriculum learning plus dataset-granular staged pretraining.
 
 ### Public Classes
 
@@ -340,7 +340,7 @@ Each stage uses the HuggingFace `Trainer` with stage-specific config overrides (
 
 ## `src/infrastructure/distributed.py` — Distributed Setup
 
-**Purpose**: Initialize distributed training environment. 123 lines.
+**Purpose**: Initialize distributed training environment. 156 lines.
 
 ### Public Classes
 
@@ -386,13 +386,13 @@ Each stage uses the HuggingFace `Trainer` with stage-specific config overrides (
 
 ## `src/models/factory.py` — Model Factory
 
-**Purpose**: Unified model creation and weight loading. 604 lines.
+**Purpose**: Unified model creation and weight loading. 764 lines.
 
 ### Supported Architectures
 
 | Architecture | Config Class | Model Class | FSDP Layer |
 |---|---|---|---|
-| methos_v3 | MethosV3Config → PretrainedConfig | MethosV3Model | HierarchicalSSMStack |
+| dhara_v3 | DharaConfig → PretrainedConfig | DharaModel | HierarchicalSSMStack |
 | nslt | Custom config | NSLTModel | SSMCompressionEngine |
 | llama | LlamaConfig | LlamaForCausalLM | LlamaDecoderLayer |
 | mixtral | MixtralConfig | MixtralForCausalLM | MixtralDecoderLayer |
@@ -410,7 +410,7 @@ Each stage uses the HuggingFace `Trainer` with stage-specific config overrides (
 
 ## `src/trainer.py` — Standalone Model Trainer
 
-**Purpose**: High-level training interface. 298 lines.
+**Purpose**: High-level training interface. 308 lines.
 
 ### Public Classes
 
@@ -429,18 +429,18 @@ Uses `DataPipeline` for data preparation and HuggingFace `Trainer` for the train
 
 ---
 
-## `src/methos_v3/model.py` — Core MethosV3 Model
+## `src/dhara/model.py` — Core Dhara Model
 
-**Purpose**: Full MethosV3 model definition. 414 lines. Integrates all 11 layers into a single forward pass with auxiliary losses.
+**Purpose**: Full Dhara model definition. 490 lines. Integrates all 11 layers into a single forward pass with auxiliary losses.
 
 ### Public Classes
 
 | Class | Description |
 |---|---|
-| `MethosV3Config(PretrainedConfig)` | 50+ configuration parameters, model_type="methos_v3" |
-| `MethosV3Model(PreTrainedModel)` | Core model with all 11 layers |
-| `MethosV3ForCausalLM(PreTrainedModel)` | CausalLM wrapper with LM head |
-| `MoEMethosV3Model(PreTrainedModel)` | Mixture-of-Experts variant |
+| `DharaConfig(PretrainedConfig)` | 50+ configuration parameters, model_type="dhara_v3" |
+| `DharaModel(PreTrainedModel)` | Core model with all 11 layers |
+| `DharaForCausalLM(PreTrainedModel)` | CausalLM wrapper with LM head |
+| `DharaMoEModel(PreTrainedModel)` | Mixture-of-Experts variant |
 
 ### Forward Pass Flow
 
@@ -463,7 +463,7 @@ Each module contributes a differentiable loss: memory reconstruction, intent CE,
 
 ## `src/nslt/model.py` — NSLT Model
 
-**Purpose**: Neural State-Space Liquid Transformer — non-Transformer architecture. 719 lines.
+**Purpose**: Neural State-Space Liquid Transformer — non-Transformer architecture. 759 lines.
 
 ### Public Classes
 

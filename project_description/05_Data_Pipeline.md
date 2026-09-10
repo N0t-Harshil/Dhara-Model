@@ -7,10 +7,10 @@ The data pipeline is the most mature and thoroughly tested subsystem in this cod
 ## Overview
 
 ```
-Raw Datasets (55 entries, 8 categories)
+Raw Datasets (54 primary entries + 4 fallback-only, 8 categories)
   │
   ▼
-Stage 1: Registry ──────── build_registry() creates 55 entries
+Stage 1: Registry ──────── build_registry() creates 54 primary entries
   │
   ▼
 Stage 2: Streaming ──────── stream_dataset_with_fallbacks(), 4 Dataset types
@@ -44,20 +44,20 @@ DataLoader → Training
 
 ## Stage 1: Registry (`registry.py`)
 
-**Entry point**: `build_registry()` → `DatasetRegistry` with 55 entries across 8 categories.
+**Entry point**: `build_registry()` → `DatasetRegistry` with 54 primary entries (58 registered including fallback-only) across 8 categories.
 
 ### Category Structure
 
 | Category | Weight | # Entries | Primary Sources |
 |---|---|---|---|
-| `code` | 0.30 | 25+ | OPC FineWeb Code, Stack v2, CodeSearchNet, CodeParrot, CodeContests |
-| `web_text` | 0.20 | 2+ | FineWeb, fallbacks: Dolma, RedPajama, Falcon RefinedWeb |
-| `docs` | 0.15 | 18+ | FineWeb-Edu + 18 scraped documentation sources |
+| `code` | 0.30 | 22 | OPC FineWeb Code, Stack v2, CodeSearchNet, CodeParrot, CodeContests |
+| `web_text` | 0.20 | 1 | FineWeb, fallbacks: Dolma, RedPajama, Falcon RefinedWeb |
+| `docs` | 0.15 | 19 | FineWeb-Edu + 18 scraped documentation sources |
 | `wiki` | 0.10 | 1 | Wikimedia Wikipedia (20231101.en) |
 | `math` | 0.10 | 6 | OpenWebMath, NuminaMath-CoT, NuminaMath-1.5, MathPile, FineWeb-Edu (proxy), LeanDojo |
-| `science` | 0.05 | 1+ | FineWeb-Edu (science proxy) |
-| `books` | 0.05 | 3+ | FineWeb-Edu (books proxy), FineWeb (books proxy) |
-| `structured_knowledge` | 0.05 | 2+ | FineWeb-Edu, FineWeb |
+| `science` | 0.05 | 1 | FineWeb-Edu (science proxy) |
+| `books` | 0.05 | 2 | FineWeb-Edu (books proxy), FineWeb (books proxy) |
+| `structured_knowledge` | 0.05 | 2 | FineWeb-Edu, FineWeb |
 
 ### Entry Metadata
 
@@ -401,7 +401,7 @@ key = hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 When `cfg.data.use_registry` is `True`:
 
-1. `build_registry()` creates all 55 entries
+1. `build_registry()` creates 54 primary entries (58 registered)
 2. For each entry, `detect_driver()` picks the File/Script/Local/Streaming family, then `stream_dataset_with_fallbacks()` loads samples (warm runs skip HF resolution entirely; script-family datasets resume their iterator)
 3. Samples pass through the filter pipeline:
    - Boilerplate removal → text length check → quality scoring
@@ -419,7 +419,7 @@ When `cfg.data.use_registry` is `True`:
 
 ```mermaid
 graph TB
-    REG[Dataset Registry<br/>55 entries, 8 categories] --> STREAM[Stage 2: Streaming Layer<br/>stream_dataset_with_fallbacks]
+    REG[Dataset Registry<br/>54 primary entries, 8 categories] --> STREAM[Stage 2: Streaming Layer<br/>stream_dataset_with_fallbacks]
 
     subgraph Fallback_Resolution
         STREAM --> FALLBACK{Primary available?}

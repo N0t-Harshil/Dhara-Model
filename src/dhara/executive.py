@@ -56,6 +56,10 @@ class ModulePerformanceTracker(nn.Module):
 MODULE_NAMES = [
     "memory", "planner", "intent", "reasoning",
     "sandbox", "reflection", "verification", "decoder",
+    # These two were previously ungatable: apply_gates() never emitted their
+    # keys, so the model's `not in skip` checks were tautologically True and
+    # the two most expensive branches always ran.
+    "world_model", "tools",
 ]
 
 
@@ -186,40 +190,34 @@ class ExecutiveController(nn.Module):
         """
         Apply REINFORCE policy gradient update to `module_importance`.
 
-        Uses the reward buffer accumulated over recent steps. The policy gradient
-        estimator is:
-            ∇J(θ) ≈ E[R · ∇log π(a|s)]
-        where π is the softmax over module_importance (the selection policy),
-        and R is the cumulative reward.
+        Uses the reward buffer accumulated over recent steps. The estimator is
+        advantage-weighted entropy shaping: modules currently in use
+        (probability mass) are reinforced when the advantage is positive and
+        explored-away-from when negative:
 
-        Updates `module_importance` in-place via vanilla policy gradient.
-        Minimum 10 rewards required before first update.
+            ∇J(θ) ≈ E[ A · Σ_m p̄_m · ∇ log π_m(θ) ]
+
+        The update is computed on a detached leaf so it NEVER interferes with
+        the main backward pass (the previous version called .backward() on a
+        graph sharing `module_importance`, clobbering gradients accumulated
+        for the outer LM loss).
         """
         if len(self.reward_buffer) < 10:
             return
 
         # Mean-baseline REINFORCE (reduces variance)
         rewards = torch.tensor(self.reward_buffer, dtype=torch.float32)
-        baseline = rewards.mean()
-        advantages = rewards - baseline
+        advantages = rewards - rewards.mean()
 
-        # Policy: softmax over module_importance → selection probabilities
-        log_probs = F.log_softmax(self.module_importance, dim=0)
+        theta = self.module_importance.detach().clone().requires_grad_(True)
+        log_probs = F.log_softmax(theta, dim=0)
+        probs = log_probs.exp().detach()
+        surrogate = -(advantages.mean() * (probs * log_probs).sum())
+        surrogate.backward()
 
-        # Policy gradient: maximize E[R · log π] by ascending the gradient
-        # Gradient w.r.t. module_importance: advantage-weighted log-probs
-        pg_loss = -(advantages.mean() * log_probs.sum())
-
-        # Manual parameter update (no optimizer attached to this sub-network)
-        if self.module_importance.grad is not None:
-            self.module_importance.grad.zero_()
-        pg_loss.backward()
         with torch.no_grad():
-            if self.module_importance.grad is not None:
-                self.module_importance.data.sub_(
-                    self.rl_lr * self.module_importance.grad
-                )
-                self.module_importance.data.clamp_(1e-6, 1.0)
+            self.module_importance.data.sub_(self.rl_lr * theta.grad)
+            self.module_importance.data.clamp_(1e-6, 1.0)
 
         self.reward_buffer.clear()
 
@@ -256,9 +254,9 @@ class ExecutiveController(nn.Module):
             gates[name] = torch.sigmoid(gate_net(h))
 
         budget_logits = self.budget_head(h)
+        # softmax already normalizes to sum=1; the previous clamp(min=1) +
+        # re-division was a no-op.
         budget_weights = F.softmax(budget_logits, dim=-1)
-        total_budget = budget_weights.sum(dim=-1, keepdim=True).clamp(min=1.0)
-        budget_weights = budget_weights / total_budget
 
         depth = torch.sigmoid(self.depth_predictor(h)).squeeze(-1)
         confidence = torch.sigmoid(self.confidence_estimator(h)).squeeze(-1)

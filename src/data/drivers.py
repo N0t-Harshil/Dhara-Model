@@ -112,6 +112,21 @@ def local_file_list(path: str) -> Tuple[List[str], Optional[str]]:
     else:
         files = sorted(str(p) for p in local.rglob("*") if p.is_file())
     loader = _loader_for_files(files) if files else None
+    if loader is None and files:
+        # Mixed-extension directory (e.g. data_dir with .jsonl + .md
+        # sidecar docs): filter to the dominant loadable extension so the
+        # dataset still classifies as local instead of falling back to HF.
+        exts = [
+            Path(f.split("?")[0]).suffix.lower()
+            for f in files if Path(f.split("?")[0]).suffix.lower()
+        ]
+        if exts:
+            dominant = max(set(exts), key=exts.count)
+            filtered = [f for f in files
+                        if Path(f.split("?")[0]).suffix.lower() == dominant]
+            sub_loader = _loader_for_files(filtered)
+            if sub_loader is not None:
+                files, loader = filtered, sub_loader
     return files, loader
 
 
@@ -347,6 +362,10 @@ class ScriptDatasetDriver(DatasetDriver):
         if self.record is not None and self.builder_cache is not None:
             self.builder_cache.reset_resume(self.record)
             self._offset = 0
+        # In-memory counters must match the persisted reset, or resume()/
+        # raw_consumed() report a stale "next position" for the run that
+        # exhausted the dataset naturally.
+        self._raw_consumed = 0
 
     def stream(
         self,
@@ -515,11 +534,11 @@ class BuilderCache:
         self.fingerprint_version = fingerprint_version
 
     @staticmethod
-    def safe_dir_name(repo: str, name: Optional[str]) -> str:
-        return DatasetMetadataCache.safe_dir_name(repo, name)
+    def safe_dir_name(repo: str, name: Optional[str], split: str = "train") -> str:
+        return DatasetMetadataCache.safe_dir_name(repo, name, split)
 
     def record_dir(self, info) -> Path:
-        return self.root / self.safe_dir_name(info.path, info.name)
+        return self.root / self.safe_dir_name(info.path, info.name, info.split)
 
     def fingerprint_for(
         self,
@@ -571,7 +590,7 @@ class BuilderCache:
 
     def get(self, repo: str, name: Optional[str] = None, split: str = "train") -> Optional[Dict[str, Any]]:
         """Load a cached builder record without verification. None if absent."""
-        rec_dir = self.root / self.safe_dir_name(repo, name)
+        rec_dir = self.root / self.safe_dir_name(repo, name, split)
         rec_path = rec_dir / "builder_record.json"
         try:
             if not rec_path.exists():
@@ -625,6 +644,12 @@ class BuilderCache:
             tmp = rec_dir / f".tmp-{uuid.uuid4().hex}"
             tmp.write_text(json.dumps(rec, indent=2, default=str, ensure_ascii=False),
                            encoding="utf-8")
+            try:
+                with open(tmp, "ab") as f:
+                    f.flush()
+                    os.fsync(f.fileno())
+            except OSError:
+                pass
             os.replace(tmp, rec_dir / "builder_record.json")
             return True
         except Exception as e:
@@ -634,7 +659,7 @@ class BuilderCache:
 
     def invalidate(self, repo: str, name: Optional[str] = None, split: str = "train") -> None:
         """Remove a stale record so the next run re-resolves the builder."""
-        rec_dir = self.root / self.safe_dir_name(repo, name)
+        rec_dir = self.root / self.safe_dir_name(repo, name, split)
         try:
             if rec_dir.exists():
                 import shutil
@@ -698,24 +723,25 @@ def detect_driver(
                                 split=info.split, data_dir=info.data_dir)
 
     # 1. Local filesystem datasets — no Hub involvement at all.
+    #    Checks BOTH path and data_dir roots: doc/registry entries use
+    #    path="json" + data_dir="data/docs/<name>" and must not be sent to
+    #    the Hub's "json"-loader resolution.
+    local_root = info.data_dir or info.path
     try:
-        local_exists = Path(info.path).exists()
+        local_exists = Path(local_root).exists()
     except Exception:
         local_exists = False
     if local_exists:
-        files, loader = local_file_list(info.path)
+        files, loader = local_file_list(local_root)
         if files and loader:
-            rec = None
-            if meta_cache is not None:
-                if meta_cache.enabled:
-                    rec = meta_cache.verify(info_like, preprocess_sig, token_sig)
-                if rec is None:
-                    rec = meta_cache.build_record(
-                        info_like, files, None, preprocess_sig, token_sig, loader)
-                    if meta_cache.enabled and meta_cache.save(rec, info_like):
-                        diag["first_resolution"] = True
-                else:
-                    diag["metadata_hit"] = True
+            cache = meta_cache if meta_cache is not None else DatasetMetadataCache(Path("."), enabled=False)
+            rec = cache.verify(info_like, preprocess_sig, token_sig) if cache.enabled else None
+            if rec is None:
+                rec = cache.build_record(info_like, files, None, preprocess_sig, token_sig, loader)
+                if cache.enabled and cache.save(rec, info_like):
+                    diag["first_resolution"] = True
+            else:
+                diag["metadata_hit"] = True
             diag["driver_kind"] = DRIVER_KIND_LOCAL
             diag["repo_resolution_skipped"] = True
             return LocalDatasetDriver(rec, meta_cache=meta_cache), diag
@@ -749,28 +775,26 @@ def detect_driver(
         )
         files, loader = inspect_builder(builder, info.split)
         if files and loader:
-            rec = None
-            if meta_cache is not None:
-                rec = meta_cache.build_record(
-                    info_like, files, revision, preprocess_sig, token_sig, loader)
-                if meta_cache.enabled and meta_cache.save(rec, info_like):
-                    logger.info("Metadata resolved+cached: %s/%s (%d shards)",
-                                info.path, info.name or "default", len(files))
-                    diag["first_resolution"] = True
+            cache = meta_cache if meta_cache is not None else DatasetMetadataCache(Path("."), enabled=False)
+            rec = cache.build_record(
+                info_like, files, revision, preprocess_sig, token_sig, loader)
+            if cache.enabled and meta_cache is not None and meta_cache.save(rec, info_like):
+                logger.info("Metadata resolved+cached: %s/%s (%d shards)",
+                            info.path, info.name or "default", len(files))
+                diag["first_resolution"] = True
             diag["driver_kind"] = DRIVER_KIND_FILE
             return FileDatasetDriver(rec, meta_cache=meta_cache), diag
 
         # Script family — never a file list; cache builder identity only.
         bclass, srev = script_identity(builder)
-        brec = None
-        if builder_cache is not None:
-            brec = builder_cache.build_record(
-                info_like, revision, srev, bclass, preprocess_sig, token_sig)
-            if builder_cache.enabled and builder_cache.save(brec, info_like):
-                logger.info("Builder resolved+cached: %s/%s (script=%s, rev=%s)",
-                            info.path, info.name or "default",
-                            bclass, srev or "?")
-                diag["first_resolution"] = True
+        cache = builder_cache if builder_cache is not None else BuilderCache(Path("."), enabled=False)
+        brec = cache.build_record(
+            info_like, revision, srev, bclass, preprocess_sig, token_sig)
+        if cache.enabled and builder_cache is not None and builder_cache.save(brec, info_like):
+            logger.info("Builder resolved+cached: %s/%s (script=%s, rev=%s)",
+                        info.path, info.name or "default",
+                        bclass, srev or "?")
+            diag["first_resolution"] = True
         diag["driver_kind"] = DRIVER_KIND_SCRIPT
         return ScriptDatasetDriver(brec, builder_cache=builder_cache), diag
     except Exception as e:
@@ -778,8 +802,21 @@ def detect_driver(
                        info.path, info.name or "default", e)
         diag["resolve_error"] = str(e)
         diag["driver_kind"] = DRIVER_KIND_STREAMING
+        cold_info = info if isinstance(info, DatasetInfo) else DatasetInfo(
+            path=info.path,
+            category=getattr(info, "category", "general"),
+            weight=float(getattr(info, "weight", 0.0)) or 1.0,
+            quality_score=float(getattr(info, "quality_score", 0.5)),
+            name=info.name,
+            split=info.split,
+            data_dir=info.data_dir,
+            max_samples=getattr(info, "max_samples", None),
+        )
+        logger.warning(
+            "Falling back to cold streaming for %s/%s (no metadata/builder record).",
+            cold_info.path, cold_info.name or "default")
         return StreamingDatasetDriver(
-            info=info if isinstance(info, DatasetInfo) else None,
+            info=cold_info,
             meta_cache=meta_cache,
             preprocess_sig=preprocess_sig, token_sig=token_sig,
         ), diag

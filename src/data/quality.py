@@ -326,14 +326,18 @@ class MinHashDeduplicator:
         self._signatures: List[Tuple[int, ...]] = []
 
     def _shingles(self, text: str, k: int = 5) -> List[str]:
-        return [text[i:i + k] for i in range(max(1, len(text) - k + 1))]
+        if len(text) < k:
+            return []
+        return [text[i:i + k] for i in range(len(text) - k + 1)]
 
     def _signature(self, text: str) -> Tuple[int, ...]:
         shingles = self._shingles(text)
+        if not shingles:
+            shingles = [text]
         sig = []
         for seed in range(1, self.num_hashes + 1):
             min_hash = min(hashlib.sha256((str(seed) + s).encode()).hexdigest() for s in shingles)
-            sig.append(hash(min_hash))
+            sig.append(int(min_hash[:16], 16))
         return tuple(sig)
 
     def is_duplicate(self, content: str) -> bool:
@@ -354,15 +358,23 @@ def _compute_simhash_fp(text: str, hash_bits: int = 64) -> int:
     Counts set bits per position (majority voting) instead of maintaining a
     signed weight vector — same result, ~2x faster.
     """
+    if hash_bits < 64:
+        mask = (1 << hash_bits) - 1
+    else:
+        mask = (1 << 64) - 1 if hash_bits == 64 else None
     cnt = [0] * hash_bits
     n = 0
     for token in re.findall(r"\w+", text.lower()):
         h = int.from_bytes(hashlib.md5(token.encode("utf-8")).digest()[:8], "little")
+        if hash_bits < 64:
+            h &= mask
         n += 1
         bits = h
         while bits:
             lsb = bits & -bits
-            cnt[lsb.bit_length() - 1] += 1
+            bit = lsb.bit_length() - 1
+            if bit < hash_bits:
+                cnt[bit] += 1
             bits ^= lsb
     fp = 0
     for i in range(hash_bits):
@@ -371,8 +383,8 @@ def _compute_simhash_fp(text: str, hash_bits: int = 64) -> int:
     return fp
 
 
-def _pool_simhash_fp(text: str) -> int:
-    return _compute_simhash_fp(text)
+def _pool_simhash_fp(text: str, hash_bits: int = 64) -> int:
+    return _compute_simhash_fp(text, hash_bits)
 
 
 def _pool_quality_score(text: str, category: str, language: str) -> float:
@@ -525,7 +537,7 @@ class SemanticDeduplicator:
         if len(self._centroids) < self.max_centroids:
             self._centroids.append(emb)
         else:
-            idx = hash(text) % self.max_centroids
+            idx = int(hashlib.md5(text.encode("utf-8")).hexdigest()[:8], 16) % self.max_centroids
             self._centroids[idx] = emb
         self._document_count += 1
         return False
@@ -548,7 +560,7 @@ class SemanticDeduplicator:
             if len(self._centroids) < self.max_centroids:
                 self._centroids.append(emb)
             else:
-                idx = hash(text) % self.max_centroids
+                idx = int(hashlib.md5(text.encode("utf-8")).hexdigest()[:8], 16) % self.max_centroids
                 self._centroids[idx] = emb
             keep.append(text)
             flags.append(True)

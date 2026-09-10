@@ -5,7 +5,7 @@
 ## Architecture Score: 7/10
 
 **Strengths:**
-- Clean separation of concerns: data processing (`src/data/`), model definitions (`src/methos_v3/`, `src/nslt/`), configuration (`src/config/`), training orchestration (`src/training/`)
+- Clean separation of concerns: data processing (`src/data/`), model definitions (`src/dhara/`, `src/nslt/`), configuration (`src/config/`), training orchestration (`src/training/`)
 - Config-driven design with Pydantic v2 validation — all parameters are type-checked with sensible defaults
 - Well-organized modules following HuggingFace conventions (`PreTrainedModel`, `PretrainedConfig` subclasses)
 - Strong data pipeline with registry, streaming, fallbacks, quality filtering, deduplication, and packing
@@ -15,7 +15,7 @@
 - Some modules are tightly coupled: `pipeline.py` imports from nearly every other data module
 - Legacy code (`MassiveDataCollector`) remains alongside new registry-based pipeline
 - Experimental components (MCTS sandbox, MoE variants, Triton kernel) mixed with production code
-- `src/data/pipeline.py` at 1123 lines is too long and handles too many responsibilities
+- `src/data/pipeline.py` at 2604 lines is too long and handles too many responsibilities
 
 **Justification:** The data pipeline is production-quality with robust fallback chains, validation, and health reporting. The model architecture is novel and complex but follows HF conventions for interoperability. Training infrastructure is mostly scaffolded. The architecture has some rough edges (tight coupling in pipeline.py, legacy wrappers) but is fundamentally well-structured. Score of 7.
 
@@ -50,7 +50,7 @@
 - Doc builder has clean abstract base class pattern making new scrapers easy to add
 
 **Weaknesses:**
-- Some files are very long: `pipeline.py` (1123 lines), `model.py` (414 lines methos_v3, 719 lines nslt), `production_validation.py` (768 lines)
+- Some files are very long: `pipeline.py` (2604 lines), `model.py` (490 lines dhara, 759 lines nslt), `production_validation.py` (778 lines)
 - Multiple duplicate scripts: `check_datasets.py`, `validate_registry.py`, `verify_datasets.py` all serve similar purposes
 - Legacy code (`MassiveDataCollector`, `src/massive_data_collector.py`) mixed with new code
 - Some commented-out code and TODO comments without context
@@ -62,7 +62,7 @@
 ## Testing Score: 4/10
 
 **Strengths:**
-- 12 test files exist in the `tests/` directory
+- 26 test files exist in the `tests/` directory with a fully green suite of 287 tests
 - Test framework (pytest) is configured via `pytest.ini`
 - Test coverage for data pipeline components: `test_data_pipeline.py`, `test_data_collector.py`, `test_quality.py`
 - Foundation pipeline test (`test_foundation_pipeline.py`) covers the core data flow
@@ -80,14 +80,12 @@
 - `test_quality.py`
 - `test_trainer.py`
 - `test_validation.py`
+- `test_async_pipeline_hardening.py`, `test_async_pipeline_overlap.py`, `test_cache_lockstep.py`, `test_cleanup_pool.py`, `test_health_reporter.py`, `test_main_cli.py`, `test_phase1_crash_fixes.py`, `test_shutdown_coordinator.py`, `test_spec_hardening.py`, `test_special_token_alignment.py`, `test_step_accounting.py`, `test_tokenizer_acquisition.py`, `test_unit_prefetch_lifecycle.py`
 
 **Weaknesses:**
-- Many tests use `@pytest.mark.skip` or are placeholders with minimal assertions
-- Few end-to-end integration tests that verify the full pipeline from config → data → model → training
+- Some tests use `@pytest.mark.skip` or are placeholders with minimal assertions (notably model/evaluation paths)
 - No CI/CD pipeline configured
-- Model tests (test_nslt.py) may only test construction, not forward pass correctness
-- Evaluation and alignment tests are likely placeholders
-- No performance benchmarks or regression tests
+- No performance benchmarks or regression tests on target hardware
 
 **Justification:** A test suite exists and provides basic coverage for the data pipeline. However, significant gaps remain in model, training, and integration testing. The foundation pipeline has better coverage than other components. Score of 4 — below industry standard for production release.
 
@@ -129,7 +127,7 @@
 **Strengths:**
 - Existing documentation is thorough and well-structured
 - Good inline comments in most modules, especially in complex areas (pipeline.py, model.py, doc_builder.py)
-- Docstrings exist for major classes and methods in nslt/model.py, methos_v3/model.py, registry.py
+- Docstrings exist for major classes and methods in nslt/model.py, dhara/model.py, registry.py
 - Config schema serves as living documentation
 
 **Weaknesses:**
@@ -145,7 +143,7 @@
 ## Performance Score: 6/10
 
 **Strengths:**
-- **O(1) memory architecture** — SSM compression in NSLT and HSSM in MethosV3 provide constant-memory context encoding regardless of sequence length
+- **O(1) memory architecture** — SSM compression in NSLT and HSSM in Dhara provide constant-memory context encoding regardless of sequence length
 - **Sparse output** — `SparseOutputSynthesizer` avoids materializing the full `[batch, seq_len, vocab_size]` logits tensor; training computes loss via sparse log-probabilities with O(top_k) complexity per position
 - **Streaming dataset loading** — datasets are loaded in streaming mode, avoiding local storage bottlenecks
 - **Sequence packing** — packs multiple samples into single sequences to maximize GPU utilization; typical efficiency >95%
@@ -173,7 +171,7 @@
 - Tests and validation scripts exist
 
 **Weaknesses:**
-- Some very long functions: `MethosV3Model.forward()` (~120 lines), `DataPipeline.build_pretrain_dataset()` (~220 lines), `DataPipeline.build_pretrain_dataset_from_registry()` (~270 lines)
+- Some very long functions: `DharaModel.forward()` (~120 lines), `DataPipeline.build_pretrain_dataset()` (~220 lines), `DataPipeline.build_pretrain_dataset_from_registry()` (~270 lines)
 - Mutable default arguments in a few places (e.g. `field(default_factory=list)` is used correctly in dataclasses, but some function signatures use mutable defaults)
 - Some commented-out code blocks in production_validation.py
 - Mix of tabs and spaces in some files (mostly consistent, but a few lines use tabs)
@@ -243,12 +241,12 @@
 
 ### Stage: Late Beta
 
-The project is in **late beta** stage. The data pipeline is production-ready with robust fallback chains, quality filtering, deduplication, and health reporting. The model architectures (NSLT and MethosV3) are implemented and compatible with the HuggingFace ecosystem. Training infrastructure is mostly scaffolded but not thoroughly tested at production scale.
+The project is in **late beta** stage. The data pipeline is production-ready with robust fallback chains, quality filtering, deduplication, and health reporting. The model architectures (NSLT and Dhara) are implemented and compatible with the HuggingFace ecosystem. Training infrastructure is mostly scaffolded but not thoroughly tested at production scale.
 
 **What's ready:**
 - Full data pipeline (registry → streaming → quality filtering → packing → weighted mixing)
 - Documentation scraping system (18 sources with timeouts and failure tracking)
-- Model architectures (NSLT with O(1) memory, MethosV3 with 11-layer cognitive architecture)
+- Model architectures (NSLT with O(1) memory, Dhara with 11-layer cognitive architecture)
 - Configuration system (Pydantic v2 with v1 migration)
 - Production validation (8 automated phases)
 - Experiment tracking adapter
@@ -286,7 +284,7 @@ It is **not yet ready** for turnkey production deployment without additional dev
 
 ### MEDIUM Priority
 4. **Run full production validation and fix all failures** — Execute `scripts/production_validation.py` with all 8 phases and address any failures found.
-5. **Track config_foundation.yaml in version control** — This file is referenced by production_validation.py but may not be committed. Ensure it is tracked and maintained.
+5. **Track config_foundation.yaml in version control** ✅ **RESOLVED** — `config_foundation.yaml` is committed and tracked.
 6. **Integrate CI/CD for automated validation** — Set up GitHub Actions (or equivalent) to:
    - Run `pytest` on every PR
    - Run `production_validation.py` on schedule or release
@@ -314,7 +312,7 @@ It is **not yet ready** for turnkey production deployment without additional dev
 | 2025-Q1 | 0.1.0 | Initial prototype |
 | 2025-Q2 | 0.2.0 | Data pipeline, streaming, registry |
 | 2025-Q3 | 0.3.0 | NSLT model, production validation |
-| 2025-Q4 | 0.4.0 | MethosV3 model, alignment pipeline |
+| 2025-Q4 | 0.4.0 | Dhara model, alignment pipeline |
 | 2026-Q1 | 0.5.0 | Documentation scraping, config v2 migration |
 | 2026-Q2 | 0.6.0-beta | Late beta — data pipeline production-ready |
 | 2026-Q3 | **1.0-pretraining (candidate)** | Final engineering pass: template URL filtering at discovery, CUDA discovery indentation bug, PostgreSQL version-agnostic validation, Linux kernel threshold, cuDNN `/latest/` seeds, corpus audit tool, transformers v5 integration-test fixes, local validation 14/14. **FINAL DECISION: READY TO FREEZE REPOSITORY** — remaining steps are operational server runs (re-crawl, `verify_datasets.py`, `production_validation.py`, `test_integration.py` with network/HF_TOKEN), not code changes. |

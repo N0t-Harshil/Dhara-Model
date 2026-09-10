@@ -1,5 +1,5 @@
 # =============================================================================
-# Methos Class Model — Dependencies
+# Dhara Class Model — Dependencies
 # =============================================================================
 # JupyterLab server (GPU training):
 #   pip install -r requirements.txt
@@ -29,7 +29,9 @@ pydantic>=2.0.0
 tqdm
 sentencepiece
 scipy
-einops
+numpy>=1.24
+requests>=2.31
+psutil>=5.9
 
 # Testing (required for `python main.py test`)
 pytest>=7.0
@@ -39,8 +41,8 @@ chromadb
 sentence-transformers
 networkx
 
-# Web Chat UI
-flask>=3.0.0
+# Web Chat UI (unused by current code; kept only if you run an external UI)
+# flask>=3.0.0
 
 # Optional: ~2x attention speed on A100/H100/Blackwell
 # flash-attn --no-build-isolation

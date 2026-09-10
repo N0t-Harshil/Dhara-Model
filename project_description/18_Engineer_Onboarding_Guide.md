@@ -4,35 +4,35 @@
 
 ```
 specialized-coding-model/
-├── config.yaml              # Primary training config (7B, 4x A100)
+├── config.yaml              # Primary training config (~10.55B, 4x A100)
 ├── config_foundation.yaml   # Foundation pretraining config (160M, 1x A100)
 ├── config_small.yaml        # Debug config (173M, 1x GPU)
 ├── main.py                  # CLI entrypoint (8 commands)
 ├── src/
 │   ├── data/                # Data pipeline (MOST POLISHED)
-│   │   ├── registry.py      # 55-dataset registry
+│   │   ├── registry.py      # 54-dataset registry
 │   │   ├── streaming.py     # Dataset loading with fallbacks
 │   │   ├── drivers.py       # File/Script/Local/Streaming driver families + builder cache
 │   │   ├── metadata_cache.py # Metadata records, fingerprints, URI rewriting
 │   │   ├── shards.py        # Shard-parallel progress store
-│   │   ├── pipeline.py      # Pipeline orchestration (2250 lines)
-│   │   ├── doc_builder.py   # 18-source web scraper (808 lines)
+│   │   ├── pipeline.py      # Pipeline orchestration (2604 lines)
+│   │   ├── doc_builder.py   # 18-source web scraper (975 lines)
 │   │   ├── quality.py       # Quality scoring + dedup
 │   │   ├── ast_filter.py    # Code quality via AST parsing
 │   │   ├── function_sampler.py # Function-level code sampling
 │   │   ├── sanity.py        # Sanity checks
 │   │   └── health_reporter.py # Dataset health stats
-│   ├── methos_v3/           # Core model (22 files)
-│   ├── nslt/                # Alternative model (10 files)
-│   ├── config/              # Pydantic schema (666 lines)
+│   ├── dhara/              # Core model (22 files)
+│   ├── nslt/                # Alternative model (11 files)
+│   ├── config/              # Pydantic schema (765 lines)
 │   ├── training/            # Training orchestration
 │   ├── models/              # Model factory
 │   ├── alignment/           # DPO + Constitutional AI
 │   ├── evaluation/          # Benchmarks + safety
 │   ├── infrastructure/      # Distributed + tracking
 │   └── utils/               # Logging + reproducibility
-├── scripts/                 # 13 utility/validation scripts
-├── tests/                   # 12 test files
+├── scripts/                 # 17 utility/validation scripts
+├── tests/                   # 26 test files, 287 tests
 ├── data/docs/               # Scraped documentation datasets
 ├── notebooks/               # Jupyter notebooks
 └── models/tokenizer/        # Tokenizer files (empty - downloaded)
@@ -74,7 +74,7 @@ specialized-coding-model/
 - Test: `python src/data/doc_builder.py --sources [name] --max-per-source 50`
 
 **To add a model architecture**:
-- Create files in `src/models/` or `src/methos_v3/`
+- Create files in `src/models/` or `src/dhara/`
 - Register in `src/models/factory.py`
 - Add config parameters in `src/config/schema.py`
 - Add config in YAML config files

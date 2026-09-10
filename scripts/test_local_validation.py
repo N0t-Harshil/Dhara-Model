@@ -634,7 +634,8 @@ def test_metadata_cache_roundtrip() -> None:
         rec = cache.build_record(info, ["data/train-00000.parquet"], "rev42",
                                  "pre1", "tok1", loader="parquet")
         check("record saved", cache.save(rec, info) is True)
-        rec_dir = Path(tmpdir) / "HuggingFaceFW___fineweb__default"
+        rec_dir = Path(tmpdir) / DatasetMetadataCache.safe_dir_name(
+            "HuggingFaceFW/fineweb", None, "train")
         for fname in ("dataset_info.json", "fingerprint.json", "revision.json",
                       "split.json", "cache_location.json", "record.json"):
             check(f"{fname} written", (rec_dir / fname).exists())
@@ -1561,7 +1562,7 @@ def test_registry_build_accepted_target_and_resume() -> None:
 
 def test_registry_build_shard_order_yield() -> None:
     print("\n--- Registry build: yield ordering reuses measured shards first ---")
-    import hashlib
+    from types import SimpleNamespace
     from src.config.schema import DatasetPolicyConfig
     from src.data.shards import ShardProgressStore
 
@@ -1569,8 +1570,14 @@ def test_registry_build_shard_order_yield() -> None:
         pipe, info = _pipe_with_local_registry(tmpdir, target=3)
         ppsig = pipe.processing_signature()
         toksig = pipe.tokenizer_signature
-        fp = hashlib.sha256(
-            f"{info.path}||train|{ppsig}|{toksig}".encode()).hexdigest()
+        # The progress record's fingerprint includes the resolved record's own
+        # fingerprint — reuse the pipeline's key derivation so the primed
+        # stats are actually found on the streaming run.
+        rec0 = pipe.meta_cache.verify(
+            SimpleNamespace(path=info.path, name=None, split="train",
+                            data_dir=None), ppsig, toksig)
+        assert rec0 is not None
+        fp = pipe._shard_progress_fingerprint(info, rec0, ppsig)
         store = ShardProgressStore(pipe.cfg.data.shard_progress_dir)
         rec = store.load(info.path, None, "train", fp)
         # shard 2 yielded 100%, shard 0 yielded 33% — yield order starts with 2
@@ -2083,7 +2090,7 @@ def test_script_family_pipeline_stream() -> None:
             check("script samples tagged",
                   all(s["_shard"] == 0 for s in out))
             check("builder record persisted",
-                  (Path(tmpdir) / "meta" / "builders" / "fake___script__default"
+                  (Path(tmpdir) / "meta" / "builders" / "fake___script__default__train"
                    / "builder_record.json").exists())
             check("raw_rows tracked", streamer.stats.raw_rows == 5)
 

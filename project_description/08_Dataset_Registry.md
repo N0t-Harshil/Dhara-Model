@@ -2,7 +2,7 @@
 
 ## Overview
 
-The dataset registry (`src/data/registry.py`) defines 55 dataset entries across 8 categories. Each entry is a `DatasetInfo` dataclass specifying the HuggingFace path, category, weight (fraction of total training tokens), quality score, fallback chains, language, domain, text fields, and licensing. The registry is built by `build_registry()` which calls 8 registration helpers, one per category, and normalizes weights to sum to 1.0.
+The dataset registry (`src/data/registry.py`) defines 54 primary dataset entries (58 registered including fallback-only) across 8 categories. Each entry is a `DatasetInfo` dataclass specifying the HuggingFace path, category, weight (fraction of total training tokens), quality score, fallback chains, language, domain, text fields, and licensing. The registry is built by `build_registry()` which calls 8 registration helpers, one per category, and normalizes weights to sum to 1.0.
 
 ## Category Weight Targets
 
@@ -42,9 +42,9 @@ The dataset registry (`src/data/registry.py`) defines 55 dataset entries across 
 - **Priority**: 5
 - **Function sampling**: enabled
 - **Languages**: Python (0.25), C++ (0.15), JavaScript (0.10), TypeScript (0.08), Java (0.08), Rust (0.07), Go (0.06), SQL (0.05), Shell (0.04), C# (0.04), PHP (0.03), C (0.02), Kotlin (0.01), Swift (0.01), Scala (0.01), R (0.01), Julia (0.01), Lua (0.01), Objective-C (0.01)
-- **Language targets**: Defined in `CODE_LANG_TARGETS` dict at `registry.py:157`
+- **Language targets**: Defined in `CODE_LANG_TARGETS` dict at `registry.py:166`
 - **Fallbacks**: code-search-net/code_search_net, codeparrot/codeparrot-clean (sql: b-mc2/sql-create-context)
-- **Notes**: 19 dedicated language entries. Individual language weights are proportional to `CODE_LANG_TARGETS`. Each language has its own registry entry with `name=lang_name` for targeted sampling.
+- **Notes**: 18 dedicated language entries (Python → Objective-C). Individual language weights are proportional to `CODE_LANG_TARGETS` (19 targets including C#). Each language has its own registry entry with `name=lang_name` for targeted sampling.
 
 ### code-search-net/code_search_net
 - **Path**: `code-search-net/code_search_net` (namespaced id of the legacy `code_search_net` repo — newer datasets/huggingface_hub reject namespace-less ids in `hf://` URIs; same repo, same data)
@@ -287,7 +287,7 @@ The dataset registry (`src/data/registry.py`) defines 55 dataset entries across 
 
 ## Weight Normalization
 
-After all entries are registered, `DatasetRegistry.normalize_weights()` (`src/data/registry.py:117`) ensures each category's total weight matches the `CATEGORY_WEIGHTS` targets. The normalization:
+After all entries are registered, `DatasetRegistry.normalize_weights()` (`src/data/registry.py:126`) ensures each category's total weight matches the `CATEGORY_WEIGHTS` targets. The normalization:
 1. Groups entries by category
 2. Calculates the current sum of weights per category
 3. Scales each entry's weight by `target / current`
@@ -296,7 +296,7 @@ After all entries are registered, `DatasetRegistry.normalize_weights()` (`src/da
 
 ## Fallback System
 
-When a dataset fails to load (gated, 404, network error), the `stream_dataset_with_fallbacks()` function (`src/data/streaming.py:96`) iterates through the fallback chain:
+When a dataset fails to load (gated, 404, network error), the `stream_dataset_with_fallbacks()` function (`src/data/streaming.py:471`) iterates through the fallback chain:
 1. Primary dataset → fallback[0] → fallback[1] → ...
 2. First successful dataset wins
 3. Fallback usage is logged via `registry.log_fallback()`

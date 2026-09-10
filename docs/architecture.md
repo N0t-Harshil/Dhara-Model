@@ -233,6 +233,16 @@ a hit skips streaming, tokenization, and HF resolution:
 - `unit_cache_packed_count` reads the packed count for deterministic step
   allocation (§8). Stage cache saves `global_stats`, language/domain
   distributions, rejection reasons for reporting.
+- **Dataset-granular completion** (`unit_completions.json`, written atomically
+  in `<model_dir>`): a unit counts as *complete* only after train → checkpoint
+  flush → `unit_identity.json` written into the latest checkpoint (stage/unit
+  index, `unit_key`, `unit_fingerprint`, `processed_cache_key`, global_step /
+  total_steps) → completion record committed. On restart the plan skips a unit
+  only when the manifest record's fingerprint **matches the current dataset
+  identity** (sha256 over path/name/data_dir/revision/category); a changed
+  identity — e.g. a revision bump — forces retrain even if the index was
+  previously reached. A crash before the commit leaves the unit incomplete and
+  it resumes/retrains.
 
 ---
 
@@ -249,6 +259,31 @@ a hit skips streaming, tokenization, and HF resolution:
   re-raised on the consumer (marked failed, run continues) and a build that
   never returns raises `PrefetchTimeout` (unit skipped, worker slot released).
   `close()` is idempotent and never blocks the caller.
+- **Duplicate-build prevention**: `UnitPrefetch.start()` derives an identity
+  per unit (`path`/`name`, or the raw value for synthetic units); a unit
+  scheduled more than once is built exactly once — later occurrences skip the
+  build and `get()` returns the shared payload of the first occurrence
+  (`[ASYNC] unit N duplicate of unit M — duplicate build prevented`). The count
+  is tracked in `stats["duplicates_prevented"]` and reported as
+  `duplicate builds prevented` in the ASYNC PIPELINE REPORT.
+- **Global async switch & emergency fallback**: prefetch (and stage metadata
+  warming) run only when *both* the staging block opts in (`staging.prefetch`)
+  and the global `data.async_pipeline.enabled` flag is `true`
+  (`_prefetch_enabled`, §10c). Setting `enabled: false` (or it being absent)
+  routes the pipeline to the original synchronous inline build — an emergency
+  fallback with identical dataset semantics, just no overlap.
+- **Enforced worker/buffer bounds**: all `data.async_pipeline` knobs are wired
+  into the engine, not just schema fields — `ready_queue_size` and
+  `max_inflight` cap the effective prefetch depth, `preprocess_workers` caps
+  producer threads (`_effective_prefetch_depth`, §10c), `metadata_workers`
+  fans the stage metadata warming out over up to that many threads, and
+  `retry_count` bounds background build retries (see below).
+- **Build retries**: a failing background build is retried up to
+  `data.async_pipeline.retry_count` times
+  (`[ASYNC] dataset N build failed (attempt a/b) — retrying`) before its
+  exception is delivered to the consumer; only then is the unit failed and
+  journaled. Transient network/resolution errors are absorbed without touching
+  the failure journal. Retried attempts are counted in the report.
 - **Stage metadata warming**: after the last unit of stage *i*, a daemon thread
   resolves+warm-caches the metadata for stage *i+1*'s datasets
   (`[META] stage N metadata warming in background`).
@@ -282,10 +317,41 @@ checksum) off the training thread:
 - Durability boundary: `_flush_checkpoints()` blocks until queued jobs are on
   disk and is called before every resume lookup / stage switch and at the
   final pretrain save.
+- **Submit/flush race (fixed)**: `submit()` increments the pending-job count
+  under the flush condition variable *before* enqueueing, so a fast job that
+  completes between submit and the count update can never leave `flush()`
+  waiting on a live writer. The queue-full timeout path decrements the count
+  again and writes synchronously. Regression: 200-cycle submit+flush stress
+  test.
 - If the writer thread dies, `submit()` falls back to a synchronous write —
   training never deadlocks and no checkpoint is silently lost.
 - Wired through `TrainingPipeline._save_checkpoint` and gated by
   `training.async_checkpoint` / `training.checkpoint_checksum`.
+
+---
+
+## 10c. Async pipeline configuration
+
+Gated by `data.async_pipeline` (all values configurable; defaults below):
+
+| key                 | default | meaning                                              |
+|---------------------|---------|------------------------------------------------------|
+| `enabled`           | `true`  | master switch; `false` = synchronous fallback (§10)  |
+| `prefetch_depth`    | 2       | staging depth capped by `ready_queue_size`+`max_inflight` (ge 1) |
+| `ready_queue_size`  | 2       | cap on buffered ready results — bounds effective depth (ge 1) |
+| `preprocess_workers`| 4       | cap on background build worker threads (ge 1)        |
+| `metadata_workers`  | 2       | fan-out of background metadata-warming threads (ge 1)|
+| `max_inflight`      | 4       | cap on outstanding background builds — bounds effective depth (ge 1) |
+| `retry_count`       | 3       | build retries before a failure reaches the journal (ge 0) |
+
+All values are enforced at runtime (§10); the two caps that bound depth are
+applied via `_effective_prefetch_depth` (min of staging depth, ready_queue,
+max_inflight).
+
+Staging-level knobs (`training.pretrain.staging`): `prefetch` (bool), 
+`prefetch_depth`, `prefetch_timeout` (ge 5s), `skip_failed_units_on_resume`,
+`abort_on_unit_error`. Prefetch needs both the staging opt-in and the global
+switch.
 
 ---
 

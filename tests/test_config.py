@@ -56,7 +56,7 @@ class TestConfigValidation:
 
     def test_config_defaults(self):
         cfg = Config()
-        assert cfg.model.name == "Methos Class Model"
+        assert cfg.model.name == "Dhara"
         assert cfg.training.sft.batch_size == 4
         assert len(cfg.alignment.constitution) == 10
 

@@ -333,7 +333,7 @@ def test_checkpoint_identity_and_resume():
         
         ctx = CheckpointContext(
             model_state={"weight": 1.0},
-            config={"architecture": "methos_v3", "stage_index": 1, "unit_index": 2},
+            config={"architecture": "dhara_v3", "stage_index": 1, "unit_index": 2},
         )
         
         writer = AsyncCheckpointWriter(checksum=True)

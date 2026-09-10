@@ -35,7 +35,7 @@ ARCH_CONFIG_MAP = {
     "qwen2_moe": (AutoConfig, AutoModelForCausalLM),
     "deepseek_v2": (AutoConfig, AutoModelForCausalLM),
     "nslt": (None, None),
-    "methos_v3": (None, None),
+    "dhara_v3": (None, None),
 }
 
 ARCH_FSDP_LAYER_MAP = {
@@ -44,7 +44,7 @@ ARCH_FSDP_LAYER_MAP = {
     "qwen2_moe": "Qwen2MoeDecoderLayer",
     "deepseek_v2": "DeepseekV2DecoderLayer",
     "nslt": "SSMCompressionEngine",
-    "methos_v3": "HierarchicalSSMStack",
+    "dhara_v3": "HierarchicalSSMStack",
 }
 
 
@@ -172,8 +172,8 @@ class ModelFactory:
         if arch.model_type == "mixtral" or arch.model_type == "qwen2_moe":
             spec["num_local_experts"] = arch.moe.num_experts
             spec["num_experts_per_tok"] = arch.moe.top_k
-        if arch.model_type == "methos_v3":
-            spec["methos_v3"] = arch.methos_v3.model_dump(mode="python")
+        if arch.model_type == "dhara_v3":
+            spec["dhara_v3"] = arch.dhara_v3.model_dump(mode="python")
         return spec
 
     @staticmethod
@@ -230,12 +230,12 @@ class ModelFactory:
         model_type = cfg.model.architecture.model_type
         dtype = ModelFactory._resolve_dtype(cfg.model.dtype)
 
-        if model_type == "methos_v3":
-            from src.methos_v3 import MethosV3Model
-            from src.methos_v3.model import MethosV3Config as MethosV3ModelConfig
+        if model_type == "dhara_v3":
+            from src.dhara import DharaModel
+            from src.dhara.model import DharaConfig as DharaModelConfig
             arch = cfg.model.architecture
-            v3 = arch.methos_v3
-            model_config = MethosV3ModelConfig(
+            v3 = arch.dhara_v3
+            model_config = DharaModelConfig(
                 vocab_size=len(tokenizer),
                 hidden_size=arch.hidden_size,
                 d_state=v3.d_state,
@@ -265,6 +265,15 @@ class ModelFactory:
                 n_language_groups=v3.n_language_groups,
                 adaptive_top_k_min=v3.adaptive_top_k_min,
                 adaptive_top_k_max=v3.adaptive_top_k_max,
+                n_experts=v3.n_experts,
+                n_debate_rounds=v3.n_debate_rounds,
+                max_refinement_passes=v3.max_refinement_passes,
+                max_repair_iters=v3.max_repair_iters,
+                max_entities=v3.max_entities,
+                n_relation_types=v3.n_relation_types,
+                max_events=v3.max_events,
+                n_tool_types=v3.n_tool_types,
+                loss_weights=getattr(v3, "loss_weights", None),
                 enable_executive=v3.enable_executive,
                 enable_world_model=v3.enable_world_model,
                 enable_tools=v3.enable_tools,
@@ -275,7 +284,7 @@ class ModelFactory:
                 qa_converge_threshold=v3.qa_converge_threshold,
             )
             setattr(model_config, _DTYPE_CONFIG_ATTR, dtype)
-            model = MethosV3Model(config=model_config)
+            model = DharaModel(config=model_config)
             return model
 
         if model_type == "nslt":
@@ -361,8 +370,8 @@ class ModelFactory:
                 "architecture": "nslt",
             }
 
-        if arch.model_type == "methos_v3":
-            v3 = arch.methos_v3
+        if arch.model_type == "dhara_v3":
+            v3 = arch.dhara_v3
             d_model = arch.hidden_size
             d_hidden = v3.d_hidden
             if tokenizer_or_vocab is not None:
@@ -385,7 +394,7 @@ class ModelFactory:
                 "layers": v3.n_ssm_layers,
                 "experts": 1,
                 "top_k": 1,
-                "architecture": "methos_v3",
+                "architecture": "dhara_v3",
             }
 
         vocab_size = arch.vocab_size
@@ -397,7 +406,11 @@ class ModelFactory:
         num_experts = arch.moe.num_experts
         experts_per_tok = arch.moe.top_k
 
-        embed_params = vocab_size * hidden * 2
+        # vocab*hidden counted once for embeddings; lm_head is tied when
+        # tie_word_embeddings is true (schema default), otherwise separate.
+        tie = bool(getattr(arch, "tie_word_embeddings", True))
+        embed_params = vocab_size * hidden
+        lm_head_params = 0 if tie else vocab_size * hidden
         per_layer_attn = 4 * hidden * hidden + 2 * hidden * (hidden // heads) * kv_heads
         if num_experts > 1:
             expert_params = num_experts * 3 * hidden * intermediate
@@ -407,8 +420,13 @@ class ModelFactory:
             per_layer_mlp = 3 * hidden * intermediate
             shared_params = 0
         per_layer_norm = 2 * hidden
-        total_params = embed_params + layers * (per_layer_attn + per_layer_mlp + per_layer_norm) + hidden * vocab_size
-        active_params = embed_params + layers * (per_layer_attn + (expert_params / experts_per_tok if num_experts > 1 else per_layer_mlp) + per_layer_norm) + hidden * vocab_size
+        total_params = embed_params + lm_head_params + layers * (per_layer_attn + per_layer_mlp + per_layer_norm)
+        # active = dense + per-token expert slice + shared expert
+        if num_experts > 1:
+            active_mlp = (expert_params / num_experts) * experts_per_tok + shared_params
+        else:
+            active_mlp = per_layer_mlp
+        active_params = embed_params + lm_head_params + layers * (per_layer_attn + active_mlp + per_layer_norm)
 
         return {
             "total_params_b": round(total_params / 1e9, 2),
@@ -434,6 +452,17 @@ class ModelFactory:
             tokenizer.add_special_tokens({"pad_token": "<pad>"})
         if not hasattr(tokenizer, "padding_side") or tokenizer.padding_side != "right":
             tokenizer.padding_side = "right"
+        report = ModelFactory.special_tokens_report(tokenizer)
+        logger.info("Special-token table: %s",
+                    {k: v for k, v in report.items() if k != "pad_aliases_eos"})
+        if report["pad_aliases_eos"]:
+            logger.warning(
+                "PAD token id == EOS token id (%d) — packed sequences pad with "
+                "EOS. Safe while loss labels mask these positions (-100); any "
+                "code path that feeds real padding tokens to the model will "
+                "see EOS semantics. Insert a distinct <pad> to change this.",
+                report["eos_token_id"],
+            )
         max_len = getattr(cfg, 'model', None) and getattr(cfg.model, 'architecture', None) and cfg.model.architecture.max_position_embeddings
         if (not hasattr(tokenizer, "model_max_length")
                 or tokenizer.model_max_length is None
@@ -453,6 +482,27 @@ class ModelFactory:
             if f.is_file() and f.name != "tokenizer_version.json":
                 out[f.name] = hashlib.sha256(f.read_bytes()).hexdigest()
         return out
+
+    @staticmethod
+    def special_tokens_report(tokenizer) -> Dict[str, Any]:
+        """Resolved special-token table plus the PAD/EOS aliasing flag.
+
+        Phase 10 audit: packing pads sequences with ``eos_token_id``, so every
+        log must state plainly whether ``pad_token_id == eos_token_id`` in the
+        active tokenizer (deepseek-style tokenizers alias them)."""
+        table = {
+            "bos_token_id": getattr(tokenizer, "bos_token_id", None),
+            "eos_token_id": getattr(tokenizer, "eos_token_id", None),
+            "unk_token_id": getattr(tokenizer, "unk_token_id", None),
+            "pad_token_id": getattr(tokenizer, "pad_token_id", None),
+            "mask_token_id": getattr(tokenizer, "mask_token_id", None),
+        }
+        table["pad_aliases_eos"] = (
+            table["pad_token_id"] is not None
+            and table["eos_token_id"] is not None
+            and table["pad_token_id"] == table["eos_token_id"]
+        )
+        return table
 
     @staticmethod
     def _verify_tokenizer_cache(path: Path) -> Optional[Dict[str, Any]]:
@@ -538,25 +588,31 @@ class ModelFactory:
             with open(config_file) as f:
                 saved_config = json.load(f)
             model_type = saved_config.get("model_type") or saved_config.get("architecture")
-        elif cfg.model.architecture.model_type in ("nslt", "methos_v3") and ((path / "pytorch_model.bin").exists() or (path / "model.safetensors").exists()):
+        elif cfg.model.architecture.model_type in ("nslt", "dhara_v3") and ((path / "pytorch_model.bin").exists() or (path / "model.safetensors").exists()):
             model_type = cfg.model.architecture.model_type
 
-        if model_type == "methos_v3":
-            from src.methos_v3 import MethosV3Model
-            from src.methos_v3.model import MethosV3Config as MethosV3ModelConfig
+        if model_type == "dhara_v3":
+            from src.dhara import DharaModel
+            from src.dhara.model import DharaConfig as DharaModelConfig
             bin_path = path / "pytorch_model.bin"
+            st_path = path / "model.safetensors"
             if bin_path.exists():
                 state_dict = torch.load(bin_path, map_location="cpu", weights_only=True)
-            else:
+            elif st_path.exists():
                 from safetensors.torch import load_file
-                state_dict = load_file(str(path / "model.safetensors"), device="cpu")
+                state_dict = load_file(str(st_path), device="cpu")
+            else:
+                raise FileNotFoundError(
+                    f"No model weights found in {path} (expected pytorch_model.bin or model.safetensors). "
+                    "Was the model saved with save_pretrained()?"
+                )
             if saved_config is not None:
-                model_config = MethosV3ModelConfig.from_pretrained(str(path))
+                model_config = DharaModelConfig.from_pretrained(str(path))
                 model_config.vocab_size = len(tokenizer)
             else:
                 arch = cfg.model.architecture
-                v3 = arch.methos_v3
-                model_config = MethosV3ModelConfig(
+                v3 = arch.dhara_v3
+                model_config = DharaModelConfig(
                     vocab_size=len(tokenizer),
                     hidden_size=arch.hidden_size,
                     d_state=v3.d_state,
@@ -586,31 +642,59 @@ class ModelFactory:
                     n_language_groups=v3.n_language_groups,
                     adaptive_top_k_min=v3.adaptive_top_k_min,
                     adaptive_top_k_max=v3.adaptive_top_k_max,
+                    n_experts=v3.n_experts,
+                    n_debate_rounds=v3.n_debate_rounds,
+                    max_refinement_passes=v3.max_refinement_passes,
+                    max_repair_iters=v3.max_repair_iters,
+                    max_entities=v3.max_entities,
+                    n_relation_types=v3.n_relation_types,
+                    max_events=v3.max_events,
+                    n_tool_types=v3.n_tool_types,
+                    enable_curiosity=getattr(v3, "enable_curiosity", True),
+                    loss_weights=getattr(v3, "loss_weights", None),
+                    executive_gate_threshold=getattr(v3, "executive_gate_threshold", 0.3),
+                    qa_max_passes=getattr(v3, "qa_max_passes", 5),
                 )
             setattr(model_config, _DTYPE_CONFIG_ATTR, ModelFactory._resolve_dtype(cfg.model.dtype))
-            model = MethosV3Model(config=model_config)
+            model = DharaModel(config=model_config)
             model_state = model.state_dict()
             filtered = {}
+            shape_skipped = []
             for k, v in state_dict.items():
                 if k in model_state and v.shape == model_state[k].shape:
                     filtered[k] = v
+                else:
+                    shape_skipped.append(k)
             missing, unexpected = model.load_state_dict(filtered, strict=False)
-            skipped = len(state_dict) - len(filtered)
             if missing:
                 msg = f"Checkpoint missing {len(missing)} keys: {sorted(missing)[:8]}"
                 if strict:
                     raise RuntimeError(msg)
                 logger.info("Random init for %d new parameters — %s", len(missing), sorted(missing)[:4])
-            if skipped:
-                logger.info("Skipped %d incompatible checkpoint weights", skipped)
+            if shape_skipped:
+                msg = (f"Checkpoint has {len(shape_skipped)} incompatible/unknown weights "
+                       f"(skipped): {sorted(shape_skipped)[:8]}")
+                if strict:
+                    raise RuntimeError(msg)
+                logger.info("%s", msg)
             for param in model.parameters():
                 param.requires_grad = True
             return model, tokenizer
 
         if model_type == "nslt":
             from src.nslt import NSLTModel
-            import torch.nn as nn
-            state_dict = torch.load(path / "pytorch_model.bin", map_location="cpu", weights_only=True)
+            bin_path = path / "pytorch_model.bin"
+            st_path = path / "model.safetensors"
+            if bin_path.exists():
+                state_dict = torch.load(bin_path, map_location="cpu", weights_only=True)
+            elif st_path.exists():
+                from safetensors.torch import load_file
+                state_dict = load_file(str(st_path), device="cpu")
+            else:
+                raise FileNotFoundError(
+                    f"No model weights found in {path} (expected pytorch_model.bin or model.safetensors). "
+                    "Was the model saved with save_pretrained()?"
+                )
             arch = cfg.model.architecture
             nslt_cfg = arch.nslt
             model = NSLTModel(
@@ -628,7 +712,20 @@ class ModelFactory:
                 use_efficient_sandbox=nslt_cfg.use_efficient_sandbox,
                 dtype=ModelFactory._resolve_dtype(cfg.model.dtype),
             )
-            model.load_state_dict(state_dict, strict=False)
+            model_state = model.state_dict()
+            # Filter BEFORE load_state_dict: torch raises on size mismatches
+            # even with strict=False.
+            filtered = {k: v for k, v in state_dict.items()
+                        if k in model_state and v.shape == model_state[k].shape}
+            shape_skipped = sorted(set(state_dict) - set(filtered))
+            missing, unexpected = model.load_state_dict(filtered, strict=False)
+            if strict and (missing or shape_skipped):
+                raise RuntimeError(
+                    f"Strict load failed: {len(missing)} missing keys, "
+                    f"{len(shape_skipped)} incompatible/unknown weights"
+                )
+            if shape_skipped:
+                logger.info("Skipped %d incompatible checkpoint weights", len(shape_skipped))
             for param in model.parameters():
                 param.requires_grad = True
             return model, tokenizer

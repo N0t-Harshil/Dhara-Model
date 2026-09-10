@@ -31,7 +31,9 @@ def check_packed_sample(
 ) -> Dict[str, Any]:
     decoded = tokenizer.decode(input_ids, skip_special_tokens=False)
     eos_id = tokenizer.eos_token_id or 0
-    num_segments = sum(1 for t in input_ids if t == eos_id)
+    # Don't count EOS padding (attention_mask==0) as document separators:
+    # pack_sequences pads input_ids with eos_token_id while masking pads.
+    num_segments = sum(1 for t, m in zip(input_ids, attention_mask) if t == eos_id and m == 1)
     pad_ratio = attention_mask.count(0) / max(len(attention_mask), 1)
     label_mask_ratio = labels.count(-100) / max(len(labels), 1)
     has_func = any(m in decoded for m in CONTENT_MARKERS["function_bodies"])
@@ -89,7 +91,7 @@ def run_sanity_checks(
     only_license = 0
     for idx in indices:
         sample = dataset[idx]
-        input_ids = sample.get("input_ids", sample.get("input_ids", []))
+        input_ids = sample.get("input_ids", [])
         labels = sample.get("labels", [])
         attention_mask = sample.get("attention_mask", [1] * len(input_ids))
         if isinstance(input_ids, (list, tuple)):

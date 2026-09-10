@@ -7,8 +7,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-os.environ["HF_TOKEN"] = ""
-
 from datasets import load_dataset
 from src.data.registry import build_registry
 

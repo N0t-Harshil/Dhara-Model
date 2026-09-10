@@ -5,7 +5,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
-from src.methos_v3.quality_assurance import QualityAssurance
+from src.dhara.quality_assurance import QualityAssurance
 
 
 class SelfEvaluation(nn.Module):

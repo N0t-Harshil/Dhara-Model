@@ -112,6 +112,20 @@ def entity_prediction_loss(entity_logits: torch.Tensor,
     return torch.tensor(0.0, device=entity_logits.device)
 
 
+def decoder_loss(decoder_logits: torch.Tensor,
+                 decoder_targets: Optional[torch.Tensor],
+                 weight: float = 0.01) -> torch.Tensor:
+    if decoder_targets is not None:
+        flat_logits = decoder_logits.view(-1, decoder_logits.size(-1))
+        flat_targets = decoder_targets.reshape(-1)
+        valid = flat_targets != -100
+        if valid.any():
+            return weight * F.cross_entropy(
+                flat_logits[valid], flat_targets[valid]
+            )
+    return torch.tensor(0.0, device=decoder_logits.device)
+
+
 class AuxiliaryLossComputer(nn.Module):
     def __init__(self, weights: Optional[Dict[str, float]] = None):
         super().__init__()
@@ -144,6 +158,24 @@ class AuxiliaryLossComputer(nn.Module):
                 weight=self.weights.get("intent", 0.05),
             )
 
+        if "memory" in module_outputs:
+            mem = module_outputs["memory"]
+            mem_out = mem.get("state", mem) if isinstance(mem, dict) else mem
+            recon = mem.get("reconstruction", mem_out) if isinstance(mem, dict) else mem_out
+            losses["memory"] = memory_reconstruction_loss(
+                mem_out, recon,
+                weight=self.weights.get("memory", 0.01),
+            )
+
+        if "planning" in module_outputs:
+            plan = module_outputs["planning"]
+            if isinstance(plan, dict):
+                st = (targets or {}).get("subgoal", {}).get("ids") if targets else None
+                losses["planning"] = planning_loss(
+                    plan, subgoal_targets=st,
+                    weight=self.weights.get("planning", 0.05),
+                )
+
         if "executive" in module_outputs:
             exec_out = module_outputs["executive"]
             if "gates" in exec_out:
@@ -170,13 +202,38 @@ class AuxiliaryLossComputer(nn.Module):
                     weight=self.weights.get("calibration", 0.005),
                 )
 
+        if "trajectory" in module_outputs:
+            losses["trajectory"] = trajectory_smoothness_loss(
+                module_outputs["trajectory"],
+                weight=self.weights.get("trajectory", 0.001),
+            )
+
         if "tools" in module_outputs:
             tools_out = module_outputs["tools"]
-            if "route_weights" in tools_out:
+            if isinstance(tools_out, dict) and "route_weights" in tools_out:
                 tt = (targets or {}).get("tool_type")
                 losses["tools"] = tool_selection_loss(
                     tools_out["route_weights"], tt,
                     weight=self.weights.get("tools", 0.05),
+                )
+
+        if "entity" in module_outputs:
+            ent = module_outputs["entity"]
+            ent_logits = ent.get("logits", ent) if isinstance(ent, dict) else ent
+            et = (targets or {}).get("entity_ids") if targets else None
+            losses["entity"] = entity_prediction_loss(
+                ent_logits, et,
+                weight=self.weights.get("entity", 0.01),
+            )
+
+        if "decoder" in module_outputs:
+            dec = module_outputs["decoder"]
+            dec_logits = dec.get("logits", dec) if isinstance(dec, dict) else dec
+            dt = (targets or {}).get("decoder_ids") if targets else None
+            if dt is not None:
+                losses["decoder"] = decoder_loss(
+                    dec_logits, dt,
+                    weight=self.weights.get("decoder", 0.01),
                 )
 
         if "quality_assurance" in module_outputs:

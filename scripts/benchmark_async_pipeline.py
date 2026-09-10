@@ -211,7 +211,10 @@ def bench_failure_isolation() -> dict:
     delivered = []
     for i in range(UNITS):
         try:
-            delivered.append(pf.get(i))
+            r = pf.get(i)
+            if isinstance(r, tuple) and len(r) == 3:
+                r = r[0]  # (payload, gpu_wait_sec, prep_timing)
+            delivered.append(r)
         except RuntimeError:
             delivered.append(None)
     wall = time.monotonic() - t0

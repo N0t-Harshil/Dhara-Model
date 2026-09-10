@@ -57,7 +57,7 @@ A registry that holds all `DatasetInfo` entries, tracks fallback usage, and prov
 
 - `TEXT_FIELD_CANDIDATES: List[str]` — `["text", "content", "body", "code", "document", "article", "source", "output", "problem", "solution", "abstract", "section"]`
 - `TEXT_FIELD_PRIORITY: List[str]` — Priority-ordered list of field names for text detection (includes `"func_code_string"`, `"whole_func_string"`, `"documentation"`, `"doc_string"`, `"func_documentation_string"`).
-- `STACK_V2_LANGUAGES: Dict[str, str]` — Maps language names (e.g. `"Python"`, `"Rust"`) to short keys (e.g. `"python"`, `"rust"`). 17 languages total.
+- `STACK_V2_LANGUAGES: Dict[str, str]` — Maps language names (e.g. `"Python"`, `"Rust"`) to short keys (e.g. `"python"`, `"rust"`). 18 languages total.
 - `CODE_LANG_TARGETS: Dict[str, float]` — Target language distribution within code category (e.g. `"python": 0.25`).
 - `WEB_FALLBACKS: List[str]` — `["allenai/dolma", "togethercomputer/RedPajama-Data-1T", "tiiuae/falcon-refinedweb"]`
 - `DOC_SOURCES: Dict[str, Dict]` — Maps documentation source names to metadata (language, quality_score, weight, domain). 18 sources: `python-docs`, `pytorch-docs`, `numpy-docs`, `rust-book`, `go-docs`, `mdn-docs`, `fastapi-docs`, `cuda-docs`, `linux-kernel-docs`, `opencv-docs`, `kubernetes-docs`, `docker-docs`, `postgresql-docs`, `sqlite-docs`, `cudnn-docs`, `onnx-docs`, `rfcs`, `lang-specs`.
@@ -67,7 +67,7 @@ A registry that holds all `DatasetInfo` entries, tracks fallback usage, and prov
 
 - `detect_text_fields(sample: dict, known_fields: Optional[list]) -> list` — Scans a sample dict for text fields. First checks `known_fields` if provided, then `TEXT_FIELD_PRIORITY`, then all keys (looking for strings > 50 chars). Returns a list with one field name (or `["text"]` as fallback).
 - `extract_text(sample: dict, fields: Optional[list]) -> str` — Extracts text from a sample using the given fields or priority list. Falls back to concatenating all long string values (100+ chars) separated by double newlines.
-- `build_registry() -> DatasetRegistry` — Constructs the full registry by calling all `_register_*` helpers in sequence: `_register_code` (code: 30%), registers FineWeb (web_text: 20%), `_register_docs` (docs: 15%), `_register_wiki` (wiki: 10%), `_register_math` (math: 10%), `_register_science` (science: 5%), `_register_books` (books: 5%), `_register_structured` (structured_knowledge: 5%). Normalizes weights to match `CATEGORY_WEIGHTS`. Returns populated `DatasetRegistry` with ~55 entries.
+- `build_registry() -> DatasetRegistry` — Constructs the full registry by calling all `_register_*` helpers in sequence: `_register_code` (code: 30%), registers FineWeb (web_text: 20%), `_register_docs` (docs: 15%), `_register_wiki` (wiki: 10%), `_register_math` (math: 10%), `_register_science` (science: 5%), `_register_books` (books: 5%), `_register_structured` (structured_knowledge: 5%). Normalizes weights to match `CATEGORY_WEIGHTS`. Returns populated `DatasetRegistry` with 54 primary entries (58 registered including fallback-only).
 
 ### Registration Helpers (internal)
 
@@ -420,10 +420,10 @@ Top-level configuration object. Loaded from YAML via `load_config()`. Contains n
 | Model | Key Fields |
 |---|---|
 | `ModelConfig` | `name`, `dtype`, `device`, `train_from_scratch`, `architecture: ModelArchitectureConfig`, `load_in_8bit`, `load_in_4bit` |
-| `ModelArchitectureConfig` | `model_type` (llama/mixtral/qwen2_moe/deepseek_v2/nslt/methos_v3), `hidden_size`, `num_hidden_layers`, `num_attention_heads`, `num_key_value_heads`, `intermediate_size`, `moe: MoEConfig`, `nslt: NSLTConfig`, `methos_v3: MethosV3Config`, `multimodal: MultimodalConfig`, `max_position_embeddings`, `rope_theta`, `rope_scaling`, `attention_implementation`, `tie_word_embeddings`, `attention_bias`, `attention_dropout`, `hidden_act`, `rms_norm_eps`, `initializer_range`, `pretraining_tp`, `mlp_bias`, `gradient_checkpointing`, `activation_checkpointing`, `use_compile`, `vocab_size` |
+| `ModelArchitectureConfig` | `model_type` (llama/mixtral/qwen2_moe/deepseek_v2/nslt/dhara_v3), `hidden_size`, `num_hidden_layers`, `num_attention_heads`, `num_key_value_heads`, `intermediate_size`, `moe: MoEConfig`, `nslt: NSLTConfig`, `dhara_v3: DharaConfig`, `multimodal: MultimodalConfig`, `max_position_embeddings`, `rope_theta`, `rope_scaling`, `attention_implementation`, `tie_word_embeddings`, `attention_bias`, `attention_dropout`, `hidden_act`, `rms_norm_eps`, `initializer_range`, `pretraining_tp`, `mlp_bias`, `gradient_checkpointing`, `activation_checkpointing`, `use_compile`, `vocab_size` |
 | `MoEConfig` | `num_experts`, `top_k`, `expert_capacity`, `shared_expert_count`, `shared_expert_gate`, `norm_topk_prob`, `output_router_logits`, `aux_loss_coef`, `jitter_noise`, `router_aux_loss_coef` |
 | `NSLTConfig` | `d_state`, `d_hidden`, `n_ssm_layers`, `n_ode_steps`, `solver`, `n_trajectories`, `n_sim_steps`, `use_efficient_sandbox`, `sparsity_pct` |
-| `MethosV3Config` | 40+ parameters: `d_state`, `d_hidden`, `n_ssm_layers`, `n_hssm_levels`, `n_ode_steps`, `n_trajectories`, `n_sim_steps`, `use_efficient_sandbox`, `sparsity_pct`, `n_token_categories`, `n_languages`, `n_doc_roles`, `n_task_types`, `n_difficulty_levels`, `n_reasoning_types`, `max_subgoals`, `n_domains`, `max_reasoning_steps`, `n_semantic_concepts`, `working_mem_capacity`, `max_episodes`, `n_context_adapter_blocks`, `n_language_groups`, `adaptive_top_k_min`, `adaptive_top_k_max`, `n_experts`, `n_debate_rounds`, `max_refinement_passes`, `max_repair_iters`, `max_entities`, `n_relation_types`, `max_events`, `n_tool_types`, `enable_executive`, `enable_world_model`, `enable_learning_controller`, `enable_tools`, `enable_curiosity`, `enable_aux_losses`, `executive_gate_threshold`, `qa_max_passes`, `qa_converge_threshold`, `loss_weights` |
+| `DharaConfig` | 40+ parameters: `d_state`, `d_hidden`, `n_ssm_layers`, `n_hssm_levels`, `n_ode_steps`, `n_trajectories`, `n_sim_steps`, `use_efficient_sandbox`, `sparsity_pct`, `n_token_categories`, `n_languages`, `n_doc_roles`, `n_task_types`, `n_difficulty_levels`, `n_reasoning_types`, `max_subgoals`, `n_domains`, `max_reasoning_steps`, `n_semantic_concepts`, `working_mem_capacity`, `max_episodes`, `n_context_adapter_blocks`, `n_language_groups`, `adaptive_top_k_min`, `adaptive_top_k_max`, `n_experts`, `n_debate_rounds`, `max_refinement_passes`, `max_repair_iters`, `max_entities`, `n_relation_types`, `max_events`, `n_tool_types`, `enable_executive`, `enable_world_model`, `enable_learning_controller`, `enable_tools`, `enable_curiosity`, `enable_aux_losses`, `executive_gate_threshold`, `qa_max_passes`, `qa_converge_threshold`, `loss_weights` |
 | `VisionConfig` | `enabled`, `vision_encoder`, `image_size`, `patch_size`, `vision_hidden_size`, `num_vision_layers`, `num_attention_heads`, `intermediate_size`, `projection_dim`, `freeze_vision_encoder`, `tie_vision_embeddings`, `image_token_id`, `max_images_per_sample` |
 | `MultimodalConfig` | `vision: VisionConfig` |
 | `RopeScalingConfig` | `type`, `factor`, `target_max_length`, `original_max_position_embeddings` |
@@ -464,23 +464,23 @@ Top-level configuration object. Loaded from YAML via `load_config()`. Contains n
 - `is_compatible(cfg: Config, tokenizer: PreTrainedTokenizerBase, model_path: Path) -> bool` — Checks if a saved checkpoint's architecture matches the current config.
 
 - `create_model(cfg: Config, tokenizer: PreTrainedTokenizerBase) -> nn.Module` — Creates a model based on `cfg.model.architecture.model_type`. Supports:
-  - `"methos_v3"` → `MethosV3Model` (from `src.methos_v3`)
+  - `"dhara_v3"` → `DharaModel` (from `src.dhara`)
   - `"nslt"` → `NSLTModel` (from `src.nslt`)
   - `"llama"` → `LlamaForCausalLM`
   - `"mixtral"` → `MixtralForCausalLM`
   - `"qwen2_moe"` / `"deepseek_v2"` → `AutoModelForCausalLM.from_config()`
 
-- `create_methos_v3(cfg) -> MethosV3Model` — Convenience method (inline logic in `create_model`).
+- `create_dhara_v3(cfg) -> DharaModel` — Convenience method (inline logic in `create_model`).
 
 - `create_nslt(cfg) -> NSLTModel` — Convenience method (inline logic in `create_model`).
 
-- `load_model(path: str | Path, cfg: Config, tokenizer: Optional[PreTrainedTokenizerBase] = None, strict: bool = False) -> Tuple[PreTrainedModel, PreTrainedTokenizerBase]` — Loads a model from checkpoint. Supports methos_v3 (with state dict filtering for shape mismatches), nslt, and standard HF models (via `AutoModelForCausalLM.from_pretrained`). Returns `(model, tokenizer)`.
+- `load_model(path: str | Path, cfg: Config, tokenizer: Optional[PreTrainedTokenizerBase] = None, strict: bool = False) -> Tuple[PreTrainedModel, PreTrainedTokenizerBase]` — Loads a model from checkpoint. Supports dhara_v3 (with state dict filtering for shape mismatches), nslt, and standard HF models (via `AutoModelForCausalLM.from_pretrained`). Returns `(model, tokenizer)`.
 
 - `load_tokenizer(path: str | Path = "models/tokenizer", cfg: Optional[Any] = None) -> PreTrainedTokenizerBase` — Loads tokenizer from path. Tries `AutoTokenizer`, then `PreTrainedTokenizerFast`, then falls back to constructing from `vocab.json` + `merges.txt`. Sets pad token and padding side.
 
 - `estimate_model_size(arch: ModelArchitectureConfig, tokenizer_or_vocab: Any = None) -> Dict[str, Any]` — Estimates parameter counts for all architecture types. Returns `{"total_params_b": float, "active_params_b": float, "layers": int, "experts": int, "top_k": int, "architecture": str}`.
 
-- `get_fsdp_layer_cls(model_type: str) -> str` — Returns the transformer layer class name for FSDP wrapping (e.g. `"HierarchicalSSMStack"` for methos_v3, `"SSMCompressionEngine"` for nslt).
+- `get_fsdp_layer_cls(model_type: str) -> str` — Returns the transformer layer class name for FSDP wrapping (e.g. `"HierarchicalSSMStack"` for dhara_v3, `"SSMCompressionEngine"` for nslt).
 
 **Private Methods:**
 
@@ -494,12 +494,12 @@ Top-level configuration object. Loaded from YAML via `load_config()`. Contains n
 
 ---
 
-## `src.methos_v3.model`
+## `src.dhara.model`
 
-### `MethosV3Config(PretrainedConfig)`
+### `DharaConfig(PretrainedConfig)`
 
 **Class Attributes:**
-- `model_type = "methos_v3"`
+- `model_type = "dhara_v3"`
 
 **Constructor Parameters (40+):**
 
@@ -553,10 +553,10 @@ Top-level configuration object. Loaded from YAML via `load_config()`. Contains n
 | `loss_weights` | `Optional[Dict[str,float]]` | None | Loss weights |
 | `is_encoder_decoder` | `bool` | False | HF compatibility flag |
 
-### `MethosV3Model(PreTrainedModel)`
+### `DharaModel(PreTrainedModel)`
 
 **Class Attributes:**
-- `config_class = MethosV3Config`
+- `config_class = DharaConfig`
 - `base_model_prefix = "model"`
 - `supports_gradient_checkpointing = True`
 - `_no_split_modules` — List of module names for FSDP wrapping.
@@ -588,13 +588,13 @@ Top-level configuration object. Loaded from YAML via `load_config()`. Contains n
 **Private Methods:**
 - `_log_architecture()` — Logs parameter counts and module status.
 
-### `MethosV3ForCausalLM(MethosV3Model)`
+### `DharaForCausalLM(DharaModel)`
 
 Adds a linear `lm_head` for standard causal LM interface.
 
 - `forward(*args, **kwargs) -> CausalLMOutputWithPast` — Delegates to parent, passes through `lm_head` on logits during inference.
 
-### `MoEMethosV3Model(MethosV3Model)`
+### `DharaMoEModel(DharaModel)`
 
 - Constructor adds `n_experts` and `top_k_experts` parameters for MoE variant.
 

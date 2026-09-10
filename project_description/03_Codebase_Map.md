@@ -5,10 +5,10 @@
 | File | Purpose |
 |---|---|
 | `main.py` | CLI entrypoint — GPU auto-selection, subcommand dispatch (train, test, chat, etc.), config loading |
-| `config.yaml` | Primary training config — Methos V4 NSLT, 4x A100 80GB, vocab_size=128000, 1M pretrain steps |
-| `config_foundation.yaml` | Foundation pretraining config — 1x A100 (~160M params), vocab_size=64000, 50K pretrain steps |
+| `config.yaml` | Primary training config — Dhara V4, 4x A100 80GB, vocab_size=128000, 1M pretrain steps |
+| `config_foundation.yaml` | Foundation pretraining config — 1x A100 (~160M params), vocab_size=64000, staged 50K pretrain steps |
 | `config_small.yaml` | Small/test config — single GPU debug, 173M params, 2 datasets only |
-| `ARCHITECTURE.md` | Detailed Methos V4 architecture spec — 11-layer workspace-centric cognitive architecture |
+| `ARCHITECTURE.md` | Detailed Dhara architecture spec — 11-layer workspace-centric cognitive architecture |
 | `PROJECT_DOCUMENTATION.md` | High-level project overview and usage guide |
 | `README.md` | Project README with setup instructions |
 | `requirements.txt` | Production dependencies — torch 2.6, transformers 4.43, datasets, pydantic, etc. |
@@ -28,17 +28,17 @@
 
 | File | Lines | Responsibility |
 |---|---|---|
-| `registry.py` | 464 | Central dataset registry — 55 entries across 8 categories, weight management, fallback tracking |
-| `streaming.py` | 549 | Dataset loading with fallback chains — handles all 4 DatasetDict/IterableDataset types |
-| `drivers.py` | 722 | Dataset driver abstraction — File/Script/Local/Streaming families, builder cache, `detect_driver()` |
-| `metadata_cache.py` | 419 | Metadata record cache — file lists, loader detection, fingerprints, gated-error helpers |
-| `shards.py` | 184 | Shard-parallel progress store — resume state, per-shard stats, completion tracking |
-| `pipeline.py` | 1123 | Complete dataset assembly — quality filtering, dedup, boilerplate removal, AST filtering, function sampling, weighted mixing, sequence packing, disk caching |
-| `quality.py` | 508 | Quality scoring (8 components), 4 deduplication strategies (Exact/MinHash/SimHash/Semantic), contamination filtering, language detection |
-| `doc_builder.py` | 820 | Web scraping for 18 documentation sources — Sphinx-based, RFCs, MDN, NVIDIA docs |
-| `ast_filter.py` | 200 | AST-based code filtering — identifier ratio, executable ratio, autogen detection |
+| `registry.py` | 489 | Central dataset registry — 54 primary entries (+4 fallback-only) across 8 categories, weight management, fallback tracking |
+| `streaming.py` | 586 | Dataset loading with fallback chains — handles all 4 DatasetDict/IterableDataset types |
+| `drivers.py` | 827 | Dataset driver abstraction — File/Script/Local/Streaming families, builder cache, `detect_driver()` |
+| `metadata_cache.py` | 458 | Metadata record cache — file lists, loader detection, fingerprints, gated-error helpers |
+| `shards.py` | 190 | Shard-parallel progress store — resume state, per-shard stats, completion tracking |
+| `pipeline.py` | 2604 | Complete dataset assembly — quality filtering, dedup, boilerplate removal, AST filtering, function sampling, weighted mixing, sequence packing, disk caching, async prefetch + cancellation |
+| `quality.py` | 630 | Quality scoring (8 components), 4 deduplication strategies (Exact/MinHash/SimHash/Semantic), contamination filtering, language detection |
+| `doc_builder.py` | 975 | Web scraping for 18 documentation sources — Sphinx-based, RFCs, MDN, NVIDIA docs |
+| `ast_filter.py` | 218 | AST-based code filtering — identifier ratio, executable ratio, autogen detection |
 | `function_sampler.py` | 57 | Function-level code sampling — extract functions, sample or fallback to full code |
-| `health_reporter.py` | 239 | Dataset health reporting — per-dataset stats, global stats, error tracking |
+| `health_reporter.py` | 307 | Dataset health reporting — per-dataset stats, global stats, error tracking |
 | `sanity.py` | 144 | Sanity checks on packed samples — decode quality, content markers |
 | `__init__.py` | — | Package init |
 
@@ -55,7 +55,7 @@
 
 | File | Lines | Responsibility |
 |---|---|---|
-| `schema.py` | 666 | 30+ Pydantic models — Config (root), ModelConfig, TrainingConfig, DataConfig, DistributedConfig, FSDPConfig, MethosV3Config, NSLTConfig, MoEConfig, etc. Cross-field validation, auto-migration |
+| `schema.py` | 765 | 30+ Pydantic models — Config (root), ModelConfig, TrainingConfig, DataConfig, DistributedConfig, FSDPConfig, DharaConfig, NSLTConfig, MoEConfig, etc. Cross-field validation, auto-migration |
 | `__init__.py` | — | Package init |
 
 **Dependencies**: `pydantic>=2.0.0`, `pyyaml`
@@ -63,15 +63,15 @@
 
 ---
 
-### `src/methos_v3/` — Core Model Architecture
+### `src/dhara/` — Core Model Architecture
 
-**Purpose**: Methos V3/V4 — 11-layer workspace-centric cognitive architecture with SSM compression, hierarchical planning, specialist debate, symbolic tools, and quality assurance.
+**Purpose**: Dhara (formerly Methos V3/V4) — 11-layer workspace-centric cognitive architecture with SSM compression, hierarchical planning, specialist debate, symbolic tools, and quality assurance.
 
 **Files** (22 files):
 
 | File | Lines | Layer / Module |
 |---|---|---|
-| `model.py` | 414 | Core model — MethosV3Config, MethosV3Model, MethosV3ForCausalLM, MoEMethosV3Model |
+| `model.py` | 490 | Core model — DharaConfig, DharaModel, DharaForCausalLM, DharaMoEModel |
 | `layer1_tokenizer.py` | — | Intelligent Tokenizer — multi-granularity tokenization |
 | `layer2_embedding.py` | — | Adaptive Semantic Embedding |
 | `layer3_memory.py` | — | Hierarchical Memory Engine — SSM compression + HSSM multi-scale |
@@ -102,11 +102,11 @@
 
 **Purpose**: Alternative non-Transformer architecture — O(1) memory via SSM compression, continuous ODE reasoning via LTC, energy-based reasoning via LatentSandbox, sparse output.
 
-**Files** (10 files):
+**Files** (11 files):
 
 | File | Lines | Responsibility |
 |---|---|---|
-| `model.py` | 719 | Full NSLT model — NSLTModel, MoENSLTModel, TokenEmbedding, RotaryPositionEncoding |
+| `model.py` | 759 | Full NSLT model — NSLTModel, MoENSLTModel, TokenEmbedding, RotaryPositionEncoding |
 | `layer1_ssm.py` | — | SSM Compression Engine — structured state-space sequence modeling |
 | `layer2_ltc.py` | — | LTC Routing Layer — liquid time-constant ODE |
 | `layer3_sandbox.py` | — | Latent Sandbox — energy-based parallel vector reasoning |
@@ -129,7 +129,9 @@
 
 | File | Lines | Responsibility |
 |---|---|---|
-| `pipeline.py` | 556 | TrainingPipeline — stage management, checkpointing, logging, gradient checkpointing |
+| `pipeline.py` | 1772 | TrainingPipeline — stage management, checkpointing, logging, gradient checkpointing, dataset-granular staged pretraining |
+| `asyncprefetch.py` | 763 | Async unit prefetch — daemon producers, per-slot cancellation, retry/backoff |
+| `checkpoint.py` | 283 | Checkpoint IO — async write, atomic rename, meta/resumer wiring |
 | `__init__.py` | — | Package init |
 
 **Dependencies**: `src.config`, `src.data`, `src.models`, `src.infrastructure`, `src.alignment`, `src.evaluation`
@@ -144,8 +146,9 @@
 
 | File | Lines | Responsibility |
 |---|---|---|
-| `distributed.py` | 123 | DistributedSetup — process group init, FSDP arg preparation, device placement, multi-node support |
+| `distributed.py` | 156 | DistributedSetup — process group init, FSDP arg preparation, device placement, multi-node support |
 | `tracking.py` | 79 | ExperimentTracker — wraps wandb/mlflow/tensorboard, log metrics/configs/checkpoints |
+| `telemetry.py` | 204 | Async logger / telemetry streams — stage-tagged metrics, EWMA throughput |
 
 **Dependencies**: `torch.distributed`, `wandb`/`mlflow`/`tensorboard` (optional)
 
@@ -159,7 +162,7 @@
 
 | File | Lines | Responsibility |
 |---|---|---|
-| `factory.py` | 604 | ModelFactory — create MethosV3, NSLT, MoE variants, LLaMA, Mixtral, Qwen2MoE, DeepSeekV2 |
+| `factory.py` | 764 | ModelFactory — create Dhara, NSLT, MoE variants, LLaMA, Mixtral, Qwen2MoE, DeepSeekV2 |
 
 **Dependencies**: `torch`, `transformers` (AutoModelForCausalLM, LlamaForCausalLM, MixtralForCausalLM)
 
@@ -173,9 +176,9 @@
 
 | File | Lines | Responsibility |
 |---|---|---|
-| `constitutional.py` | 125 | ConstitutionalTrainer — constitutional AI training loop |
-| `dpo_trainer.py` | 296 | DPOTrainer, KTOtrainer, ORPOTrainer, SimPOTrainer — preference optimization |
-| `pipeline.py` | 286 | AlignmentPipeline — orchestrates alignment probes, refusal testing, safety evaluation |
+| `constitutional.py` | 120 | ConstitutionalTrainer — constitutional AI training loop |
+| `dpo_trainer.py` | 343 | DPOTrainer, KTOtrainer, ORPOTrainer, SimPOTrainer — preference optimization |
+| `pipeline.py` | 339 | AlignmentPipeline — orchestrates alignment probes, refusal testing, safety evaluation |
 
 **Dependencies**: `torch`, `transformers`
 
@@ -189,9 +192,9 @@
 
 | File | Lines | Responsibility |
 |---|---|---|
-| `benchmarks.py` | 438 | BenchmarkRunner — HumanEval, MBPP, MMLU, GSM8K, BBH, custom benchmarks |
-| `reporting.py` | — | EvaluationReport — result formatting and reporting |
-| `safety.py` | 132 | SafetyEvaluator — safety probes, honesty probes, refusal keyword detection |
+| `benchmarks.py` | 616 | BenchmarkRunner — HumanEval, MBPP, MMLU, GSM8K, BBH, custom benchmarks |
+| `reporting.py` | 86 | EvaluationReport — result formatting and reporting |
+| `safety.py` | 147 | SafetyEvaluator — safety probes, honesty probes, refusal keyword detection |
 
 **Dependencies**: `torch`, `transformers`, `numpy`
 
@@ -203,8 +206,12 @@
 
 | File | Lines | Responsibility |
 |---|---|---|
-| `logging.py` | — | Shared logging configuration |
-| `reproducibility.py` | — | Seeding — set_seed() for torch/numpy/random |
+| `logging.py` | 33 | Shared logging configuration |
+| `reproducibility.py` | 38 | Seeding — set_seed() for torch/numpy/random |
+| `hf_auth.py` | 163 | HuggingFace token resolution — env var, CLI cache, interactive prompt |
+| `shutdown.py` | 129 | Graceful shutdown coordination — signal handling, worker teardown |
+| `steps.py` | 71 | Step accounting helpers — device-batch vs optimizer steps |
+| `training.py` | 19 | Shared training utilities — dataloader worker count, tokenizer kwargs |
 
 **Dependencies**: `torch`, `numpy`
 
@@ -214,20 +221,20 @@
 
 | File | Lines | Purpose |
 |---|---|---|
-| `model.py` | 168 | SpecializedCoderModel — high-level model wrapper, config loading, tokenizer setup |
-| `trainer.py` | 298 | ModelTrainer — standalone trainer: prepare_data(), train(), evaluate(), save_checkpoint() |
+| `model.py` | 170 | SpecializedCoderModel — high-level model wrapper, config loading, tokenizer setup |
+| `trainer.py` | 308 | ModelTrainer — standalone trainer: prepare_data(), train(), evaluate(), save_checkpoint() |
 | `dataset.py` | 988 | CodeExample dataclass — curated Python/JS coding examples for fine-tuning |
 | `benchmark.py` | 1011 | Custom coding benchmark — inspired by HumanEval/MBPP, pass@1 scoring, 100+ problems |
 | `validator.py` | 318 | CodeValidator — syntax checking and sandboxed execution for Python/JS |
-| `generator.py` | 240 | CodeGenerator — high-level generation with batching, multi-language, code extraction |
-| `tokenizer_trainer.py` | 226 | Tokenizer trainer — ByteLevelBPETokenizer training from dataset streams |
+| `generator.py` | 241 | CodeGenerator — high-level generation with batching, multi-language, code extraction |
+| `tokenizer_trainer.py` | 250 | Tokenizer trainer — ByteLevelBPETokenizer training from dataset streams |
 | `knowledge_graph.py` | 130 | GraphMemory — ChromaDB + NetworkX for agentic memory and knowledge graph |
-| `massive_data_collector.py` | 484 | Legacy MassiveDataCollector — streams from Hugging Face, dataset filtering by libraries |
-| `synthetic_labels.py` | 123 | Synthetic label generator — intent, tool selection, QA labels for multi-task training |
+| `massive_data_collector.py` | 593 | Legacy MassiveDataCollector — streams from Hugging Face, dataset filtering by libraries |
+| `synthetic_labels.py` | 164 | Synthetic label generator — intent, tool selection, QA labels for multi-task training |
 
 ---
 
-## `scripts/` — 15 Scripts
+## `scripts/` — 17 Python Scripts (+2 shell launchers)
 
 | Script | Purpose |
 |---|---|
@@ -242,21 +249,25 @@
 | `validate_registry.py` | Registry entry validation |
 | `verify_each_entry.py` | Per-entry dataset verification |
 | `test_pipeline.py` | Pipeline integration test script |
+| `test_pipeline_async.py` | Async pipeline integration test script |
 | `test_local_validation.py` | Local dataset validation — missing/malformed/empty JSONL, UTF-8, schema |
 | `test_integration.py` | End-to-end integration test — registry → stream → pack → tokenize → train → checkpoint |
+| `bounded_async_repro.py` | Bounded async repro/smoke run — staged prefetch validation |
+| `benchmark_async_pipeline.py` | Async pipeline benchmark (CPU-executable) |
+| `corpus_audit.py` | Documentation corpus audit — quality checks on scraped JSONL |
 | `final_verify.sh` | Shell-based final verification |
 | `train_4gpu.sh` | Shell launcher for 4-GPU training |
 
 ---
 
-## `tests/` — 12 Test Files
+## `tests/` — 26 Test Files (287 tests, full suite green)
 
 | Test File | Coverage |
 |---|---|
-| `test_data_pipeline.py` | Data pipeline — streaming, filtering, packing |
+| `test_data_pipeline.py` | Data pipeline — streaming, filtering, packing, registry builds, health aggregation |
 | `test_quality.py` | Quality scoring — document_quality_score, deduplication, contamination |
 | `test_config.py` | Config loading and validation — Pydantic schema |
-| `test_trainer.py` | ModelTrainer — training loop, checkpointing |
+| `test_trainer.py` | ModelTrainer — training loop, checkpointing, SFT eval hygiene |
 | `test_nslt.py` | NSLT architecture — forward pass, generation, SSM |
 | `test_alignment.py` | Alignment — Constitutional AI, DPO, KTO |
 | `test_evaluation.py` | Evaluation — benchmark runner, reporting |
@@ -265,6 +276,19 @@
 | `test_foundation_pipeline.py` | Foundation config pipeline test |
 | `test_integration.py` | End-to-end integration tests |
 | `test_validation.py` | Code validation — syntax checking, execution |
+| `test_async_pipeline_hardening.py` | Async hardening — ownership, cancellation, journal-first sched, regressions |
+| `test_async_pipeline_overlap.py` | Async overlap — stream/filter/tokenize overlap semantics |
+| `test_cache_lockstep.py` | Packed/metadata cache version lockstep |
+| `test_cleanup_pool.py` | Worker cleanup pool lifecycle |
+| `test_health_reporter.py` | Health reporter — timestamps, per-dataset distributions |
+| `test_main_cli.py` | main.py CLI dispatch and config wiring |
+| `test_phase1_crash_fixes.py` | Phase-1 crash regression fixes |
+| `test_shutdown_coordinator.py` | Graceful shutdown — signal handler, teardown |
+| `test_spec_hardening.py` | Spec hardening tests |
+| `test_special_token_alignment.py` | Special-token alignment across pipeline |
+| `test_step_accounting.py` | Step accounting — device vs optimizer steps |
+| `test_tokenizer_acquisition.py` | Tokenizer acquisition — cache verify, force redownload |
+| `test_unit_prefetch_lifecycle.py` | Unit-level prefetch lifecycle |
 
 ---
 

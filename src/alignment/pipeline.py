@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import logging
 import random
 from pathlib import Path
@@ -49,6 +50,7 @@ class AlignmentPipeline:
         self.tokenizer = tokenizer
         self.cfg = cfg
         self.ref_model = ref_model
+        self._frozen_ref: Optional[PreTrainedModel] = None
         self.device = torch.device(f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu")
 
         self.constitutional = ConstitutionalTrainer(
@@ -57,6 +59,24 @@ class AlignmentPipeline:
             constitution=cfg.alignment.constitution,
             max_length=cfg.training.max_seq_length,
         )
+
+    def _get_ref_model(self) -> PreTrainedModel:
+        """Reference model for DPO/KTO.
+
+        A preference or KL penalty is only meaningful against a *frozen*
+        policy snapshot — using the policy itself (the previous fallback)
+        collapses ref_logps = policy logps and zeroes the training signal.
+        Deep-copy and freeze the policy once, then reuse it.
+        """
+        if self.ref_model is not None:
+            return self.ref_model
+        if self._frozen_ref is None:
+            ref = copy.deepcopy(self.model)
+            ref.eval()
+            for p in ref.parameters():
+                p.requires_grad_(False)
+            self._frozen_ref = ref.to(self.device)
+        return self._frozen_ref
 
     def run_constitutional_alignment(
         self,
@@ -86,14 +106,16 @@ class AlignmentPipeline:
         dpo_cfg = self.cfg.training.alignment.method_configs.dpo
         trainer = DPOTrainer(
             model=self.model,
-            ref_model=self.ref_model,
+            ref_model=self._get_ref_model(),
             tokenizer=self.tokenizer,
             beta=kwargs.get("beta", dpo_cfg.beta if dpo_cfg else 0.1),
             learning_rate=kwargs.get("learning_rate", dpo_cfg.learning_rate if dpo_cfg else 3e-7),
             max_length=self.cfg.training.max_seq_length,
             device=self.device,
         )
-        return self._run_preference_training(trainer, preference_dataset, "DPO", **kwargs)
+        params = self._preference_params(dpo_cfg)
+        params.update(kwargs)
+        return self._run_preference_training(trainer, preference_dataset, "DPO", **params)
 
     def run_orpo(
         self,
@@ -109,7 +131,9 @@ class AlignmentPipeline:
             max_length=self.cfg.training.max_seq_length,
             device=self.device,
         )
-        return self._run_preference_training(trainer, preference_dataset, "ORPO", **kwargs)
+        params = self._preference_params(orpo_cfg)
+        params.update(kwargs)
+        return self._run_preference_training(trainer, preference_dataset, "ORPO", **params)
 
     def run_simpo(
         self,
@@ -126,7 +150,9 @@ class AlignmentPipeline:
             max_length=self.cfg.training.max_seq_length,
             device=self.device,
         )
-        return self._run_preference_training(trainer, preference_dataset, "SimPO", **kwargs)
+        params = self._preference_params(simpo_cfg)
+        params.update(kwargs)
+        return self._run_preference_training(trainer, preference_dataset, "SimPO", **params)
 
     def run_kto(
         self,
@@ -143,8 +169,11 @@ class AlignmentPipeline:
             device=self.device,
             desirable_weight=kwargs.get("desirable_weight", kto_cfg.desirable_weight if kto_cfg else 1.0),
             undesirable_weight=kwargs.get("undesirable_weight", kto_cfg.undesirable_weight if kto_cfg else 1.0),
+            ref_model=self._get_ref_model(),
         )
-        return self._run_preference_training(trainer, dataset, "KTO", **kwargs)
+        params = self._preference_params(kto_cfg)
+        params.update(kwargs)
+        return self._run_preference_training(trainer, dataset, "KTO", **params)
 
     def run_alignment_sequence(
         self,
@@ -168,8 +197,14 @@ class AlignmentPipeline:
 
     def run_safety_training(
         self,
-        num_steps: int = 1000,
+        num_steps: Optional[int] = None,
     ) -> Dict[str, float]:
+        safety_cfg = self.cfg.training.safety
+        if not safety_cfg.refusal_training:
+            logger.info("Refusal training disabled — skipping safety training")
+            return {"safety_loss": 0.0, "refusal_rate": 0.0}
+        if num_steps is None:
+            num_steps = safety_cfg.safety_training_steps
         logger.info("Running Claude-style safety training for %d steps...", num_steps)
         self.model.train()
         optimizer = torch.optim.AdamW(self.model.parameters(), lr=1e-6)
@@ -177,6 +212,7 @@ class AlignmentPipeline:
         refusal_rate = 0.0
         total = 0
         refused_count = 0
+        step = 0
 
         for step in range(num_steps):
             probe = random.choice(HARMLESSNESS_PROBES)
@@ -219,8 +255,10 @@ class AlignmentPipeline:
 
     def run_red_teaming(
         self,
-        num_iters: int = 500,
+        num_iters: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
+        if num_iters is None:
+            num_iters = self.cfg.training.safety.red_teaming_iters
         logger.info("Running red teaming for %d iterations...", num_iters)
         results = []
         self.model.eval()
@@ -251,12 +289,17 @@ class AlignmentPipeline:
         name: str,
         **kwargs,
     ) -> Dict[str, float]:
+        total_steps = kwargs.get("max_steps", 1000)
+
+        if len(dataset) == 0:
+            logger.warning("%s: preference dataset is empty — nothing to train on.", name)
+            return {"loss": 0.0, "accuracy": 0.0, "steps": 0}
+
         loader = DataLoader(
             dataset,
             batch_size=kwargs.get("batch_size", 4),
             shuffle=True,
         )
-        total_steps = kwargs.get("max_steps", 1000)
         step = 0
         cumulative = {"loss": 0.0, "accuracy": 0.0}
 
@@ -278,9 +321,19 @@ class AlignmentPipeline:
                 cumulative[k] = cumulative.get(k, 0.0) + v
 
             if step % 10 == 0:
-                logger.info("%s Step %d/%d: loss=%.4f acc=%.4f", name, step, total_steps, metrics["loss"], metrics.get("accuracy", 0.0))
+                acc_str = f" acc={metrics['accuracy']:.4f}" if "accuracy" in metrics else ""
+                logger.info("%s Step %d/%d: loss=%.4f%s", name, step, total_steps, metrics["loss"], acc_str)
 
         for k in cumulative:
-            cumulative[k] /= max(step, 1)
+            cumulative[k] /= (step + 1)
         logger.info("%s complete. Avg loss=%.4f, Avg acc=%.4f", name, cumulative.get("loss", 0), cumulative.get("accuracy", 0))
         return cumulative
+
+    def _preference_params(self, method_cfg: Any) -> Dict[str, Any]:
+        """Base DataLoader / loop hyperparameters derived from the stage config."""
+        if method_cfg is None:
+            return {}
+        return {
+            "batch_size": method_cfg.batch_size,
+            "max_steps": method_cfg.max_steps,
+        }

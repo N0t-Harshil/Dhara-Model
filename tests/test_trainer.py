@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
+
+import torch
+from datasets import Dataset
 
 from src.trainer import ModelTrainer
 from src.training.pipeline import TrainingPipeline
+from src.infrastructure.distributed import DistributedSetup
 from src.config.schema import Config
 
 
@@ -75,6 +79,33 @@ class TestTrainerPreprocessing(unittest.TestCase):
         optim_name = pipeline._resolve_optimizer_name(stage_cfg, base_args, {})
 
         self.assertEqual(optim_name, "adamw_torch")
+
+    def test_pretrain_trainer_disables_eval_steps(self):
+        cfg = Config()
+        pipeline = TrainingPipeline(cfg)
+        pipeline.model = torch.nn.Linear(4, 2)
+        pipeline.tokenizer = MagicMock()
+        dataset = Dataset.from_dict({
+            "input_ids": [[1, 2, 3, 4]],
+            "attention_mask": [[1, 1, 1, 1]],
+            "labels": [[1, 2, 3, 4]],
+        })
+
+        trainer = pipeline._build_trainer(dataset, "pretrain", cfg.training.pretrain)
+
+        self.assertEqual(trainer.args.eval_strategy, "no")
+        self.assertIsNone(trainer.args.eval_steps)
+
+    @patch("torch.cuda.is_available", return_value=False)
+    def test_fsdp_cpu_does_not_force_bf16(self, cuda_available):
+        cfg = Config()
+        cfg.model.dtype = "bfloat16"
+        cfg.distributed.strategy = "fsdp"
+        dist_setup = DistributedSetup(cfg)
+        args = dist_setup.get_training_args("out")
+
+        self.assertFalse(args.get("bf16", False))
+        self.assertFalse(args.get("fp16", False))
 
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -87,19 +88,27 @@ class DatasetInfo:
 class DatasetRegistry:
     def __init__(self) -> None:
         self._entries: Dict[str, DatasetInfo] = {}
+        self._fallback_entries: Dict[str, DatasetInfo] = {}
         self._used_fallbacks: Dict[str, str] = {}
         self._counter: int = 0
 
-    def register(self, info: DatasetInfo) -> None:
+    def register(self, info: DatasetInfo, fallback_only: bool = False) -> None:
+        """Add a dataset entry. With fallback_only=True the entry is only
+        resolvable as a fallback chain member (never streamed as a primary
+        dataset by all_entries()/by_category()) — used for the fallback
+        datasets referenced by primary entries."""
         key = f"{info.path}/{info.name or 'default'}/{info.category}/{self._counter}"
-        self._entries[key] = info
+        if fallback_only:
+            self._fallback_entries[key] = info
+        else:
+            self._entries[key] = info
         self._counter += 1
 
     def get(self, key: str) -> Optional[DatasetInfo]:
         return self._entries.get(key)
 
     def get_by_path_category(self, path: str, category: str) -> Optional[DatasetInfo]:
-        for info in self._entries.values():
+        for info in itertools.chain(self._entries.values(), self._fallback_entries.values()):
             if info.path == path and info.category == category:
                 return info
         return None
@@ -327,7 +336,7 @@ def _register_math(registry: DatasetRegistry) -> float:
         ("AI-MO/NuminaMath-CoT", None, 0.90, 0.20, "science", ["AI-MO/NuminaMath-1.5"]),
         ("AI-MO/NuminaMath-1.5", None, 0.91, 0.15, "science", ["AI-MO/NuminaMath-CoT"]),
         ("GAIR/MathPile", None, 0.93, 0.10, "science", ["open-web-math/open-web-math"]),
-        ("HuggingFaceFW/fineweb-edu", "sample-10BT", 0.85, 0.10, "science",
+        ("HuggingFaceFW/fineweb-edu", "sample-100BT", 0.85, 0.10, "science",
          ["open-web-math/open-web-math"]),
         ("akjadhav/leandojo-lean4-formal-informal-strings-split", None, 0.93, 0.03, "science",
          ["open-web-math/open-web-math"]),
@@ -353,7 +362,7 @@ def _register_science(registry: DatasetRegistry) -> float:
     # openalex/arxiv/acl_anthology (not real HF datasets) — all removed.
     # Science corpus is entirely FineWeb-Edu until a suitable parquet-based scientific dataset is found.
     entries = [
-        ("HuggingFaceFW/fineweb-edu", "sample-10BT", 0.85, 1.0, "science", []),
+        ("HuggingFaceFW/fineweb-edu", "CC-MAIN-2024-10", 0.85, 1.0, "science", []),
     ]
     for path, name, qs, frac, domain, fallbacks in entries:
         w = round(sci_total * frac, 4)
@@ -375,8 +384,8 @@ def _register_books(registry: DatasetRegistry) -> float:
     # pg19 (script-based, fails datasets 2.20+), gutenberg/openstax/libretexts (not real) — all removed.
     # Books corpus from FineWeb-Edu + FineWeb.
     entries = [
-        ("HuggingFaceFW/fineweb-edu", "sample-10BT", 0.88, 0.50, "web", []),
-        ("HuggingFaceFW/fineweb", None, 0.85, 0.30, "web", []),
+        ("HuggingFaceFW/fineweb-edu", "CC-MAIN-2023-50", 0.88, 0.50, "web", []),
+        ("HuggingFaceFW/fineweb", "CC-MAIN-2021-10", 0.85, 0.30, "web", []),
     ]
     for path, name, qs, frac, domain, fallbacks in entries:
         w = round(book_total * frac, 4)
@@ -398,8 +407,8 @@ def _register_structured(registry: DatasetRegistry) -> float:
     # WIT (script-based, fails datasets 2.20+), wikidata/dbpedia/conceptnet/wordnet (not real) — all removed.
     # Structured knowledge from FineWeb-Edu + FineWeb.
     entries = [
-        ("HuggingFaceFW/fineweb-edu", "sample-10BT", 0.85, 0.50, "web", []),
-        ("HuggingFaceFW/fineweb", None, 0.82, 0.50, "web", []),
+        ("HuggingFaceFW/fineweb-edu", "sample-350BT", 0.85, 0.50, "web", []),
+        ("HuggingFaceFW/fineweb", "sample-100BT", 0.82, 0.50, "web", []),
     ]
     for path, name, qs, frac, domain, fallbacks in entries:
         w = round(sk_total * frac, 4)
@@ -425,6 +434,15 @@ def build_registry() -> DatasetRegistry:
     total += _register_code(registry)
     logger.info("  code:         %.4f", total)
 
+    # Fallback-only: sql-create-context is referenced as an SQL fallback by
+    # the-stack-v2-dedup entries — make the chain resolvable without ever
+    # streaming it as a primary dataset.
+    registry.register(DatasetInfo(
+        path="b-mc2/sql-create-context", category="code", weight=0.0,
+        quality_score=0.80, language="sql", domain="backend",
+        text_fields=["question", "answer", "context"], priority=1,
+    ), fallback_only=True)
+
     # Web text (SlimPajama removed — 404 on HF)
     web_total = CATEGORY_WEIGHTS["web_text"]
     registry.register(DatasetInfo(
@@ -433,6 +451,11 @@ def build_registry() -> DatasetRegistry:
         domain="web", text_fields=["text"], license="ODC-BY",
         fallbacks=WEB_FALLBACKS, priority=1,
     ))
+    for fb_path in WEB_FALLBACKS:
+        registry.register(DatasetInfo(
+            path=fb_path, category="web_text", weight=0.0, quality_score=0.85,
+            domain="web", text_fields=["text"], priority=1,
+        ), fallback_only=True)
     total += web_total
     logger.info("  web_text:     %.4f", total)
 

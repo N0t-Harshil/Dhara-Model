@@ -76,6 +76,8 @@ class PipelineTelemetry:
         self._stop.set()
         if self._monitor is not None:
             self._monitor.join(timeout=2.0)
+            if self._monitor.is_alive():
+                logger.warning("Telemetry sampler did not exit within 2s; abandoning thread.")
             self._monitor = None
 
     def _sample_loop(self) -> None:
@@ -86,7 +88,7 @@ class PipelineTelemetry:
                 pass
 
     def _sample_once(self) -> None:
-        if self._gpu_sample:
+        if self._gpu_sample and self._smoke_gpu_avail:
             util = _gpu_utilization()
             if util is not None:
                 self.set_event("gpu_util_pct", util)
@@ -173,8 +175,17 @@ def _gpu_memory() -> Optional[tuple]:
              "--format=csv,noheader,nounits"],
             capture_output=True, timeout=3, text=True)
         if out.returncode == 0 and out.stdout.strip():
-            free, total = out.stdout.strip().split(",")[:2]
-            return float(free) / 1024.0, float(total) / 1024.0
+            # One "free,total" pair per GPU line; sum across GPUs.
+            free_total = 0.0
+            total_total = 0.0
+            for line in out.stdout.strip().splitlines():
+                parts = [p.strip() for p in line.split(",") if p.strip()]
+                if len(parts) < 2:
+                    continue
+                free_total += float(parts[0])
+                total_total += float(parts[1])
+            if total_total > 0:
+                return free_total / 1024.0, total_total / 1024.0
     except Exception:  # noqa: BLE001
         pass
     return None

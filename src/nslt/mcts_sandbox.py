@@ -205,13 +205,16 @@ class MCTSLatentSandbox(nn.Module):
         state = leaf.state.unsqueeze(0)
         context_b = context.unsqueeze(0) if context.dim() == 1 else context
 
-        directions, values = self.policy_value(state, context_b)
-
         with torch.no_grad():
+            directions, values = self.policy_value(state, context_b)
+
             for k in range(self.n_directions):
-                perturbation = self.learning_rate * directions[0, k] * energy_grad
+                # Gradient-based expansion: descend the energy surface at the
+                # leaf, keeping a small policy-weighted exploration offset.
+                perturbation = -self.learning_rate * energy_grad
+                exploration = self.noise_scale * directions[0, k]
                 noise = self.noise_scale * torch.randn(self.d_hidden, device=state.device)
-                child_state = leaf.state + perturbation + noise
+                child_state = leaf.state + perturbation + exploration + noise
                 child = MCTSNode(
                     state=child_state, parent=leaf, action_id=k
                 )
@@ -220,15 +223,40 @@ class MCTSLatentSandbox(nn.Module):
     def _simulate(
         self, node: MCTSNode, context: torch.Tensor
     ) -> float:
+        # Search-time rollout: memory-bounded energy gradient descent. The
+        # returned scalar only feeds visit statistics / backup; the output
+        # trajectory is replayed in-graph in _finalize_state so gradients
+        # reach the learned modules.
         z = node.state.detach().clone()
+        total_energy = 0.0
         for _ in range(self.n_sim_steps):
             z = z.detach().requires_grad_(True)
             energy, grad = self.energy_fn(z.unsqueeze(0))
             with torch.no_grad():
                 z = z - self.learning_rate * grad.squeeze(0)
-        with torch.no_grad():
-            energy, _ = self.energy_fn(z.unsqueeze(0))
-        return -energy.mean().item()
+                total_energy += energy.detach().mean().item()
+        return -total_energy
+
+    def _finalize_state(
+        self,
+        best_child: MCTSNode,
+        z_ltc_b: torch.Tensor,
+        context: torch.Tensor,
+    ) -> torch.Tensor:
+        """Re-run the chosen trajectory in-graph so the module trains end to end."""
+        dirs, _ = self.policy_value(z_ltc_b.unsqueeze(0), context.unsqueeze(0))
+        k = best_child.action_id
+        if 0 <= k < self.n_directions:
+            _, g0 = self.energy_fn(z_ltc_b.unsqueeze(0))
+            # Same update shape used during search-time expansion.
+            z = z_ltc_b - self.learning_rate * g0[0]
+            z = z + self.learning_rate * self.noise_scale * dirs[0, k]
+        else:
+            z = z_ltc_b.clone()
+        for _ in range(self.n_sim_steps):
+            _, g = self.energy_fn(z.unsqueeze(0))
+            z = z - self.learning_rate * g[0]
+        return z
 
     def _backup(self, path: List[MCTSNode], value: float) -> None:
         for node in reversed(path):
@@ -279,7 +307,11 @@ class MCTSLatentSandbox(nn.Module):
                     self._backup(path, path_value)
                     continue
 
-                energy_grad = torch.randn(self.d_hidden, device=device) * 0.1
+                # Real energy gradient at the leaf (search-time, detached).
+                with torch.no_grad():
+                    _, grad = self.energy_fn(leaf.state.unsqueeze(0))
+                energy_grad = grad[0]
+
                 self._expand(leaf, context, energy_grad)
 
                 for child in leaf.children[-self.n_directions:]:
@@ -292,11 +324,14 @@ class MCTSLatentSandbox(nn.Module):
             root_children = sorted(
                 root.children, key=lambda c: c.visit_count, reverse=True
             )
-            if root_children:
-                best_state = root_children[0].state
-            else:
-                best_state = z_ltc[b]
+            if not root_children:
+                root_children = [root]
+            best_child = root_children[0]
 
+            # Differentiable finalization: replay the selected trajectory
+            # in-graph so energy_fn / policy_value / out_proj / norm receive
+            # end-to-end gradients.
+            best_state = self._finalize_state(best_child, z_ltc[b], context)
             batch_outputs.append(best_state)
             if batch_energies is not None:
                 batch_energies.append(energy_trace)
@@ -330,21 +365,27 @@ class MCTSLatentSandboxEfficient(MCTSLatentSandbox):
 
         for b in range(batch):
             cb = context[b]
-            z = z_ltc[b].clone()
             energy_trace = []
 
-            best_z = z.clone()
+            best_z = z_ltc[b].detach().clone()
             best_score = -float("inf")
+            best_k = -1
 
             for sim in range(self.n_simulations):
-                directions, value = self.policy_value(z.unsqueeze(0), cb.unsqueeze(0))
+                with torch.no_grad():
+                    directions, value = self.policy_value(z_ltc[b].unsqueeze(0), cb.unsqueeze(0))
+                    _, grad = self.energy_fn(z_ltc[b].unsqueeze(0))
+                energy_grad = grad[0]
 
                 candidates = []
+                candidate_scores = []
                 for k in range(self.n_directions):
-                    cand = z + self.learning_rate * directions[0, k]
+                    cand = (
+                        best_z
+                        - self.learning_rate * energy_grad
+                        + self.learning_rate * self.noise_scale * directions[0, k]
+                    )
                     candidates.append(cand)
-
-                for cand in candidates:
                     sim_z = cand.detach().clone()
                     for _ in range(self.n_sim_steps):
                         sim_z = sim_z.detach().requires_grad_(True)
@@ -354,14 +395,30 @@ class MCTSLatentSandboxEfficient(MCTSLatentSandbox):
                     with torch.no_grad():
                         e, _ = self.energy_fn(sim_z.unsqueeze(0))
                     score = -e.item()
+                    candidate_scores.append(score)
                     energy_trace.append(e.item())
-                    if score > best_score:
-                        best_score = score
-                        best_z = cand.clone()
 
-                z = best_z.clone()
+                best_idx = int(torch.tensor(candidate_scores).argmax())
+                if candidate_scores[best_idx] > best_score:
+                    best_score = candidate_scores[best_idx]
+                    best_z = candidates[best_idx].detach()
+                    best_k = best_idx
 
-            batch_outputs.append(best_z)
+            # Differentiable finalization along the selected direction.
+            dirs, _ = self.policy_value(z_ltc[b].unsqueeze(0), cb.unsqueeze(0))
+            if best_k >= 0:
+                _, g0 = self.energy_fn(z_ltc[b].unsqueeze(0))
+                z = z_ltc[b] - self.learning_rate * g0[0]
+                z = z + self.learning_rate * self.noise_scale * dirs[0, best_k]
+            else:
+                z = z_ltc[b].clone()
+            for _ in range(self.n_sim_steps):
+                _, g = self.energy_fn(z.unsqueeze(0))
+                z = z - self.learning_rate * g[0]
+
+            batch_outputs.append(z)
+            if batch_energies is not None:
+                batch_energies.append(energy_trace)
 
         output = torch.stack(batch_outputs, dim=0)
         output = self.out_proj(output)

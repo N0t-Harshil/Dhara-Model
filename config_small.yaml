@@ -1,21 +1,21 @@
-# Small MethosV3 (~173M params) for single-GPU training
+# Small Dhara (~173M params) for single-GPU training
 project:
-  name: Methos Class Model (Small)
+  name: Dhara Class Model (Small)
   seed: 42
 
 model:
-  name: Methos Class Model (Small)
+  name: Dhara Class Model (Small)
   dtype: bfloat16
   device: auto
   train_from_scratch: true
   architecture:
-    model_type: methos_v3
+    model_type: dhara_v3
     vocab_size: 128000
     hidden_size: 576                    # d_model (scaled down from 10240)
     gradient_checkpointing: false
     activation_checkpointing: false
 
-    methos_v3:
+    dhara_v3:
       d_state: 288
       d_hidden: 576
       n_ssm_layers: 3                   # Reduced SSM layers
@@ -108,9 +108,30 @@ distributed:
     activation_checkpointing: false
 
 data:
+  # Never hardcode a token here — set the HF_TOKEN environment variable; this
+  # field is only a fallback override (empty = use env / anonymous access).
+  hf_token: ""
+  # Dataset-granular list mode: exactly the two datasets below. Keeps this a
+  # genuine SMALL smoke run (registry mode would stream the full 41-dataset
+  # registry and is reserved for config_foundation.yaml).
+  use_registry: false
   cache_dir: ./hf_cache
   streaming: true
   max_cache_gb: 50
+
+  # Persistent dataset metadata cache: resolved HF file lists + fingerprints
+  # are saved so reruns skip repository/shard resolution entirely.
+  metadata_cache:
+    enabled: true
+    dir: ./hf_cache/datasets
+    fingerprint_version: 1
+
+  preprocessing:
+    remove_boilerplate: true
+    min_text_length: 100
+    max_text_length: 250000
+    collapse_blank_lines: true
+    strip_trailing_spaces: true
 
   quality:
     min_length: 30
@@ -154,9 +175,9 @@ tokenizer:
   add_eos_token: true
 
 output:
-  model_dir: ./models/methos-small
+  model_dir: ./models/dhara-small
   data_dir: ./data
-  checkpoint_dir: ./models/methos-small/checkpoints
+  checkpoint_dir: ./models/dhara-small/checkpoints
   log_dir: ./logs
   experiment_tracking:
     enabled: false

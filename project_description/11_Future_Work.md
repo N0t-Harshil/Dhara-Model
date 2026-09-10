@@ -18,25 +18,21 @@ These issues must be resolved before production training can proceed reliably.
   - Options: (1) Switch to readthedocs.io mirror, (2) Integrate cloudscraper library, (3) Use Playwright/Selenium with stealth
   - Risk: If unfixed, pytorch-docs contributes 0 pages to the corpus
 
-- **Track config_foundation.yaml in version control**
-  - Target: git tracking for config_foundation.yaml
-  - Ensures all config changes are versioned and reviewable
-  - Alternative: Generate foundation config programmatically from defaults + overrides
+- **Track config_foundation.yaml in version control** ✅ **RESOLVED**
+  - Target: git tracking for config_foundation.yaml — now tracked in git, all config changes versioned and reviewable
 
-- **Request GAIR/MathPile access**
+- **Request GAIR/MathPile access** ✅ **RESOLVED**
   - Target: https://huggingface.co/GAIR/MathPile
-  - 0.010 weight currently blocked by gated access
-  - Fallback: open-web-math/open-web-math (already configured as fallback)
+  - Access granted — 0.010 weight now loads; fallback: open-web-math/open-web-math (still configured)
 
 - **Complete production validation and fix all Phase failures**
   - Target: scripts/production_validation.py
   - Run all 8 phases, fix all warnings and failures until status is "READY FOR FULL PRETRAINING"
   - Key metrics: corpus availability >= 90%, padding < 5%, token distribution within 3% of targets
 
-- **Remove hardcoded HF token from config_foundation.yaml** †
-  - Target: config_foundation.yaml:127
-  - Replace with environment variable `HF_TOKEN` with config field as fallback only
-  - Security: prevent accidental token exposure in version control
+- **Remove hardcoded HF token from config_foundation.yaml** ✅ **RESOLVED**
+  - Target: config_foundation.yaml
+  - `data.hf_token` is now empty in all configs; set the `HF_TOKEN` environment variable instead
 
 ---
 
@@ -92,8 +88,8 @@ Valuable improvements that enhance quality, performance, or maintainability.
   - Migration: update DataPipeline to use StreamingManager directly
 
 - **Add more programming languages to STACK_V2_LANGUAGES**
-  - Target: src/data/registry.py:148-155
-  - Currently 19 languages. Add: Ruby, Dart, Elixir, Haskell, OCaml, Zig, Nim
+  - Target: src/data/registry.py:157
+  - Currently 19 language targets. Add: Ruby, Dart, Elixir, Haskell, OCaml, Zig, Nim
   - Update CODE_LANG_TARGETS accordingly with proportional weights
 
 - **Implement tokenizer training from scratch**
@@ -152,7 +148,7 @@ Nice-to-have improvements that can be addressed as time permits.
   - CI integration via GitHub Actions
 
 - **Add piped import aliases for all merged modules**
-  - Target: src/methos_v3/__init__.py
+  - Target: src/dhara/__init__.py
   - Old modules (ReflectionModule, VerificationWithRepair, CuriosityModule, LearningController) should be clearly marked as deprecated wrappers
   - Add deprecation warnings to all backward-compatible re-exports
 
@@ -191,7 +187,7 @@ Polishing and features for broader accessibility.
 
 ## Research Ideas
 
-- **Ablation: SSM vs Transformer backbone for MethosV3**
+- **Ablation: SSM vs Transformer backbone for Dhara**
   - Compare: SSM-based compressed state vs standard Transformer hidden state
   - Metrics: perplexity, throughput, memory usage at various sequence lengths
 

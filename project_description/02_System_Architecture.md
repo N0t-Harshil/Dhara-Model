@@ -6,7 +6,7 @@ The system is organized into four major subsystems, each corresponding to a top-
 
 **Data Subsystem** (`src/data/`) handles all data ingestion, transformation, quality control, and dataset management. It contains twelve modules: registry.py, streaming.py, drivers.py, metadata_cache.py, shards.py, pipeline.py, quality.py, ast_filter.py, function_sampler.py, doc_builder.py, health_reporter.py, and sanity.py. The data subsystem is the most mature part of the codebase, with production-ready implementations for all core functionality.
 
-**Model Subsystem** spans three directories. `src/methos_v3/` contains the MethosV3 architecture with 17 modules implementing 11 layers plus the executive controller, world model, tools, and loss computer. `src/nslt/` contains the NSLT architecture with 10 modules implementing the SSM compression engine, LTC routing, latent sandbox, and sparse output synthesizer, plus optional MoE and MCTS variants. `src/models/` contains the ModelFactory that creates and loads models based on configuration.
+**Model Subsystem** spans three directories. `src/dhara/` contains the Dhara architecture with 22 modules implementing 11 layers plus the executive controller, world model, tools, and loss computer. `src/nslt/` contains the NSLT architecture with 11 modules implementing the SSM compression engine, LTC routing, latent sandbox, and sparse output synthesizer, plus optional MoE and MCTS variants. `src/models/` contains the ModelFactory that creates and loads models based on configuration.
 
 **Training Subsystem** (`src/training/`, `src/trainer.py`, `src/infrastructure/`) orchestrates model training across three stages (pretrain, SFT, instruction tuning) plus alignment. The TrainingPipeline class manages the full training sequence, including dataset building, trainer construction, checkpointing, and evaluation. The DistributedSetup class configures FSDP, DeepSpeed, or DDP based on the configuration. The ExperimentTracker supports Weights and Biases, MLflow, and TensorBoard.
 
@@ -14,7 +14,7 @@ The system is organized into four major subsystems, each corresponding to a top-
 
 ## Data Architecture Flow
 
-The data pipeline is the most thoroughly implemented portion of the system. It begins with the Dataset Registry, which is constructed by `build_registry()` in `registry.py`. The registry contains approximately 55 entries distributed across 8 categories: code (0.30 weight), web_text (0.20), docs (0.15), wiki (0.10), math (0.10), science (0.05), books (0.05), and structured_knowledge (0.05). Each DatasetInfo entry stores the HuggingFace dataset path, name, split, data_dir, category, weight, quality_score, language, domain, fallback list, text fields, license, and flags for function sampling, streaming, priority, and long context. The registry normalizes weights against category targets so that each category sums to its configured proportion.
+The data pipeline is the most thoroughly implemented portion of the system. It begins with the Dataset Registry, which is constructed by `build_registry()` in `registry.py`. The registry contains 54 primary entries (58 registered including fallback-only entries) distributed across 8 categories: code (0.30 weight), web_text (0.20), docs (0.15), wiki (0.10), math (0.10), science (0.05), books (0.05), and structured_knowledge (0.05). Each DatasetInfo entry stores the HuggingFace dataset path, name, split, data_dir, category, weight, quality_score, language, domain, fallback list, text fields, license, and flags for function sampling, streaming, priority, and long context. The registry normalizes weights against category targets so that each category sums to its configured proportion.
 
 The streaming layer in `streaming.py` provides the `stream_dataset()` function that handles Dataset, IterableDataset, DatasetDict, and IterableDatasetDict types from HuggingFace Datasets. It performs automatic text field detection by checking known candidate fields in priority order. The `stream_dataset_with_fallbacks()` function implements the fallback chain: if the primary dataset fails to load or returns zero samples, it tries each fallback entry registered in the registry. The StreamingManager class provides `stream_all()` and `stream_category()` methods for higher-level access.
 
@@ -27,7 +27,7 @@ The packing pipeline in `pipeline.py` implements the complete data processing wo
 ```mermaid
 graph TB
     subgraph "Dataset Registry (registry.py)"
-        R1[build_registry] --> R2[55 entries across 8 categories]
+        R1[build_registry] --> R2[54 primary entries across 8 categories]
         R2 --> R3[Weight normalization to 1.0]
         R2 --> R4[Fallback chains per entry]
     end
@@ -71,9 +71,9 @@ The configuration system is defined in `src/config/schema.py` using Pydantic v2 
 
 The schema includes a `@model_validator(mode="before")` classmethod that performs automatic v1-to-v2 migration. It converts `data_collection.*` keys to `data.*`, `fsdp.*` to `distributed.fsdp.*`, and legacy `rope_scaling_factor` and `rope_scaling_type` to the nested `rope_scaling` sub-config. Cross-field validators ensure that num_key_value_heads divides num_attention_heads, top_k does not exceed num_experts, and the image_size is divisible by patch_size for vision configurations.
 
-Model architecture is configured through the `ModelArchitectureConfig` which supports six model types: llama, mixtral, qwen2_moe, deepseek_v2, nslt, and methos_v3. Each non-standard architecture has its own sub-config (NSLTConfig, MethosV3Config) with architecture-specific parameters. The ModelFactory uses these configs to construct the appropriate model, passing NSLTConfig parameters to NSLTModel or MethosV3Config parameters to MethosV3Model.
+Model architecture is configured through the `ModelArchitectureConfig` which supports six model types: llama, mixtral, qwen2_moe, deepseek_v2, nslt, and dhara_v3. Each non-standard architecture has its own sub-config (NSLTConfig, DharaConfig) with architecture-specific parameters. The ModelFactory uses these configs to construct the appropriate model, passing NSLTConfig parameters to NSLTModel or DharaConfig parameters to DharaModel.
 
-Three YAML configuration files are provided. `config.yaml` targets full-scale training with MethosV3 at d_model=10240 across 4x A100 80GB GPUs. `config_small.yaml` scales down to d_model=576 for single-GPU experimentation. `config_foundation.yaml` uses a 64K vocabulary and further reduced dimensions for ~160M parameter pretraining on a single A100 80GB.
+Three YAML configuration files are provided. `config.yaml` targets full-scale training with Dhara at d_model=10240 across 4x A100 80GB GPUs. `config_small.yaml` scales down to d_model=576 for single-GPU experimentation. `config_foundation.yaml` uses a 64K vocabulary and further reduced dimensions for ~160M parameter pretraining on a single A100 80GB.
 
 ```mermaid
 graph LR
@@ -87,9 +87,9 @@ graph LR
     SUB --> DATAPIPE[DataPipeline - src/data/pipeline.py]
 ```
 
-## Model Architecture (MethosV3)
+## Model Architecture (Dhara)
 
-MethosV3 is an 11-layer non-transformer language model with a workspace-centric architecture. All modules communicate through a central CognitiveWorkspace dict-based hub. The ExecutiveController enforces module gates via REINFORCE training.
+Dhara is an 11-layer non-transformer language model with a workspace-centric architecture. All modules communicate through a central CognitiveWorkspace dict-based hub. The ExecutiveController enforces module gates via REINFORCE training.
 
 Layer 1 is the IntelligentTokenizer, which produces token embeddings with semantic metadata including token categories, languages, and document roles. Layer 2 is the AdaptiveSemanticEmbedding, which applies Rotary Position Encoding (RoPE) with a configurable base theta of 10 million, task context conditioning, and context adapter blocks. Layer 3 is the HierarchicalMemoryEngine, which implements four memory systems: a working memory with configurable capacity (default 512 slots), a semantic memory with learned concept embeddings (default 4096 concepts), a long-context SSM for sequence compression, and an episodic memory tracking up to 256 episodes. The memory engine returns a fused representation plus a compressed state dict.
 
@@ -101,7 +101,7 @@ The model supports 14 auxiliary training losses beyond next-token prediction, in
 
 ```mermaid
 graph TB
-    subgraph "MethosV3Model - 11 Layers"
+    subgraph "DharaModel - 11 Layers"
         direction TB
         L1[Layer 1: IntelligentTokenizer] --> L1D[Token embedding + Semantic metadata]
         L1D --> L2[Layer 2: AdaptiveSemanticEmbedding]
@@ -128,7 +128,7 @@ graph TB
 
 ## NSLT Model Architecture
 
-The Neural State-Space Liquid Transformer (NSLT) is a four-layer non-transformer architecture designed for O(1) memory complexity. It was the original architecture in this project and remains fully implemented alongside MethosV3.
+The Neural State-Space Liquid Transformer (NSLT) is a four-layer non-transformer architecture designed for O(1) memory complexity. It was the original architecture in this project and remains fully implemented alongside Dhara.
 
 The input pipeline begins with a TokenEmbedding layer followed by RotaryPositionEncoding with a configurable base theta and support for position offsets. Layer 1 consists of a stack of SSMCompressionEngine blocks (default 4 layers, configurable up to 12). Each SSM block processes the sequence through a structured state-space model that compresses the entire sequence into a fixed-size state vector of dimension d_state (default 2048). Multiple SSM layers can be stacked, with each layer further compressing and transforming the representation. An MoE variant replaces each dense SSM block with a Mixture-of-Experts SSM where each token activates only top-k of n_experts.
 
@@ -188,12 +188,12 @@ The evaluation system in `src/evaluation/` includes three components. The benchm
 
 ## Scripts Ecosystem
 
-The `scripts/` directory contains 14 utility scripts. The production validation script is the most comprehensive at 768 lines. Supporting scripts include `verify_datasets.py` for registry verification, `verify_each_entry.py` for individual dataset checking, `check_datasets.py` for dataset health, `check_scripts.py` for script consistency, `check_stackv2.py` for Stack v2 validation, `check_tokens_and_decode.py` for token distribution analysis, `final_verify.sh` as a shell entry point, `param_audit.py` for parameter counting, `validate_pipeline.py` and `validate_registry.py` for pipeline and registry validation, and `test_pipeline.py` for pipeline integration testing. The `train_4gpu.sh` script provides the launch command for 4-GPU FSDP training.
+The `scripts/` directory contains 17 utility scripts. The production validation script is the most comprehensive at 778 lines. Supporting scripts include `verify_datasets.py` for registry verification, `verify_each_entry.py` for individual dataset checking, `check_datasets.py` for dataset health, `check_scripts.py` for script consistency, `check_stackv2.py` for Stack v2 validation, `check_tokens_and_decode.py` for token distribution analysis, `bounded_async_repro.py` and `benchmark_async_pipeline.py` for async pipeline checks, `final_verify.sh` as a shell entry point, `param_audit.py` for parameter counting, `validate_pipeline.py` and `validate_registry.py` for pipeline and registry validation, and `test_pipeline.py` for pipeline integration testing. The `train_4gpu.sh` script provides the launch command for 4-GPU FSDP training.
 
 ## Test Suite
 
-The `tests/` directory contains 12 test files with 109 tests according to the documentation. Test files cover alignment (`test_alignment.py`), configuration (`test_config.py`), data collection (`test_data_collector.py`), data pipeline (`test_data_pipeline.py`), evaluation (`test_evaluation.py`), foundation pipeline (`test_foundation_pipeline.py`), generation (`test_generation.py`), integration (`test_integration.py`), NSLT model (`test_nslt.py`), quality (`test_quality.py`), trainer (`test_trainer.py`), and validation (`test_validation.py`). Many tests use placeholder implementations with skip decorators for components that are still being developed.
+The `tests/` directory contains 26 test files with a fully green suite of 287 tests. Test files cover alignment (`test_alignment.py`), configuration (`test_config.py`), data collection (`test_data_collector.py`), data pipeline (`test_data_pipeline.py`), evaluation (`test_evaluation.py`), foundation pipeline (`test_foundation_pipeline.py`), generation (`test_generation.py`), integration (`test_integration.py`), NSLT model (`test_nslt.py`), quality (`test_quality.py`), trainer (`test_trainer.py`), validation (`test_validation.py`), plus the hardened async-pipeline tests: async pipeline overlap (`test_async_pipeline_overlap.py`), async hardening (`test_async_pipeline_hardening.py`), cache lockstep (`test_cache_lockstep.py`), cleanup pool (`test_cleanup_pool.py`), health reporter (`test_health_reporter.py`), main CLI (`test_main_cli.py`), phase-1 crash fixes (`test_phase1_crash_fixes.py`), shutdown coordinator (`test_shutdown_coordinator.py`), spec hardening (`test_spec_hardening.py`), special token alignment (`test_special_token_alignment.py`), step accounting (`test_step_accounting.py`), tokenizer acquisition (`test_tokenizer_acquisition.py`), and unit prefetch lifecycle (`test_unit_prefetch_lifecycle.py`).
 
 ## Configuration Files
 
-Three YAML configuration files are provided in the project root. `config.yaml` is the primary configuration targeting MethosV3 at full scale with d_model=10240, d_state=4096, 6 SSM layers, 504K training steps distributed across pretrain (1M steps), SFT (100K steps), and instruction tuning (50K steps). It uses FSDP with CPU offload for 4x A100 80GB GPUs. `config_small.yaml` scales all dimensions down by approximately 18x for single-GPU experimentation with d_model=576, d_state=288, 3 SSM layers, and reduced capacities across all sub-components. `config_foundation.yaml` targets ~160M parameter pretraining on a single A100 80GB with a reduced vocabulary of 64K tokens, 2 trajectory paths, 2 experts, and minimal debate rounds. All three configurations share the same Pydantic schema and are validated by the same cross-field validators, ensuring that experiments at different scales use consistent parameter naming and validation rules.
+Three YAML configuration files are provided in the project root. `config.yaml` is the primary configuration targeting Dhara at full scale with d_model=10240, d_state=4096, 6 SSM layers, and 1M pretrain steps (plus SFT 100K steps and instruction tuning 50K steps). It uses FSDP with CPU offload for 4x A100 80GB GPUs. `config_small.yaml` scales all dimensions down by approximately 18x for single-GPU experimentation with d_model=576, d_state=288, 3 SSM layers, and reduced capacities across all sub-components. `config_foundation.yaml` targets ~160M parameter pretraining on a single A100 80GB with a reduced vocabulary of 64K tokens, 2 trajectory paths, 2 experts, and minimal debate rounds. All three configurations share the same Pydantic schema and are validated by the same cross-field validators, ensuring that experiments at different scales use consistent parameter naming and validation rules.

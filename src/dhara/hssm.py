@@ -76,7 +76,9 @@ class HierarchicalSSMStack(nn.Module):
             x, h = layer(x, layer_state)
             if h is not None:
                 states.append(h)
-                layer_state = h.detach()
+                # Keep the graph connected across layers so the recurrent
+                # state has a gradient path (detach() severed it).
+                layer_state = h
         if not states:
             return x, torch.zeros(x.shape[0], self.layers[0].n_levels, self.layers[0].d_state, device=x.device, dtype=x.dtype)
         final_state = torch.stack(states, dim=1).mean(dim=1)

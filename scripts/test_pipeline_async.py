@@ -23,6 +23,11 @@ PASS = 0
 FAIL = 0
 
 
+def payload(result):
+    """UnitPrefetch.get() returns (payload, gpu_wait_sec, prep_timing)."""
+    return result[0] if isinstance(result, tuple) else result
+
+
 def test(name: str, condition: bool, detail: str = "") -> None:
     global PASS, FAIL
     if condition:
@@ -43,7 +48,7 @@ def test_unit_prefetch_ordered_delivery() -> None:
         build_fn=lambda item, idx: (built.append(idx) or (f"ds{idx}", {"idx": idx})),
         total=8, depth=2, timeout=5.0)
     pf.start(list(range(8)))
-    got = [pf.get(i) for i in range(8)]
+    got = [payload(pf.get(i)) for i in range(8)]
     pf.close()
     test("all units delivered in order",
          got == [(f"ds{i}", {"idx": i}) for i in range(8)])
@@ -69,10 +74,10 @@ def test_unit_prefetch_overlap() -> None:
 
     pf = UnitPrefetch(build_fn=build, total=4, depth=3, timeout=5.0)
     pf.start(list(range(4)))
-    first = pf.get(0)
+    first = payload(pf.get(0))
     test("unit 2 built while unit 0/1 waited", build2_started.wait(2))
     release_build2.set()
-    rest = [pf.get(i) for i in range(1, 4)]
+    rest = [payload(pf.get(i)) for i in range(1, 4)]
     pf.close()
     test("all delivered in order", [first] + rest == [0, 1, 2, 3])
 
@@ -90,7 +95,7 @@ def test_unit_prefetch_starvation_free() -> None:
 
     pf = UnitPrefetch(build_fn=build, total=6, depth=2, timeout=5.0)
     pf.start(list(range(6)))
-    got = [pf.get(i) for i in range(6)]
+    got = [payload(pf.get(i)) for i in range(6)]
     pf.close()
     test("slow units never overtake fast ones", got == list(range(6)),
          f"got={got}")
@@ -107,14 +112,14 @@ def test_unit_prefetch_failure_re_raised() -> None:
 
     pf = UnitPrefetch(build_fn=build, total=3, depth=3, timeout=5.0)
     pf.start(list(range(3)))
-    test("unit 0 ok", pf.get(0) == 0)
+    test("unit 0 ok", payload(pf.get(0)) == 0)
     try:
         pf.get(1)
         raised = False
     except ValueError as e:
         raised = str(e) == "boom"
     test("unit 1 exception re-raised on consumer", raised)
-    test("consumer can continue after failure", pf.get(2) == 2)
+    test("consumer can continue after failure", payload(pf.get(2)) == 2)
     pf.close()
 
 
@@ -138,7 +143,7 @@ def test_unit_prefetch_timeout() -> None:
     test("timeout raised for stuck unit", raised)
     test("waited ~timeout, not more", 0.2 < time.monotonic() - t0 < 3.0)
     # The late result must be ignored once the consumer moved on.
-    test("later unit still deliverable", pf.get(2) == 2)
+    test("later unit still deliverable", payload(pf.get(2)) == 2)
     pf.close()
 
 
@@ -156,7 +161,7 @@ def test_unit_prefetch_discard_and_stale() -> None:
     pf.start(list(range(4)))
     pf.discard(0)
     test("discarded result ignored (stale get returns None)", pf.get(0) is None)
-    test("later indexes unaffected", [pf.get(i) for i in (1, 2, 3)] == [1, 2, 3])
+    test("later indexes unaffected", [payload(pf.get(i)) for i in (1, 2, 3)] == [1, 2, 3])
     pf.close()
 
 
@@ -318,7 +323,7 @@ def test_unit_prefetch_stress_volume() -> None:
         r = pf.get(i)
         if r is None:
             break
-        got.append(r)
+        got.append(payload(r))
     elapsed = time.monotonic() - t0
     pf.close()
     test("stress: all 400 units delivered", len(got) == N, f"got {len(got)}")

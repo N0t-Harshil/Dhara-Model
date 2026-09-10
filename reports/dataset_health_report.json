@@ -1,74 +1,115 @@
 {
   "name": "Methos Foundation",
   "config_path": "",
-  "timestamp": "2026-08-02T11:41:39.461451",
+  "timestamp": "2026-08-28T10:53:35.447138+00:00",
   "global_stats": {
-    "total_datasets": 1,
-    "total_raw_samples": 30,
-    "total_packed_sequences": 2,
-    "total_tokens": 256,
-    "total_duplicates_removed": 0,
-    "average_retention_pct": 6.67,
+    "total_datasets": 2,
+    "total_raw_samples": 10000,
+    "total_packed_sequences": 952,
+    "total_tokens": 1949696,
+    "total_duplicates_removed": 1306,
+    "average_retention_pct": 9.52,
     "average_packing_efficiency": 1.0,
     "average_padding_ratio": 0.0,
-    "average_tokens_per_sequence": 128.0,
-    "average_quality_score": 0.9,
+    "average_tokens_per_sequence": 2048.0,
+    "average_quality_score": 0.5893,
     "long_context_documents": 0,
     "long_context_ratio_global": 0.0,
     "categories": 1,
-    "languages_detected": 30,
-    "domains_detected": 30
+    "languages_detected": 7079,
+    "domains_detected": 7079
   },
   "categories": {
     "code": {
-      "dataset_count": 1,
-      "packed_count": 2,
-      "token_count": 256,
-      "weight": 1.0,
+      "dataset_count": 2,
+      "packed_count": 952,
+      "token_count": 1949696,
+      "weight": 0.067318,
       "long_ctx_count": 0
     }
   },
   "languages": {
-    "python": 30
+    "other": 2944,
+    "javascript": 4,
+    "python": 4131
   },
   "domains": {
-    "code": 30
+    "algorithms": 2948,
+    "backend": 4131
   },
   "datasets": [
     {
-      "path": "fake/ds1",
+      "path": "OpenCoder-LLM/opc-fineweb-code-corpus",
       "category": "code",
-      "weight": 1.0,
-      "raw_samples": 30,
-      "after_boilerplate": 30,
-      "after_quality": 30,
-      "after_dedup": 30,
-      "packed_sequences": 2,
-      "total_tokens": 256,
-      "duplicates_removed": 0,
-      "retention_rate": 6.67,
-      "avg_tokens_per_seq": 128.0,
+      "weight": 0.045485,
+      "raw_samples": 5000,
+      "after_boilerplate": 2948,
+      "after_quality": 2948,
+      "after_dedup": 2948,
+      "packed_sequences": 433,
+      "total_tokens": 886784,
+      "duplicates_removed": 666,
+      "retention_rate": 8.66,
+      "avg_tokens_per_seq": 2048.0,
       "packing_efficiency": 1.0,
       "padding_ratio": 0.0,
       "long_context_count": 0,
       "long_context_ratio": 0.0,
-      "max_seq_length": 128,
+      "max_seq_length": 2048,
       "rejection_reasons": {
-        "loaded": 30,
-        "accepted": 30,
+        "loaded": 5000,
+        "accepted": 2948,
+        "rejected_boilerplate": 0,
+        "rejected_short": 6,
+        "rejected_quality": 2,
+        "rejected_dedup": 666,
+        "rejected_ast": 1341,
+        "rejected_empty": 0,
+        "rejected_contamination": 37
+      },
+      "quality_scores": {
+        "mean": 0.5143,
+        "min": 0.2929,
+        "max": 0.6121,
+        "median": 0.5102,
+        "count": 4994
+      }
+    },
+    {
+      "path": "bigcode/the-stack-v2-dedup",
+      "category": "code",
+      "weight": 0.021833,
+      "raw_samples": 5000,
+      "after_boilerplate": 4131,
+      "after_quality": 4131,
+      "after_dedup": 4131,
+      "packed_sequences": 519,
+      "total_tokens": 1062912,
+      "duplicates_removed": 640,
+      "retention_rate": 10.38,
+      "avg_tokens_per_seq": 2048.0,
+      "packing_efficiency": 1.0,
+      "padding_ratio": 0.0,
+      "long_context_count": 0,
+      "long_context_ratio": 0.0,
+      "max_seq_length": 2048,
+      "rejection_reasons": {
+        "loaded": 5000,
+        "accepted": 4131,
         "rejected_boilerplate": 0,
         "rejected_short": 0,
         "rejected_quality": 0,
-        "rejected_dedup": 0,
-        "rejected_ast": 0,
-        "rejected_empty": 0
+        "rejected_dedup": 640,
+        "rejected_ast": 71,
+        "rejected_empty": 0,
+        "rejected_contamination": 158
       },
       "quality_scores": {
-        "mean": 0.9,
-        "min": 0.9,
-        "max": 0.9,
-        "median": 0.9,
-        "count": 30
+        "mean": 0.6642,
+        "min": 0.3518,
+        "max": 0.8162,
+        "median": 0.6549,
+        "count": 5000
       }
     }
   ],

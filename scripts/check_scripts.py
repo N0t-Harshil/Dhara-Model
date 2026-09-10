@@ -4,7 +4,8 @@ import os, sys, time, json
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-os.environ["HF_TOKEN"] = ""
+# HF_TOKEN is inherited from the environment when set; never force-blank it,
+# otherwise gated-dataset checks silently report misleading results.
 
 import requests
 from src.data.registry import build_registry

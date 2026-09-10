@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Parameter Audit Script for Methos Class Model (MethosV3 / NSLT).
+Parameter Audit Script for Dhara Class Model (Dhara / NSLT).
 
 Loads model configuration, computes total and module-level parameter counts,
 checks embedding parameter cost ratio, and saves report to docs/param_breakdown.txt.
@@ -46,8 +46,8 @@ def main():
 
     total_params_b = param_info.get("total_params_b", 0)
     # Estimate exact params
-    if model_type == "methos_v3":
-        v3 = arch.methos_v3
+    if model_type == "dhara_v3":
+        v3 = arch.dhara_v3
         ssm_params = v3.n_ssm_layers * (4 * hidden_size ** 2 + hidden_size * v3.d_state * 3 + hidden_size * v3.d_state)
         memory_params = hidden_size * v3.d_hidden * 4 + v3.d_hidden * v3.d_hidden * 2
         intent_params = hidden_size * (v3.n_task_types + v3.n_difficulty_levels + v3.n_reasoning_types + 2)

@@ -25,6 +25,17 @@ os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 SCHEMA_VERSION = 1
 
 
+def _fsync(path: Path) -> None:
+    """Flush a file to disk so an atomic os.replace() never leaves an empty
+    or partially written target after a crash/power loss."""
+    try:
+        with open(path, "ab") as f:
+            f.flush()
+            os.fsync(f.fileno())
+    except OSError:
+        pass
+
+
 # ── Fingerprinting ────────────────────────────────────────────────────
 
 
@@ -129,8 +140,19 @@ def rewrite_hf_url(src: str) -> str:
 
 
 def _loader_for_files(files: List[str]) -> Optional[str]:
-    exts = [Path(f.split("?")[0]).suffix.lower() for f in files]
-    exts = [e for e in exts if e]
+    # Use full-name suffix matching so compressed variants (.json.gz, .jsonl.gz)
+    # are recognized — Path.suffix of "x.jsonl.gz" is only ".gz".
+    def _suffixes(f: str) -> List[str]:
+        name = f.split("?")[0].lower()
+        for cand in (".jsonl.gz", ".json.gz", ".parquet", ".jsonl", ".json",
+                     ".csv", ".arrow", ".txt"):
+            if name.endswith(cand):
+                return [cand]
+        return []
+
+    exts: List[str] = []
+    for f in files:
+        exts.extend(_suffixes(f))
     if not exts:
         return None
     if all(e == ".parquet" for e in exts):
@@ -213,16 +235,16 @@ class DatasetMetadataCache:
     # -- keys / paths -------------------------------------------------
 
     @staticmethod
-    def safe_dir_name(repo: str, name: Optional[str]) -> str:
+    def safe_dir_name(repo: str, name: Optional[str], split: str = "train") -> str:
         parts = []
-        for part in [repo, name or "default"]:
+        for part in [repo, name or "default", split]:
             part = part.replace("/", "___")
             part = re.sub(r"[^A-Za-z0-9_.-]+", "_", part)
             parts.append(part)
         return "__".join(parts)
 
     def record_dir(self, info) -> Path:
-        return self.root / self.safe_dir_name(info.path, info.name)
+        return self.root / self.safe_dir_name(info.path, info.name, info.split)
 
     # -- record construction ------------------------------------------
 
@@ -286,7 +308,7 @@ class DatasetMetadataCache:
 
     def get(self, repo: str, name: Optional[str] = None, split: str = "train") -> Optional[Dict[str, Any]]:
         """Load a cached record without verification. Returns None if absent."""
-        rec_dir = self.root / self.safe_dir_name(repo, name)
+        rec_dir = self.root / self.safe_dir_name(repo, name, split)
         rec_path = rec_dir / "record.json"
         try:
             if rec_path.exists():
@@ -343,7 +365,7 @@ class DatasetMetadataCache:
 
     def invalidate(self, repo: str, name: Optional[str] = None, split: str = "train") -> None:
         """Remove a stale record so the next run re-resolves the dataset."""
-        rec_dir = self.root / self.safe_dir_name(repo, name)
+        rec_dir = self.root / self.safe_dir_name(repo, name, split)
         try:
             if rec_dir.exists():
                 import shutil
@@ -366,6 +388,7 @@ class DatasetMetadataCache:
                 tmp.write_text(json.dumps(content, indent=2, default=str, ensure_ascii=False),
                                encoding="utf-8")
                 try:
+                    _fsync(tmp)
                     os.replace(tmp, path)
                 finally:
                     tmp.unlink(missing_ok=True)

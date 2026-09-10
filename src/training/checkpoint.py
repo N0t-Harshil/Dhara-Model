@@ -113,6 +113,7 @@ class AsyncCheckpointWriter:
         self._flush_cv = threading.Condition()
         self._pending = 0
         self._failed = False
+        self._closed = False
         self._thread = threading.Thread(
             target=self._run, daemon=True, name="ckpt-writer")
         self._thread.start()
@@ -167,12 +168,21 @@ class AsyncCheckpointWriter:
         return True
 
     def close(self) -> None:
-        """Flush pending jobs and stop the writer thread."""
+        """Flush pending jobs and stop the writer thread. Idempotent: safe to
+        call more than once or after a writer-thread failure (never hangs)."""
+        if self._closed:
+            return
+        self._closed = True
         try:
             self.flush()
         except Exception:
             pass
-        self._q.put(None)
+        try:
+            # Bounded put: if the writer thread died with a full queue a
+            # blocking put could stall the caller for write_timeout.
+            self._q.put(None, timeout=1.0)
+        except queue.Full:
+            pass
         self._thread.join(timeout=5)
 
     # -- internals --------------------------------------------------
@@ -254,7 +264,7 @@ def sync_write_checkpoint(path: Path, ctx: CheckpointContext) -> None:
     path.mkdir(parents=True, exist_ok=True)
     config = ctx.config
     if "model_type" not in config:
-        config = {**config, "model_type": config.get("architecture") or "methos_v3"}
+        config = {**config, "model_type": config.get("architecture") or "dhara_v3"}
     _atomic_write_bytes(path / "config.json", json.dumps(config, indent=2).encode("utf-8"))
     tmp = path / ("pytorch_model.bin.tmp")
     torch.save(ctx.model_state, str(tmp))

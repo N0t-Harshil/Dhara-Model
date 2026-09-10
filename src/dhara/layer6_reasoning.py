@@ -49,7 +49,10 @@ class AdaptiveContinuousReasoning(nn.Module):
         for step in range(max_n):
             active = step < n_steps
             dz = self.ode_tick(z_out, h_compressed)
-            new_z = z_out + dz * self.scale
+            # Euler update with dt = 1/sqrt(d_hidden). Multiplying by
+            # sqrt(d_hidden) (~100x for default config) blew up the state
+            # magnitude multiplicatively at every step.
+            new_z = z_out + dz / self.scale
             z_out = torch.where(active.unsqueeze(-1), new_z, z_out)
             trajectories.append(z_out.unsqueeze(1))
         if len(trajectories) > 0:

@@ -138,7 +138,9 @@ class SpecializedCoderModel:
         prompt_len = inputs["input_ids"].shape[1]
         new_tokens = outputs[0][prompt_len:]
         code = self.tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
-        for marker in ("### Instruction", "### End", "###"):
+        # Only truncate at instruction boundaries (previous code chopped any
+        # "###" including markdown headers inside generated code).
+        for marker in ("\n### Instruction", "\n### End"):
             idx = code.find(marker)
             if idx > 0:
                 code = code[:idx].strip()

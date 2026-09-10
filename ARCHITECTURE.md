@@ -1,4 +1,4 @@
-# Methos V4 — Frontier Cognitive Architecture
+# Dhara V4 — Frontier Cognitive Architecture
 
 ## Design Philosophy
 
@@ -66,7 +66,7 @@ Input → Tokenizer → Embedding → Memory → Intent → Workspace
 - **Ablation**: replace with residual sum → measure degradation
 
 ### 2. Tokenizer + Embedding
-- Unchanged from MethosV3 (IntelligentTokenizer + AdaptiveSemanticEmbedding)
+- Unchanged from Dhara (IntelligentTokenizer + AdaptiveSemanticEmbedding)
 
 ### 3. HierarchicalMemoryEngine
 - Unchanged (SSM compression + HSSM multi-scale memory + MemoryManager)
@@ -176,7 +176,7 @@ Measure: Δ score per ablation, Δ inference FLOPs, Δ training time
 
 ## Scaling Roadmap
 
-- **7B**: Full MethosV4, 1× A100 80GB inference, 4× training (FSDP)
+- **7B**: Full Dhara V4, 1× A100 80GB inference, 4× training (FSDP)
 - **70B**: MoE variant (8 experts, top-2), 4× A100 inference, 32× training
 - **1T**: MoE (64 experts, top-8), distributed inference, curriculum pretraining only
 
@@ -189,7 +189,7 @@ Measure: Δ score per ablation, Δ inference FLOPs, Δ training time
 5. **Phase 5**: Ablation harness with automated benchmark runs
 6. **Phase 6**: Scaling tests (7B → 70B → 1T)
 
-## Migration Plan from MethosV3
+## Migration Plan from Dhara
 
 1. Replace `InternalToolInterface` with `SymbolicToolRouter` (breaking: different outputs)
 2. Replace separate `ReflectionModule`, `VerificationModule`, `CuriosityModule` with single `QualityAssurance` (breaking: different forward signature)

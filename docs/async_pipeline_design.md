@@ -228,3 +228,11 @@ backoff delay + teardown cut-through, and a mixed timeout/success stress
 test pinning `in_flight() <= depth`). Phase 5 stress caught a latent
 producer leak (a cancelled/stale slot retired its worker thread; fixed by
 `continue` instead of `return`).
+
+`tests/test_health_reporter.py` (12 tests) pins the total-function safety of
+`DatasetHealthReport.summary_text()`: a cached dataset with no single detected
+language yields a `None` distribution label that previously crashed the
+report formatter (`TypeError: unsupported format string passed to
+NoneType.__format__`, `health_reporter.py:223`); `None` now renders as
+`unknown`/`N/A` and the exact packed-cache + async-worker call sequence is
+regression-tested.

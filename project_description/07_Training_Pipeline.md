@@ -2,7 +2,7 @@
 
 ## Overview
 
-The training pipeline (`src/training/pipeline.py`) orchestrates multi-stage training for the Methos Class Model. It supports three YAML configurations for different training scales, four training stages, FSDP distributed training, checkpointing with resume, and experiment tracking.
+The training pipeline (`src/training/pipeline.py`) orchestrates multi-stage training for the Dhara model. It supports three YAML configurations for different training scales, four training stages, FSDP distributed training, checkpointing with resume, and experiment tracking.
 
 ## Configuration
 
@@ -10,28 +10,29 @@ Three YAML config files in the project root provide different training scales:
 
 ### 1. `config_foundation.yaml` — Foundation Pretraining
 
-Target: ~160M parameter MethosV3 model for single NVIDIA A100 80GB.
+Target: ~160M parameter Dhara model for single NVIDIA A100 80GB.
 
-- **Architecture**: `methos_v3`, hidden_size=576, d_state=288, n_ssm_layers=3, vocab_size=64000
+- **Architecture**: `dhara_v3`, hidden_size=576, d_state=288, n_ssm_layers=3, vocab_size=64000
 - **Training**: 50,000 steps, learning_rate=1e-4, batch_size=4, gradient_accumulation=4 (effective batch 16)
 - **Sequence length**: 2048
 - **Distributed**: single GPU (strategy: none)
-- **Data**: Full registry mode with 55 datasets across 8 categories
+- **Data**: Full registry mode with 54 primary datasets (+4 fallback-only) across 8 categories
+- **Staging**: dataset-granular staged pretraining with 8 stages (8000 / 6000 / 10000 / 6000 / 6000 / 6000 / 6000 / 2000 = 50,000 steps), one cosine schedule over the full run
 
 ### 2. `config_small.yaml` — Small Scale
 
-Target: ~173M parameter MethosV3 for single-GPU experimentation.
+Target: ~173M parameter Dhara for single-GPU experimentation.
 
-- **Architecture**: `methos_v3`, hidden_size=576, vocab_size=128000, reduced subgoal/reasoning parameters
+- **Architecture**: `dhara_v3`, hidden_size=576, vocab_size=128000, reduced subgoal/reasoning parameters
 - **Training**: 50,000 steps, learning_rate=3e-4, batch_size=4, gradient_accumulation=8 (effective batch 32)
 - **Data**: Uses explicit dataset list (codeparrot-clean + c4), not registry mode
 - **Distributed**: single GPU
 
 ### 3. `config.yaml` — Full Production
 
-Target: Full-scale MethosV3 for 4x A100 80GB (FSDP full-shard).
+Target: Full-scale Dhara for 4x A100 80GB (FSDP full-shard).
 
-- **Architecture**: `methos_v3`, hidden_size=10240, d_state=4096, n_ssm_layers=6, vocab_size=128000
+- **Architecture**: `dhara_v3`, hidden_size=10240, d_state=4096, n_ssm_layers=6, vocab_size=128000
 - **Training**: 1,000,000 steps, learning_rate=2e-4, batch_size=2, gradient_accumulation=8 (effective batch 64)
 - **Sequence length**: 4096 (extensible to 262K via YaRN RoPE scaling)
 - **Distributed**: FSDP full-shard, 4 GPUs, CPU offload for optimizer states
@@ -41,7 +42,7 @@ Target: Full-scale MethosV3 for 4x A100 80GB (FSDP full-shard).
 
 All configuration parameters are validated by the Pydantic v2 schema in `src/config/schema.py`. The root model is `Config` with nested sub-configs:
 
-- `ModelConfig` → `ModelArchitectureConfig` → `MethosV3Config` / `NSLTConfig` / `MoEConfig` / `VisionConfig`
+- `ModelConfig` → `ModelArchitectureConfig` → `DharaConfig` / `NSLTConfig` / `MoEConfig` / `VisionConfig`
 - `TrainingConfig` → `PretrainStageConfig`, `SFTStageConfig`, `InstructionTuningConfig`, `AlignmentPhaseConfig`, `RLHFConfig`, `SafetyConfig`
 - `DistributedConfig` → `FSDPConfig`, `DeepSpeedConfig`
 - `DataConfig` → `QualityPipelineConfig`, `CurriculumConfig`, `PreprocessingConfig`, `LanguageBalancingConfig`, `DomainBalancingConfig`, `ASTFilterConfig`, `FunctionSamplingConfig`, `WeightedSamplerConfig`
@@ -65,9 +66,10 @@ Cross-field validators ensure consistency:
 - **Weight decay**: 0.1
 - **Max grad norm**: 1.0
 - **Optimizer**: AdamW (fused)
-- **Dataset**: Full registry (55 entries, 8 categories via weighted mixture)
+- **Dataset**: Full registry (54 primary entries, 8 categories via weighted mixture)
 - **Disabled**: SFT, instruction tuning, alignment, safety, curriculum
 - **FSDP**: Disabled (single GPU)
+- **Async prefetch**: per-slot staged unit prefetch (daemon producers, cancellation, retry/backoff) keeps streaming/filtering/tokenization ahead of the GPU
 
 ### Stage 2: Full Pretraining (config.yaml)
 
@@ -134,7 +136,7 @@ All stages use cosine decay with linear warmup. The scheduler type is configurab
 ### Save Format
 
 - **Model weights**: `model.safetensors` (via `save_pretrained()`)
-- **Config**: `config.json` (MethosV3Config → PretrainedConfig, HuggingFace-compatible)
+- **Config**: `config.json` (DharaConfig → PretrainedConfig, HuggingFace-compatible)
 - **Tokenizer**: `tokenizer.json`, `special_tokens_map.json`, etc.
 - **Training state**: `training_args.bin` (TrainingArguments state, managed by Trainer)
 

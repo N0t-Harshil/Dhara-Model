@@ -51,7 +51,7 @@ Report output: plain-text summary printed to stdout and optionally saved to a fi
 
 **Function**: `phase1_verify_registry()`
 
-Tests that all 55 registry entries can be loaded from HuggingFace. For each entry:
+Tests that all 54 primary registry entries can be loaded from HuggingFace. For each entry:
 1. Attempts to load 5 samples via `stream_dataset_with_fallbacks()`
 2. Reports status: `ok` (loaded successfully), `failed` (load error), `gated` (authentication required), `skipped_dup` (duplicate entry), or `local_json` (JSONL file)
 3. Calculates `available_pct` = total weight of available entries / total weight
@@ -61,7 +61,7 @@ Tests that all 55 registry entries can be loaded from HuggingFace. For each entr
 - Available weight and percentage
 - List of failures with path, category, weight, and error message
 
-**Expected**: >90% available weight. Known failures: GAIR/MathPile (gated), some doc sources if JSONL not yet built.
+**Expected**: >90% available weight. GAIR/MathPile now loads (access granted); remaining risk is doc sources if the JSONL corpus is not yet built.
 
 ---
 
@@ -208,6 +208,8 @@ Tests the training loop and checkpoint save/load/resume cycle.
 2. Uses a temporary directory for checkpoints
 3. Logging steps = 1 for detailed output
 
+> **Current status**: `scripts/run_training.py` does not yet exist in the repo, so Phase 8 reports `SKIPPED` (with a warning) until the unified training entrypoint is landed. The phase's checkpoint-verification + resume logic is exercised only when that script is present.
+
 **Step 2 — Verify checkpoint**:
 1. Scans the output directory for `.pt` files or `checkpoint-*` directories
 2. Reports the first checkpoint file found
@@ -236,7 +238,7 @@ Assembles all phase results into a production readiness report.
 **Decision logic**:
 - **READY FOR FULL PRETRAINING**: No issues detected (all phases pass)
 - **READY WITH MINOR WARNINGS**: Only non-critical issues (e.g., padding slightly above target, minor distribution deviation)
-- **NOT READY**: Critical issues present (corpus availability < 90%, padding >= 5%, token distribution off by > 3%, decoded sample issues, training/failback failures)
+- **NOT READY**: Critical issues present (corpus availability < 90%, padding >= 5%, token distribution off by > 3%, decoded sample issues, training/fallback failures)
 
 **Issue categories**:
 1. Corpus availability < 90% → NOT READY

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import gzip
 import json
 import logging
 import os
@@ -875,13 +874,18 @@ def scrape_all(output_dir: str, sources: Optional[List[str]] = None, max_per_sou
         try:
             scraper = cls(output_dir=str(output_path))
             scraper.MAX_PAGES = max_per_source
-            jsons_path = output_path / scraper.SOURCE_NAME / "documents.jsonl"
+            target = output_path / scraper.SOURCE_NAME / "documents.jsonl"
+            # Scrape into a temp file: only a fully completed crawl is
+            # atomically renamed into place, so a timed-out/errored run never
+            # leaves (or reuses) a torn documents.jsonl.
+            tmp = target.with_name("documents.jsonl.tmp")
+            tmp.unlink(missing_ok=True)
             count = 0
             exc_info: List[Optional[Exception]] = [None]
             def _run():
                 nonlocal count
                 try:
-                    count = scraper.scrape_to_jsonl(jsons_path)
+                    count = scraper.scrape_to_jsonl(tmp)
                 except Exception as e:
                     exc_info[0] = e
             t = threading.Thread(target=_run, daemon=True)
@@ -891,10 +895,24 @@ def scrape_all(output_dir: str, sources: Optional[List[str]] = None, max_per_sou
                 logger.error("  %s: TIMEOUT after %ds (discovered=%d, failed=%d)",
                              name, source_timeout, scraper._discovered_count, scraper._failed_count)
                 results[name] = -1
+                # The daemon may still be appending to the temp file — drop
+                # both the partial data and any stale target so the next run
+                # rescrapes from scratch.
+                tmp.unlink(missing_ok=True)
+                target.unlink(missing_ok=True)
             elif exc_info[0]:
+                tmp.unlink(missing_ok=True)
                 raise exc_info[0]
             else:
                 results[name] = count
+                if tmp.exists():
+                    try:
+                        with open(tmp, "ab") as f:
+                            f.flush()
+                            os.fsync(f.fileno())
+                    except OSError:
+                        pass
+                    tmp.replace(target)
                 if count == 0:
                     logger.warning("  %s: 0 pages scraped (discovered=%d, failed=%d, dups=%d)",
                                    name, scraper._discovered_count, scraper._failed_count, scraper._duplicate_count)

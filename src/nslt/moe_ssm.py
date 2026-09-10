@@ -8,8 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.nslt.layer1_ssm import SSMCompressionEngine
-from src.nslt.ssm_scan import selective_scan_vectorized
+from src.nslt.layer1_ssm import SSMCompressionEngine  # noqa: F401 — re-exported for backward compat
 
 logger = logging.getLogger(__name__)
 
@@ -179,6 +178,10 @@ class MoE_SSM_Block(nn.Module):
 
         # Route tokens to experts (use normalized input x, not conv features)
         gate_weights, expert_indices, load_loss = self.router(x)
+        # Stash for the caller (e.g. loss computation); without it the
+        # router's load-balancing signal is computed-then-dropped and experts
+        # collapse to a few winners.
+        self._last_load_loss = load_loss
 
         # Each token activates top_k experts.
         # For each expert, gather its tokens, run SSM, scatter back.
@@ -220,8 +223,9 @@ class MoE_SSM_Block(nn.Module):
             h_flat[:, :, e_idx * self.expert_d_state: (e_idx + 1) * self.expert_d_state] += h_e_full
             y_flat = y_flat + y_e
 
-        if d_inner > self.expert_d_state:
-            y_flat = y_flat + x_conv[:, :, :d_inner]
+        # Residual input path so every channel carries signal (previously only
+        # the scanned scalar reached channel 0; tail channels were raw x only).
+        y_flat = y_flat + x_conv[:, :, :d_inner]
 
         output = y_flat * self.act(x_gate)
         output = self.out_proj(output)

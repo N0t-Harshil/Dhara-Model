@@ -94,6 +94,9 @@ class ShardCoordinator:
         self._first_row_timeout = float(
             os.environ.get("DATA_FILE_FIRST_ROW_TIMEOUT", "600"))
         self._created = time.monotonic()
+        # Last sample-consumed / shard-finished instant — guards against both
+        # a dead first row AND a mid-stream stall (network/pyarrow hang).
+        self._last_progress = self._created
         logger.info("Streaming begins — %d shards, %d parallel workers%s%s",
                     len(self.files), self.workers,
                     f", resume at shard {plan[0][0]} offset {plan[0][1]}" if plan else "",
@@ -107,16 +110,15 @@ class ShardCoordinator:
         if not self._runs:
             raise StopIteration
         while True:
-            if (not self._first_row_seen
-                    and (time.monotonic() - self._created) > self._first_row_timeout):
+            if (time.monotonic() - self._last_progress) > self._first_row_timeout:
                 raise TimeoutError(
-                    f"Streaming produced no samples within "
-                    f"{self._first_row_timeout:.0f}s ({len(self._runs)} shards in "
-                    "flight). Causes: (1) gated dataset — ensure HF_TOKEN is set and "
-                    "the repo terms are accepted; (2) Xet backend stall — "
-                    "HF_HUB_DISABLE_XET=1 is set by default; (3) network outage. "
-                    "Raise with DATA_FILE_FIRST_ROW_TIMEOUT=<seconds> if the first "
-                    "row legitimately takes longer.")
+                    f"Streaming made no progress for {self._first_row_timeout:.0f}s "
+                    f"({len(self._runs)} shards in flight). Causes: (1) gated dataset "
+                    "— ensure HF_TOKEN is set and the repo terms are accepted; (2) Xet "
+                    "backend stall — HF_HUB_DISABLE_XET=1 is set by default; (3) network "
+                    "outage; (4) a mid-stream download hang. Raise with "
+                    "DATA_FILE_FIRST_ROW_TIMEOUT=<seconds> if a stall legitimately "
+                    "lasts longer.")
             if self._stop.is_set():
                 raise StopIteration
             if self._emit_pos >= len(self.plan):
@@ -142,6 +144,7 @@ class ShardCoordinator:
                 continue
             sample["_shard"] = idx
             self._first_row_seen = True
+            self._last_progress = time.monotonic()
             self._consumed_raw[idx] = max(
                 self._consumed_raw.get(idx, 0), int(sample.get("_raw_seq", 0)))
             self._gated += 1
@@ -228,6 +231,10 @@ class ShardCoordinator:
             self._timings["arrow_open_max_sec"], open_sec)
         if run.failed:
             self._failed_shards.append(idx)
+        else:
+            # Shard completion is progress even when it gated zero samples
+            # (its queue was drained and the worker finished cleanly).
+            self._last_progress = time.monotonic()
         self._raw_done[idx] = run.raw_count
         del self._runs[idx]
         if self._current is run:
@@ -468,6 +475,7 @@ def stream_dataset_with_fallbacks(
     meta_cache: Optional[DatasetMetadataCache] = None,
     preprocess_sig: str = "",
     token_sig: str = "",
+    skip_counters: Optional[Dict[str, int]] = None,
 ) -> Generator[Dict[str, Any], None, None]:
     tried: List[str] = []
     chain = [info]
@@ -507,6 +515,8 @@ def stream_dataset_with_fallbacks(
             if key != f"{info.path}/{info.name or 'default'}":
                 registry.log_fallback(f"{info.path}/{info.name or 'default'}", key)
             return
+        if skip_counters is not None:
+            skip_counters[key] = skip_counters.get(key, 0) + 1
         logger.warning("Dataset %s returned 0 samples, trying fallback %s", key,
                        entry.fallbacks if entry is info else "none")
 
@@ -520,9 +530,11 @@ class StreamingManager:
 
     def stream_all(self, limit_per_dataset: Optional[int] = None) -> Generator[Dict[str, Any], None, None]:
         for info in self.registry.all_entries():
-            key = f"{info.path}/{info.name or 'default'}/{info.category}"
+            key = f"{info.path}/{info.name or 'default'}"
             self._skip_counters[key] = 0
-            yield from stream_dataset_with_fallbacks(info, self.registry, limit=limit_per_dataset)
+            yield from stream_dataset_with_fallbacks(
+                info, self.registry, limit=limit_per_dataset,
+                skip_counters=self._skip_counters)
 
     def stream_category(self, category: str, limit_per_dataset: Optional[int] = None) -> Generator[Dict[str, Any], None, None]:
         for info in self.registry.all_entries():

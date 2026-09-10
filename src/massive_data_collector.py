@@ -20,9 +20,11 @@ class MassiveDataCollector:
         the collector uses it directly and avoids file I/O.
         """
         if isinstance(datasets_cfg_or_config, list):
-            # tests and some callsites pass a datasets list directly
+            # tests and some callsites pass a datasets list directly; entries
+            # may be plain dicts or pydantic config models — normalize once so
+            # every downstream .get()/[] access works uniformly.
             self.config = {"data": {"datasets": datasets_cfg_or_config}}
-            self.datasets = datasets_cfg_or_config
+            self.datasets = [self._to_dict(d) for d in datasets_cfg_or_config]
         else:
             # treat as path to config file
             self.config = self._load_config(datasets_cfg_or_config)
@@ -58,36 +60,50 @@ class MassiveDataCollector:
         with open(path, "r", encoding="utf-8") as f:
             return yaml.safe_load(f)
 
+    @staticmethod
+    def _to_dict(entry) -> dict:
+        """Normalize a dataset entry to a plain dict.
+
+        Callers pass either raw dicts (tests) or pydantic config models
+        (training pipeline) — this accepts both so .get()/[] access always
+        works regardless of the source.
+        """
+        if isinstance(entry, dict):
+            return entry
+        if hasattr(entry, "model_dump"):
+            try:
+                return dict(entry.model_dump())
+            except Exception:
+                pass
+        if hasattr(entry, "__dict__"):
+            return {k: v for k, v in vars(entry).items() if not k.startswith("_")}
+        return dict(entry)
+
     def get_dataset_list(self) -> list:
         """Returns the list of dataset configs for staged training."""
         return self.datasets
 
-    def stream_single_dataset(self, ds_info: dict, limit=None, theme: str = "all", skip_samples: int = 0):
+    def stream_single_dataset(self, ds_info: dict, limit=None, theme: str = "all",
+                              skip_samples: int = 0, raw_text: bool = False):
         """Stream samples from a single dataset entry.
-        
+
         Used by the staged training pipeline to train on one dataset at a time.
+        `skip_samples` valid samples are dropped from the front of the stream
+        in a single pass — the dataset is never re-downloaded/re-iterated.
+        `raw_text` is accepted for call-site compatibility with the legacy
+        collector (DataPipeline passes ``raw_text=True``); this collector always
+        yields structured field dicts.
         """
+        ds_info = self._to_dict(ds_info)
         count = 0
         if limit is None:
             limit = ds_info.get("max_samples")
         groups = self._get_groups()
         target_libs = groups.get(theme, self.target_libraries)
-        
-        state_parts = [
-            ds_info.get("path", ""),
-            ds_info.get("data_dir", ""),
-            ds_info.get("name", ""),
-            ds_info.get("split", ""),
-        ]
-        state_key = "_skip_" + "_".join(
-            str(part).replace("/", "_").replace("-", "_").replace("+", "plus")
-            for part in state_parts
-            if part
-        )
-        if not hasattr(self, state_key):
-            setattr(self, state_key, skip_samples)
-            
-        logger.info(f"Streaming {theme} samples from {ds_info['path']}...")
+        skip = int(skip_samples or 0)
+        path = str(ds_info.get("path", "?"))
+
+        logger.info(f"Streaming {theme} samples from {path}...")
         try:
             ds_kwargs = {
                 "path": ds_info["path"],
@@ -100,45 +116,33 @@ class MassiveDataCollector:
                 ds_kwargs["name"] = ds_info["name"]
             if "languages" in ds_info:
                 ds_kwargs["languages"] = ds_info["languages"]
-            
-            while True:
-                processed_entries = 0
-                ds = load_dataset(**ds_kwargs)
-                initial_skip = getattr(self, state_key)
-                
-                for entry in ds:
-                    processed_entries += 1
-                    sample = self._process_entry(entry, theme, target_libs, ds_info=ds_info)
-                    if sample:
-                        current_skip = getattr(self, state_key)
-                        if current_skip > 0:
-                            setattr(self, state_key, current_skip - 1)
-                            continue
-                            
-                        yield sample
-                        count += 1
-                        if limit and count >= int(limit):
-                            return
-                            
-                if count > 0:
-                    break
-                    
-                if processed_entries == 0:
-                    logger.warning(f"Dataset {ds_info['path']} is empty. Breaking.")
-                    break
-                    
-                # SAFETY CHECK: If we went through the entire dataset and didn't skip a single sample,
-                # it means the dataset has 0 valid samples for this theme. We must break to avoid infinite loop!
-                if getattr(self, state_key) == initial_skip:
-                    logger.warning(f"Dataset {ds_info['path']} yielded 0 valid samples in this epoch. Breaking to avoid infinite loop.")
-                    break
-                    
-                logger.info(f"Dataset exhausted during skip phase (remaining skips: {getattr(self, state_key)}). Looping internally.")
-                
+
+            ds = load_dataset(**ds_kwargs)
+            processed_entries = 0
+            for entry in ds:
+                processed_entries += 1
+                sample = self._process_entry(entry, theme, target_libs, ds_info=ds_info)
+                if not sample:
+                    continue
+                if skip > 0:
+                    skip -= 1
+                    continue
+                yield sample
+                count += 1
+                if limit and count >= int(limit):
+                    return
+
+            if skip > 0:
+                logger.warning(
+                    f"Dataset {path} exhausted with {skip} sample(s) still to skip "
+                    f"(requested {int(skip_samples or 0)}, fewer valid samples available).")
+            elif processed_entries == 0:
+                logger.warning(f"Dataset {path} is empty.")
+
         except Exception as e:
-            logger.error(f"Error streaming from {ds_info['path']}: {e}")
-        
-        logger.info(f"Finished streaming {count} samples from {ds_info['path']}")
+            logger.error(f"Error streaming from {path}: {e}")
+
+        logger.info(f"Finished streaming {count} samples from {path}")
 
 
     def stream_samples(self, limit=None, theme: str = "all", stages=None):
@@ -156,6 +160,7 @@ class MassiveDataCollector:
             groups = self._get_groups()
             
             for ds_info in self.datasets:
+                ds_info = self._to_dict(ds_info)
                 logger.info(f"Streaming curriculum from {ds_info['path']}...")
                 try:
                     ds_kwargs = {
@@ -288,6 +293,7 @@ class MassiveDataCollector:
         target_libs = groups.get(theme, self.target_libraries)
         
         for ds_info in self.datasets:
+            ds_info = self._to_dict(ds_info)
             logger.info(f"Streaming {theme} samples from {ds_info['path']}...")
             try:
                 ds_kwargs = {
@@ -321,70 +327,13 @@ class MassiveDataCollector:
 
     def _process_entry(self, entry: dict, theme: str, target_libs: list, ds_info: dict | None = None) -> dict | None:
         """Processes a single entry and returns a formatted sample if it matches the theme.
-        
-        Handles many HuggingFace dataset formats:
-          - instruction/output and instruction/response (Alpaca-style)
-          - problem/solution and query/answer (code instruction datasets)
-          - messages/chosen/conversations (chat and preference datasets)
-          - prompt/completion
-          - description/solutions (code_contests)
-          - func_documentation_string/func_code_string (code-search-net)
-          - content/text/code (raw code datasets)
-        """
-        ds_info = ds_info or {}
-        instruction = ""
-        input_text = ""
-        output = ""
 
-        # --- Alpaca-style instruction datasets ---
-        if "instruction" in entry and "output" in entry:
-            instruction = self._clean_text(entry.get("instruction"))
-            input_text = self._clean_text(entry.get("input"))
-            output = self._clean_text(entry.get("output"))
-        # --- Instruction/response style ---
-        elif "instruction" in entry and "response" in entry:
-            instruction = self._clean_text(entry.get("instruction"))
-            output = self._clean_text(entry.get("response"))
-        # --- Problem/solution style ---
-        elif "problem" in entry and "solution" in entry:
-            instruction = self._clean_text(entry.get("problem"))
-            output = self._clean_text(entry.get("solution"))
-        # --- Query/answer style ---
-        elif "query" in entry and "answer" in entry:
-            instruction = self._clean_text(entry.get("query"))
-            output = self._clean_text(entry.get("answer"))
-        # --- Chat or preference-style messages ---
-        elif "messages" in entry or "chosen" in entry or "conversations" in entry:
-            instruction, output = self._extract_chat_pair(entry)
-        # --- Prompt/completion style ---
-        elif "prompt" in entry and "completion" in entry:
-            instruction = self._clean_text(entry.get("prompt"))
-            output = self._clean_text(entry.get("completion"))
-        elif "prompt" in entry and "response" in entry:
-            instruction = self._clean_text(entry.get("prompt"))
-            output = self._clean_text(entry.get("response"))
-        # --- Code contests (deepmind) ---
-        elif "description" in entry and "solutions" in entry:
-            instruction = self._clean_text(entry.get("description"))
-            solutions = entry["solutions"]
-            if isinstance(solutions, dict) and "solution" in solutions:
-                sol_list = solutions["solution"]
-                if isinstance(sol_list, list) and len(sol_list) > 0:
-                    output = self._clean_text(sol_list[0])
-                else:
-                    return None
-            elif isinstance(solutions, list) and len(solutions) > 0:
-                output = self._clean_text(solutions[0])
-            else:
-                return None
-        # --- Code-search-net style ---
-        elif "func_documentation_string" in entry and "func_code_string" in entry:
-            instruction = self._clean_text(entry.get("func_documentation_string"))
-            output = self._clean_text(entry.get("func_code_string"))
-        # --- Raw code fallback ---
-        else:
-            output = self._clean_text(entry.get('content') or entry.get('text') or entry.get('code') or "")
-            instruction = ""
+        Field extraction delegates to _extract_fields (the single source of
+        truth for the many HuggingFace dataset formats) — theme filtering and
+        quality gating live here.
+        """
+        ds_info = self._to_dict(ds_info or {})
+        instruction, input_text, output = self._extract_fields(entry)
 
         content = "\n".join(part for part in (instruction, input_text, output) if part)
 
@@ -494,14 +443,6 @@ class MassiveDataCollector:
             instruction = self._clean_text(entry.get("prompt"))
             output = self._clean_text(entry.get("completion") or entry.get("response"))
         elif "description" in entry and "solutions" in entry:
-            instruction = self._clean_text(entry.get("description"))
-            solutions = entry.get("solutions")
-            if isinstance(solutions, dict) and "solution" in solutions:
-                sol_list = solutions["solution"]
-                if isinstance(sol_list, list) and sol_list:
-                    output = self._clean_text(sol_list[0])
-            elif isinstance(solutions, list) and solutions:
-                output = self._clean_text(solutions[0])
             instruction = self._clean_text(entry.get("description"))
             solutions = entry.get("solutions")
             if isinstance(solutions, dict) and "solution" in solutions:

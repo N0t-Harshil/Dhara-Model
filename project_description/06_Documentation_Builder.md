@@ -6,7 +6,7 @@ The documentation builder (`src/data/doc_builder.py`) is a multi-threaded web sc
 
 ## Supported Sources
 
-All 18 scrapers are registered in the `SCRAPERS` dictionary at `src/data/doc_builder.py:694`:
+All 18 scrapers are registered in the `SCRAPERS` dictionary at `src/data/doc_builder.py:839`:
 
 | # | Key | Class | Language | Domain | Pages
 |---|-----|-------|----------|--------|-------
@@ -60,7 +60,7 @@ DocScraper (ABC)
 
 ### DocScraper (Abstract Base Class)
 
-**File:** `src/data/doc_builder.py:97`
+**File:** `src/data/doc_builder.py:147`
 
 The abstract base class provides:
 
@@ -87,7 +87,7 @@ This guarantees template URLs such as `https://docs.docker.com/{{ meta.url | def
 
 ### SphinxScraper
 
-**File:** `src/data/doc_builder.py:197`
+**File:** `src/data/doc_builder.py:267`
 
 Extends `DocScraper` for Sphinx-generated documentation sites (Python docs, NumPy, FastAPI, OpenCV, ONNX, Docker, Kubernetes, PostgreSQL, Go). Adds:
 
@@ -102,23 +102,23 @@ Each scraper implements its own `discover_urls()` method with a strategy tailore
 
 - **SphinxScraper** (generic): Yields `BASE_URL` + all `URL_PATTERNS` as seeds. For each seed, fetches HTML and follows all `href` links that match the base URL and are not excluded. Template/invalid hrefs are filtered before yielding. This works well for Sphinx-generated docs which have predictable link structures. Used by Docker, Kubernetes, OpenCV, ONNX, NumPy, FastAPI, Go, and Python docs.
 
-- **PyTorchDocScraper** (`src/data/doc_builder.py:250`): Adds seed URLs (tensors.html, torch.html, nn.html, optim.html, etc.), then fetches `genindex.html` to discover additional pages via the alphabetical index. This provides broader coverage than Sphinx's auto-generated index.
+- **PyTorchDocScraper** (`src/data/doc_builder.py:335`): Adds seed URLs (tensors.html, torch.html, nn.html, optim.html, etc.), then fetches `genindex.html` to discover additional pages via the alphabetical index. This provides broader coverage than Sphinx's auto-generated index.
 
-- **MDNDocScraper** (`src/data/doc_builder.py:413`): Uses hardcoded `CORE_TOPICS` (HTML, CSS, JavaScript, HTTP, Web/API, Web/Guide, SVG, MathML, Web_Components, Events, Performance, Security, Accessibility) as seeds. Fetches `/en-US/docs/Web` for one-level link discovery. Filters deprecated prefixes (old SVG path APIs, GestureEvent, Microsoft-specific APIs, etc.).
+- **MDNDocScraper** (`src/data/doc_builder.py:517`): Uses hardcoded `CORE_TOPICS` (HTML, CSS, JavaScript, HTTP, Web/API, Web/Guide, SVG, MathML, Web_Components, Events, Performance, Security, Accessibility) as seeds. Fetches `/en-US/docs/Web` for one-level link discovery. Filters deprecated prefixes (old SVG path APIs, GestureEvent, Microsoft-specific APIs, etc.).
 
-- **RFCDocScraper** (`src/data/doc_builder.py:511`): Fetches the IETF text index (`https://www.ietf.org/rfc/rfc-index.txt`) which is a plain-text list of all RFC numbers. Parses each RFC number and constructs the URL `https://www.rfc-editor.org/rfc/rfc{NUMBER}.txt`. This avoids the 16MB Nuxt SSR HTML index page.
+- **RFCDocScraper** (`src/data/doc_builder.py:622`): Fetches the IETF text index (`https://www.ietf.org/rfc/rfc-index.txt`) which is a plain-text list of all RFC numbers. Parses each RFC number and constructs the URL `https://www.rfc-editor.org/rfc/rfc{NUMBER}.txt`. This avoids the 16MB Nuxt SSR HTML index page.
 
-- **PostgreSQLDocScraper** (`src/data/doc_builder.py:350`): Matches links against `https://www.postgresql.org/docs/` with any version path (e.g., `/docs/16/`, `/docs/current/`) to be version-agnostic. Excludes non-HTML resources.
+- **PostgreSQLDocScraper** (`src/data/doc_builder.py:442`): Matches links against `https://www.postgresql.org/docs/` with any version path (e.g., `/docs/16/`, `/docs/current/`) to be version-agnostic. Excludes non-HTML resources.
 
-- **LinuxKernelDocScraper** (`src/data/doc_builder.py:540`): Full recursive discovery from `BASE_URL`. Follows all same-domain `href` links, excludes PDFs and fragment-only links.
+- **LinuxKernelDocScraper** (`src/data/doc_builder.py:651`): Full recursive discovery from `BASE_URL`. Follows all same-domain `href` links, excludes PDFs and fragment-only links.
 
-- **SQLiteDocScraper** (`src/data/doc_builder.py:384`): Fetches `https://sqlite.org/docs.html` and follows all same-domain links, excluding `.pdf`, `.txt`, `.zip`, `.tar`.
+- **SQLiteDocScraper** (`src/data/doc_builder.py:483`): Fetches `https://sqlite.org/docs.html` and follows all same-domain links, excluding `.pdf`, `.txt`, `.zip`, `.tar`.
 
-- **LangSpecScraper** (`src/data/doc_builder.py:572`): Uses fully hardcoded URL lists — 9 Python language reference pages + 9 Rust reference pages. No link discovery needed since the language specs are a curated set.
+- **LangSpecScraper** (`src/data/doc_builder.py:689`): Uses fully hardcoded URL lists — 9 Python language reference pages + 9 Rust reference pages. No link discovery needed since the language specs are a curated set.
 
-- **CUDADocScraper** (`src/data/doc_builder.py:635`): Uses 18 hardcoded seed URLs (programming guide, runtime API, driver API, math API, best practices, cuBLAS, cuRAND, cuSOLVER, cuSPARSE, cuFFT, NVRTC, NVML, Thrust, installation guide, NVCC, release notes, PTX, C++ guide). For each seed, follows one level of `.html` links within the CUDA docs domain. **Fix applied:** the href-processing loop was previously outside the `for` loop due to an indentation bug — only the *last* href per page was processed and all earlier links were silently dropped. All links are now processed, which is why the CUDA page count increases on regeneration.
+- **CUDADocScraper** (`src/data/doc_builder.py:752`): Uses 18 hardcoded seed URLs (programming guide, runtime API, driver API, math API, best practices, cuBLAS, cuRAND, cuSOLVER, cuSPARSE, cuFFT, NVRTC, NVML, Thrust, installation guide, NVCC, release notes, PTX, C++ guide). For each seed, follows one level of `.html` links within the CUDA docs domain. **Fix applied:** the href-processing loop was previously outside the `for` loop due to an indentation bug — only the *last* href per page was processed and all earlier links were silently dropped. All links are now processed, which is why the CUDA page count increases on regeneration.
 
-- **CuDNNDocScraper** (`src/data/doc_builder.py:667`): Uses 7 hardcoded seed URLs under `https://docs.nvidia.com/deeplearning/cudnn/latest/` (api overview, graph/ops library, developer guide, release notes, installation guide, index). Sub-link following is enabled (restricted to `.html` links within the cudnn docs domain), with a dual content selector (`article` → fallback `main`).
+- **CuDNNDocScraper** (`src/data/doc_builder.py:790`): Uses 7 hardcoded seed URLs under `https://docs.nvidia.com/deeplearning/cudnn/latest/` (api overview, graph/ops library, developer guide, release notes, installation guide, index). Sub-link following is enabled (restricted to `.html` links within the cudnn docs domain), with a dual content selector (`article` → fallback `main`).
 
 ## Text Extraction
 
@@ -153,7 +153,7 @@ Content selectors vary per scraper:
 - **`_failed` set**: Each scraper instance maintains a set of failed URLs. Once a URL fails (404, timeout, connection error), it is never re-fetched within the same scrape session.
 - **`_filtered_count`**: Template/invalid URLs rejected at discovery or at the `scrape()` gate are counted separately — they are never treated as failed requests.
 - **Per-scraper summary stats**: After scraping, `_summary()` reports discovered count, duplicate count, filtered count, and failed count.
-- **Per-source timeout**: The `scrape_all()` function (`src/data/doc_builder.py:716`) runs each scraper in a separate thread with a configurable timeout (default 600 seconds). If a scraper exceeds the timeout, the thread is abandoned and the source is reported as timed out.
+- **Per-source timeout**: The `scrape_all()` function (`src/data/doc_builder.py:861`) runs each scraper in a separate thread with a configurable timeout (default 600 seconds). If a scraper exceeds the timeout, the thread is abandoned and the source is reported as timed out.
 - **MAX_PAGES enforcement**: The `scrape()` generator checks `count >= self.MAX_PAGES` at each yield point, so over-discovery does not lead to unbounded scraping.
 - **Client-side redirect following**: `_find_client_redirect()` handles `<meta http-equiv="refresh">` redirects and `location.replace()`/`location.href` JavaScript redirects, following up to 4 redirect hops.
 
@@ -190,7 +190,7 @@ graph TB
 
 ## Registry Integration
 
-After scraping, `build_doc_registry()` (`src/data/doc_builder.py:757`) creates `DatasetInfo` entries for each scraped source. These entries:
+After scraping, `build_doc_registry()` (`src/data/doc_builder.py:925`) creates `DatasetInfo` entries for each scraped source. These entries:
 - Use `path="json"` and `data_dir` pointing to the JSONL output directory
 - Get proportional weights based on the `weights` dict (default: python 0.18, pytorch 0.13, mdn 0.15, rust-book 0.10, etc.)
 - Have `quality_score=0.95` and `category="docs"`

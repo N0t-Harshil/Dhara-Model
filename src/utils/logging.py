@@ -15,6 +15,10 @@ def setup_logging(log_dir: str | Path = "logs", level: int = logging.INFO) -> No
     )
 
     root = logging.getLogger()
+    # Idempotent: don't add duplicate handlers on repeated calls (previously
+    # every call duplicated console+file output and leaked file handles).
+    if any(isinstance(h, logging.FileHandler) and getattr(h, "baseFilename", "").endswith("train.log") for h in root.handlers):
+        return
     root.setLevel(level)
 
     console = logging.StreamHandler(sys.stdout)

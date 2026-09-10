@@ -1,4 +1,4 @@
-# Methos Class Model — Agent Reference
+# Dhara Class Model — Agent Reference
 
 > **Purpose:** This document is the single source of truth for AI agents working on this codebase.
 > Every config field, CLI flag, architecture detail, data flow, error state, and edge case is
@@ -30,7 +30,7 @@
   - [5.5 Error Handling](#55-error-handling)
   - [5.6 Synthetic Data Generation for Auxiliary Losses](#56-synthetic-data-generation-for-auxiliary-losses)
 - [6. Model Architecture](#6-model-architecture)
-  - [6.0 MethosV3Model (V4 redesign)](#60-methosv3model)
+  - [6.0 DharaModel (V4 redesign)](#60-dharamodel)
   - [6.1 ExecutiveController (RL-trained, gate-enforcing)](#61-executivecontroller)
   - [6.2 MemoryManager](#62-memorymanager)
   - [6.3 HierarchicalPlanner](#63-hierarchicalplanner)
@@ -93,7 +93,7 @@
 | `src/tokenizer_trainer.py` | Tokenizer download (`download_tokenizer`) and BPE training (`train_custom_tokenizer`). |
 | `src/infrastructure/distributed.py` | `DistributedSetup` — process group init, device management, FSDP config. |
 | `src/config/schema.py` | All pydantic models: `Config`, `ModelArchitectureConfig`, `TrainingConfig`, etc. |
-| `src/methos_v3/model.py` | `MethosV3Model`, `MethosV3Config`, `MethosV3ForCausalLM` — the core architecture (V4 redesign). |
+| `src/dhara/model.py` | `DharaModel`, `DharaConfig`, `DharaForCausalLM` — the core architecture (V4 redesign). |
 
 ---
 
@@ -136,11 +136,11 @@ that migrates v1 config keys to v2.
 ```yaml
 # ── Top-Level ──
 project:
-  name: Methos Class Model           # str — Project name for logging
+  name: Dhara Class Model           # str — Project name for logging
   seed: 42                           # int — Random seed (set_seed() called in pipeline init)
 
 model:
-  name: Methos Class Model           # str — Display name
+  name: Dhara Class Model           # str — Display name
   dtype: bfloat16                    # "bfloat16" | "float16" | "float32"
   device: auto                       # "auto" → resolved to "cuda" or "cpu" at runtime
   train_from_scratch: true           # bool — If false, would try pretrained (not implemented for NSLT)
@@ -150,7 +150,7 @@ model:
 
 # ── Architecture ──
 model.architecture:
-  model_type: methos_v3              # "methos_v3" | "nslt" | "llama" | "mixtral" | "qwen2_moe" | "deepseek_v2"
+  model_type: dhara_v3              # "dhara_v3" | "nslt" | "llama" | "mixtral" | "qwen2_moe" | "deepseek_v2"
   hidden_size: 10240                 # int — d_model (scaled for 4× A100 80GB)
   vocab_size: 128000                 # int — Must match tokenizer.vocab_size or len(tokenizer)
   max_position_embeddings: 16384     # int — Absolute max sequence length
@@ -203,9 +203,9 @@ model.architecture:
       image_token_id: 128000
       max_images_per_sample: 5
 
-  # MethosV3 sub-config (ignored for non-methos_v3 model_type).
-  # Full schema: see src/methos_v3/model.py MethosV3Config.__init__
-  methos_v3:
+  # Dhara sub-config (ignored for non-dhara_v3 model_type).
+  # Full schema: see src/dhara/model.py DharaConfig.__init__
+  dhara_v3:
     d_state: 4096                    # int — SSM compressed state dimension
     d_hidden: 10240                  # int — Workspace/hidden dimension
     n_ssm_layers: 6                  # int — Number of SSM compression layers
@@ -223,7 +223,7 @@ model.architecture:
     executive_gate_threshold: 0.3    # float — Gate skip threshold
     qa_max_passes: 5                 # int — QA refinement passes
     qa_converge_threshold: 0.05      # float — QA early-stop confidence delta
-    # + many more fields (see MethosV3Config for complete list)
+    # + many more fields (see DharaConfig for complete list)
 
   # NSLT sub-config (ignored for non-nslt model_type)
   nslt:
@@ -406,14 +406,14 @@ tokenizer:
 
 # ── Output ──
 output:
-  model_dir: ./models/methos
+  model_dir: ./models/dhara
   data_dir: ./data
-  checkpoint_dir: ./models/methos/checkpoints
+  checkpoint_dir: ./models/dhara/checkpoints
   log_dir: ./logs
   experiment_tracking:
     enabled: false
     provider: none                  # "wandb" | "mlflow" | "tensorboard" | "none"
-    project: methos-class-model
+    project: dhara-class-model
 
 # ── Generation defaults ──
 generation:
@@ -523,7 +523,7 @@ weight buffers which then "own" the memory instead of the reservation tensor.
 | Flag | Type | Default | Description |
 |---|---|---|---|
 | `--prompt` | `str` | `None` | Input prompt. Reads from stdin if omitted. |
-| `--checkpoint` | `str` | `models/methos` | Path to model directory |
+| `--checkpoint` | `str` | `models/dhara` | Path to model directory |
 | `--tokenizer` | `str` | `models/tokenizer` | Path to tokenizer directory |
 | `--max-new-tokens` | `int` | `1024` | Max tokens to generate |
 | `--temperature` | `float` | `0.7` | Sampling temperature; 0 = greedy |
@@ -561,7 +561,7 @@ weight buffers which then "own" the memory instead of the reservation tensor.
 
 | Flag | Type | Default | Description |
 |---|---|---|---|
-| `--checkpoint` | `str` | `models/methos` | Model path |
+| `--checkpoint` | `str` | `models/dhara` | Model path |
 | `--tokenizer` | `str` | `models/tokenizer` | Tokenizer path |
 | `--benchmarks` | `str` | `None` | Comma-separated names |
 
@@ -654,7 +654,7 @@ Each `_train_stage(dataset, stage_name, stage_cfg)`:
 - `remove_unused_columns=False` — keeps all dataset columns
 - `report_to` → from `experiment_tracking.provider`
 
-**Instruction tuning stage** uses `MethosV3ForCausalLM` wrapper which adds
+**Instruction tuning stage** uses `DharaForCausalLM` wrapper which adds
 causal LM loss calculation: `cross_entropy(logits[:-1], labels[1:])`.
 The decoder sees the processed representation of position i and predicts token i.
 Per-position decoder context is initialized from a learned `decoder_context` parameter
@@ -708,21 +708,21 @@ FSDP's memory savings.
 
 - **Interval:** `training.save_steps` (default 1000)
 - **Retention:** `training.save_total_limit` (default 5)
-- **Per-stage directories:** `models/methos/<stage_name>/`
-- **Auto-resume:** `_train_stage()` scans `models/methos/<stage_name>/` for
+- **Per-stage directories:** `models/dhara/<stage_name>/`
+- **Auto-resume:** `_train_stage()` scans `models/dhara/<stage_name>/` for
   `checkpoint-*` subdirectories and passes the latest to `trainer.train(resume_from_checkpoint=...)`.
   Without this, a crash mid-stage loses all progress because `trainer.train()` starts from step 0.
-- **Cross-stage resume:** Pipeline checks `models/methos/checkpoints` for latest.
+- **Cross-stage resume:** Pipeline checks `models/dhara/checkpoints` for latest.
   Compares architecture spec between saved `config.json` and current config.
   On mismatch → log warning, create fresh model.
 - **Save format:** `model.save_pretrained(dir, safe_serialization=True)`
   + `tokenizer.save_pretrained(dir)`
-  - Saves `model.safetensors`, `config.json` (MethosV3Config → PretrainedConfig),
+  - Saves `model.safetensors`, `config.json` (DharaConfig → PretrainedConfig),
     and `training_args.bin` (TrainingArguments state)
-- **Load format:** `MethosV3Model.from_pretrained(dir)` reads `config.json` to
-  reconstruct `MethosV3Config`, then loads weights from `model.safetensors`.
-- **HuggingFace integration:** Because `MethosV3Model` extends `PreTrainedModel`
-  and `MethosV3Config` extends `PretrainedConfig`, checkpoint directories are fully
+- **Load format:** `DharaModel.from_pretrained(dir)` reads `config.json` to
+  reconstruct `DharaConfig`, then loads weights from `model.safetensors`.
+- **HuggingFace integration:** Because `DharaModel` extends `PreTrainedModel`
+  and `DharaConfig` extends `PretrainedConfig`, checkpoint directories are fully
   compatible with `AutoModel` and the HuggingFace Hub.
 
 ### 5.5 Error Handling
@@ -775,22 +775,22 @@ the operator knows a target generator isn't wired up yet.
 
 ## 6. Model Architecture
 
-### 6.0 MethosV3Model
+### 6.0 DharaModel
 
-**File:** `src/methos_v3/model.py` (~445 lines)
+**File:** `src/dhara/model.py` (~445 lines)
 
 ```python
-class MethosV3Config(PretrainedConfig):
-    model_type = "methos_v3"
+class DharaConfig(PretrainedConfig):
+    model_type = "dhara_v3"
     def __init__(self, vocab_size=128000, d_model=10240, d_state=4096, d_hidden=10240, ...):
     # + @classmethod from_pretrained, to_dict, to_json_string, save_pretrained
 
-class MethosV3Model(PreTrainedModel):
-    config_class = MethosV3Config
-    def __init__(self, config: MethosV3Config):
+class DharaModel(PreTrainedModel):
+    config_class = DharaConfig
+    def __init__(self, config: DharaConfig):
     # supports save_pretrained(), from_pretrained(), get_input_embeddings(), set_input_embeddings()
 
-class MethosV3ForCausalLM(MethosV3Model):
+class DharaForCausalLM(DharaModel):
     # Wrapper with LM head for causal language modeling loss
     # forward() returns CausalLMOutputWithPast
 ```
@@ -799,7 +799,7 @@ class MethosV3ForCausalLM(MethosV3Model):
 - Checkpoints save/load seamlessly via `save_pretrained()`/`from_pretrained()`
 - HuggingFace Trainer works natively (no custom training loop needed)
 - Compatible with `AutoModel` registry, Hub push, and `pipeline()`
-- `MethosV3Config` includes Pydantic-style validation but inherits from `PretrainedConfig`
+- `DharaConfig` includes Pydantic-style validation but inherits from `PretrainedConfig`
 
 A **non-Transformer** LLM with **workspace-centric architecture** (V4 redesign). All modules communicate through a central `CognitiveWorkspace` dict-based hub rather than calling each other directly. The **Executive Controller** enforces module gates (actually skips modules below threshold) and is trained via REINFORCE with reward = accuracy − λ·compute. Neural tool approximations are replaced with **symbolic tools** (real `eval()`/`exec()`) with learned routing. Reflection, verification, and curiosity are merged into a single **QualityAssurance** multi-pass module. The model supports **14 auxiliary training losses** beyond next-token prediction.
 
@@ -845,9 +845,9 @@ Input → [Tokenizer] → [Embedding+RoPE] → [MemoryManager] → [Executive Co
 
 Old separate ReflectionModule, VerificationWithRepair, CuriosityModule, and LearningController are now **backward-compatible wrappers** that re-export from the merged modules.
 
-**Config key** (in `config.yaml`): `model.architecture.model_type: methos_v3`
+**Config key** (in `config.yaml`): `model.architecture.model_type: dhara_v3`
 
-**MethosV3Config additional fields (V4):**
+**DharaConfig additional fields (V4):**
 
 | Field | Default | Description |
 |---|---|---|
@@ -913,7 +913,7 @@ AuxiliaryLossComputer(module_outputs)   — 14 auxiliary losses summed with L_nl
 
 ### 6.1 ExecutiveController
 
-**File:** `src/methos_v3/executive.py`
+**File:** `src/dhara/executive.py`
 
 ```python
 class ExecutiveController(nn.Module):
@@ -934,7 +934,7 @@ The meta-controller that decides which modules to activate and enforces those de
 
 ### 6.2 MemoryManager
 
-**File:** `src/methos_v3/layer3_memory.py`
+**File:** `src/dhara/layer3_memory.py`
 
 ```python
 class MemoryManager(nn.Module):
@@ -954,7 +954,7 @@ Replaces the passive `HierarchicalMemoryEngine` with active memory management:
 
 ### 6.3 HierarchicalPlanner
 
-**File:** `src/methos_v3/layer5_planner.py`
+**File:** `src/dhara/layer5_planner.py`
 
 ```python
 class HierarchicalPlanner(nn.Module):
@@ -974,7 +974,7 @@ Extends `GlobalPlanner` with hierarchical goal decomposition:
 
 ### 6.4 DebateSandbox
 
-**File:** `src/methos_v3/layer8_specialists.py`
+**File:** `src/dhara/layer8_specialists.py`
 
 ```python
 class DebateSandbox(nn.Module):
@@ -1011,7 +1011,7 @@ See **6.12 QualityAssurance** for the new implementation.
 
 ### 6.7 HierarchicalDecoder (3-level)
 
-**File:** `src/methos_v3/layer11_decoder.py`
+**File:** `src/dhara/layer11_decoder.py`
 
 ```python
 class HierarchicalSparseDecoder(nn.Module):
@@ -1028,7 +1028,7 @@ Replaces single-level sparse decoder with 3-level hierarchy:
 
 ### 6.8 WorldModel
 
-**File:** `src/methos_v3/world_model.py`
+**File:** `src/dhara/world_model.py`
 
 ```python
 class WorldModel(nn.Module):
@@ -1045,7 +1045,7 @@ Constructs an internal world representation before reasoning:
 
 ### 6.9 SymbolicToolRouter (replaces InternalToolInterface)
 
-**File:** `src/methos_v3/tools.py`
+**File:** `src/dhara/tools.py`
 
 ```python
 class SymbolicToolRouter(nn.Module):
@@ -1077,7 +1077,7 @@ See **6.1 ExecutiveController** for the merged implementation. Key merged featur
 
 ### 6.12 QualityAssurance
 
-**File:** `src/methos_v3/quality_assurance.py`
+**File:** `src/dhara/quality_assurance.py`
 
 ```python
 class QualityAssurance(nn.Module):
@@ -1114,7 +1114,7 @@ Merges RecursiveReflection, VerificationWithRepair, and CuriosityModule into a s
 
 ### 6.13 AuxiliaryLossComputer
 
-**File:** `src/methos_v3/losses.py`
+**File:** `src/dhara/losses.py`
 
 ```python
 class AuxiliaryLossComputer(nn.Module):
@@ -1147,7 +1147,7 @@ loss = lm_loss + total_aux
 
 Each loss is only computed when the relevant module output is available in `module_outputs`, making the system robust to module enable/disable toggling.
 
-**Config key:** All weights configurable via `MethosV3Config.loss_weights` dict. Default weights used when a key is missing.
+**Config key:** All weights configurable via `DharaConfig.loss_weights` dict. Default weights used when a key is missing.
 
 ### 6.14 NSLTModel
 
@@ -1432,9 +1432,9 @@ class DistributedSetup:
 ```
 src/
 ├── __init__.py
-├── methos_v3/                 # MethosV3 — cognitive architecture (V4 redesign)
+├── dhara/                 # Dhara — cognitive architecture (V4 redesign)
 │   ├── __init__.py
-│   ├── model.py               # ~445 lines — MethosV3Model, MethosV3Config, MethosV3ForCausalLM
+│   ├── model.py               # ~490 lines — DharaModel, DharaConfig, DharaForCausalLM
 │   ├── hssm.py                # ~85 lines — HierarchicalSSM, HierarchicalSSMStack (vectorized, state-dim fix)
 │   ├── workspace.py           # ~100 lines — CognitiveWorkspace (dict-based central hub)
 │   ├── executive.py           # ~150 lines — ExecutiveController (RL gates + merged LearningController + ModulePerformanceTracker)
@@ -1525,25 +1525,25 @@ src/
 | `src/training/pipeline.py` | 365 | `TrainingPipeline` | transformers.Trainer, `src.*` |
 | `src/infrastructure/distributed.py` | 108 | `DistributedSetup` | torch.distributed |
 | `src/tokenizer_trainer.py` | 222 | `download_tokenizer`, `train_custom_tokenizer`, `ensure_tokenizer` | tokenizers, transformers |
-| `src/methos_v3/model.py` | 445 | `MethosV3Model` (PreTrainedModel), `MethosV3Config`, `MethosV3ForCausalLM` | torch.nn, transformers |
-| `src/methos_v3/hssm.py` | 85 | `HierarchicalSSM`, `HierarchicalSSMStack` (state-dim fix) | torch.nn |
-| `src/methos_v3/workspace.py` | 100 | `CognitiveWorkspace` (dict-based central hub, read/write/clear API) | torch.nn |
-| `src/methos_v3/executive.py` | 150 | `ExecutiveController` (RL gates + enforcement + merged LearningController) | torch.nn |
-| `src/methos_v3/quality_assurance.py` | 180 | `QualityAssurance` (merged reflect/verify/eval/correct multi-pass) | torch.nn |
-| `src/methos_v3/tools.py` | 180 | `SymbolicToolRouter` (symbolic calc/python/search/db + learned router) | torch.nn, ast |
-| `src/methos_v3/losses.py` | 150 | `AuxiliaryLossComputer` (14 configurable auxiliary losses) | torch.nn |
-| `src/methos_v3/world_model.py` | 110 | `WorldModel`, `EntityExtractor`, `RelationNetwork`, `CauseEffectModel` | torch.nn |
-| `src/methos_v3/layer1_tokenizer.py` | 38 | `IntelligentTokenizer`, `SemanticMetadataEmbedding` | torch.nn |
-| `src/methos_v3/layer2_embedding.py` | 87 | `AdaptiveSemanticEmbedding`, `RotaryPositionEncoding`, `ContextAdapter` | torch.nn |
-| `src/methos_v3/layer3_memory.py` | 230 | `MemoryManager`, `ForgetGate`, `CompressionAE`, `PriorityScorer`, `MemoryRetriever` | torch.nn |
-| `src/methos_v3/layer4_intent.py` | 40 | `IntentUnderstanding`, `AdaptiveDifficultyRouter` | torch.nn |
-| `src/methos_v3/layer5_planner.py` | 120 | `HierarchicalPlanner`, `SubgoalNode`, `GoalGraphAttention` | torch.nn |
-| `src/methos_v3/layer6_reasoning.py` | 57 | `AdaptiveContinuousReasoning`, `ODETick`, `DomainDynamics` | torch.nn |
-| `src/methos_v3/layer7_workspace.py` | 2 | Backward-compatible re-export from workspace.py | torch.nn |
-| `src/methos_v3/layer8_specialists.py` | 110 | `DebateSandbox`, `SpecialistExpert`, `SpecialistCritic` | torch.nn |
-| `src/methos_v3/layer9_reflection.py` | 20 | Backward-compatible QA wrapper (RecursiveReflection) | torch.nn |
-| `src/methos_v3/layer10_verification.py`| 30 | Backward-compatible QA wrapper (VerificationWithRepair) | torch.nn |
-| `src/methos_v3/layer11_decoder.py` | 145 | `HierarchicalDecoder` (3-level: semantic → language → token) | torch.nn |
+| `src/dhara/model.py` | 445 | `DharaModel` (PreTrainedModel), `DharaConfig`, `DharaForCausalLM` | torch.nn, transformers |
+| `src/dhara/hssm.py` | 85 | `HierarchicalSSM`, `HierarchicalSSMStack` (state-dim fix) | torch.nn |
+| `src/dhara/workspace.py` | 100 | `CognitiveWorkspace` (dict-based central hub, read/write/clear API) | torch.nn |
+| `src/dhara/executive.py` | 150 | `ExecutiveController` (RL gates + enforcement + merged LearningController) | torch.nn |
+| `src/dhara/quality_assurance.py` | 180 | `QualityAssurance` (merged reflect/verify/eval/correct multi-pass) | torch.nn |
+| `src/dhara/tools.py` | 180 | `SymbolicToolRouter` (symbolic calc/python/search/db + learned router) | torch.nn, ast |
+| `src/dhara/losses.py` | 150 | `AuxiliaryLossComputer` (14 configurable auxiliary losses) | torch.nn |
+| `src/dhara/world_model.py` | 110 | `WorldModel`, `EntityExtractor`, `RelationNetwork`, `CauseEffectModel` | torch.nn |
+| `src/dhara/layer1_tokenizer.py` | 38 | `IntelligentTokenizer`, `SemanticMetadataEmbedding` | torch.nn |
+| `src/dhara/layer2_embedding.py` | 87 | `AdaptiveSemanticEmbedding`, `RotaryPositionEncoding`, `ContextAdapter` | torch.nn |
+| `src/dhara/layer3_memory.py` | 230 | `MemoryManager`, `ForgetGate`, `CompressionAE`, `PriorityScorer`, `MemoryRetriever` | torch.nn |
+| `src/dhara/layer4_intent.py` | 40 | `IntentUnderstanding`, `AdaptiveDifficultyRouter` | torch.nn |
+| `src/dhara/layer5_planner.py` | 120 | `HierarchicalPlanner`, `SubgoalNode`, `GoalGraphAttention` | torch.nn |
+| `src/dhara/layer6_reasoning.py` | 57 | `AdaptiveContinuousReasoning`, `ODETick`, `DomainDynamics` | torch.nn |
+| `src/dhara/layer7_workspace.py` | 2 | Backward-compatible re-export from workspace.py | torch.nn |
+| `src/dhara/layer8_specialists.py` | 110 | `DebateSandbox`, `SpecialistExpert`, `SpecialistCritic` | torch.nn |
+| `src/dhara/layer9_reflection.py` | 20 | Backward-compatible QA wrapper (RecursiveReflection) | torch.nn |
+| `src/dhara/layer10_verification.py`| 30 | Backward-compatible QA wrapper (VerificationWithRepair) | torch.nn |
+| `src/dhara/layer11_decoder.py` | 145 | `HierarchicalDecoder` (3-level: semantic → language → token) | torch.nn |
 | `src/nslt/model.py` | 694 | `NSLTModel`, `MoENSLTModel`, `TokenEmbedding`, `RotaryPositionEncoding` | torch.nn |
 | `src/nslt/ssm_scan.py` | 445 | `selective_scan`, `SSMScanFunction`, `selective_scan_triton` | torch, triton (optional) |
 | `src/data/pipeline.py` | 241 | `DataPipeline` | datasets, transformers |
@@ -1625,13 +1625,13 @@ All benchmarks use `BenchmarkRunner.run_benchmarks(benchmark_list)`.
      ensure `hidden_states.size(-1) == self.d_state`.
 10. **Missing `config.json` when loading model from path (fixed):** Models now
      always save/load via `save_pretrained()` which writes `config.json` with
-     `MethosV3Config` serialization. Loading via `from_pretrained()` reads the
+     `DharaConfig` serialization. Loading via `from_pretrained()` reads the
      config and reconstructs the model.
 11. **Singleton array conversion in `can_soft_mixture` (fixed):** The
-     `mo_soft_assignments` method in `src/methos_v3/layers/mixture.py` now handles
+     `mo_soft_assignments` method in `src/dhara/layers/mixture.py` now handles
      scalar wake masks properly — wraps singleton tensors in a list before sorting.
 12. **Causal LM label shift (fixed):** Instruction tuning stage uses
-     `MethosV3ForCausalLM` which correctly shifts labels for next-token prediction:
+     `DharaForCausalLM` which correctly shifts labels for next-token prediction:
      `loss = cross_entropy(logits[:-1], labels[1:])`. Each position i sees the
      decoder context for position i (not i-1).
 13. **Memory manager returns 3-tuple (fixed):** `MemoryManager.forward()` returns
@@ -1655,7 +1655,7 @@ All benchmarks use `BenchmarkRunner.run_benchmarks(benchmark_list)`.
 
 ### 14.1 Summary
 
-A comprehensive codebase audit (July 2026) identified and fixed **25+ bugs across 14 files** in the MethosV3 module. All fixes are verified with end-to-end model tests.
+A comprehensive codebase audit (July 2026) identified and fixed **25+ bugs across 14 files** in the Dhara module. All fixes are verified with end-to-end model tests.
 
 ### 14.2 Complete Fix Table
 
@@ -1679,10 +1679,10 @@ A comprehensive codebase audit (July 2026) identified and fixed **25+ bugs acros
 | 16 | `model.py` | 337 | **MEDIUM** | Training path returned `torch.zeros(batch, seq_len-1, vocab_size)` as dummy logits instead of actual computation | Changed to `self.decoder.hidden_to_vocab(full_h)` |
 | 17 | `model.py` | 328 | **MEDIUM** | `hierarchical_log_prob` returns a single tensor, but code used `_, log_probs, _ = ...` tuple unpacking (would crash at runtime) | Changed to `log_probs = self.decoder.hierarchical_log_prob(...)` |
 | 18 | `model.py` | 358-390 | **MEDIUM** | `generate()` calls `self.eval()` but never restores `self.train()` — model stuck in eval mode after generation | Added `was_training` guard and `if was_training: self.train()` |
-| 19 | `factory.py` | 228-275 | **MEDIUM** | `create_model` passed kwargs like `d_model`, `max_seq_len`, `rope_base`, `dtype` — but `MethosV3Config.__init__` expects `hidden_size`, `max_position_embeddings`, `rope_theta`. All kwargs silently filtered out by the `co_varnames` filter | Changed to create a proper `MethosV3Config` object and pass `config=` |
+| 19 | `factory.py` | 228-275 | **MEDIUM** | `create_model` passed kwargs like `d_model`, `max_seq_len`, `rope_base`, `dtype` — but `DharaConfig.__init__` expects `hidden_size`, `max_position_embeddings`, `rope_theta`. All kwargs silently filtered out by the `co_varnames` filter | Changed to create a proper `DharaConfig` object and pass `config=` |
 | 20 | `factory.py` | 479-518 | **MEDIUM** | Same kwarg mismatch in `load_model`. Also `saved_config` not initialized when checkpoint lacks config.json | Same fix + initialized `saved_config = None` |
 | 21 | `trainer.py` | 157 | **MEDIUM** | `self.model.is_ready` assumes `SpecializedCoderModel` wrapper — fails on raw `PreTrainedModel` | Changed to `callable(getattr(self.model, "is_ready", False))` |
-| 22 | `trainer.py` | 259 | **MEDIUM** | `model=self.model.model` assumes `.model` child attribute — `MethosV3Model` is directly a `PreTrainedModel` | Added `_unwrap_model` property |
+| 22 | `trainer.py` | 259 | **MEDIUM** | `model=self.model.model` assumes `.model` child attribute — `DharaModel` is directly a `PreTrainedModel` | Added `_unwrap_model` property |
 | 23 | `trainer.py` | 287 | **MEDIUM** | `self.model.save_model(save_dir)` assumes wrapper method — `PreTrainedModel` uses `save_pretrained` | Added `hasattr` fallback |
 | 24 | `tools.py` | 79, 95 | **LOW** | `SymbolicSearch` and `SymbolicDatabase` not inheriting `nn.Module` — their `nn.Parameter` and `nn.Linear` members invisible to optimizer | Added `nn.Module` inheritance + `super().__init__()` |
 | 25 | `layer8_specialists.py` | 54-55 | **LOW** | Dead code: `debate_input` variable assigned but never used | Removed assignment |
@@ -1817,16 +1817,16 @@ conf_t = torch.cat([
 
 #### Pattern F: HuggingFace `PretrainedConfig` kwarg name mismatch
 
-**Problem:** When subclassing `PretrainedConfig`, custom kwarg names in `MethosV3Model.__init__` must match `MethosV3Config.__init__` parameter names exactly. Otherwise the co_varnames filter silently drops them.
+**Problem:** When subclassing `PretrainedConfig`, custom kwarg names in `DharaModel.__init__` must match `DharaConfig.__init__` parameter names exactly. Otherwise the co_varnames filter silently drops them.
 
-**Always pass config as a `MethosV3Config` object rather than relying on kwarg passthrough:**
+**Always pass config as a `DharaConfig` object rather than relying on kwarg passthrough:**
 ```python
 # Correct:
-config = MethosV3Config(hidden_size=arch.hidden_size, ...)
-model = MethosV3Model(config=config)
+config = DharaConfig(hidden_size=arch.hidden_size, ...)
+model = DharaModel(config=config)
 
 # Wrong (kwargs silently dropped):
-model = MethosV3Model(d_model=arch.hidden_size, ...)
+model = DharaModel(d_model=arch.hidden_size, ...)
 ```
 
 **Files affected:** `factory.py` (create_model, load_model)
@@ -1835,11 +1835,11 @@ model = MethosV3Model(d_model=arch.hidden_size, ...)
 
 All fixes verified with:
 ```python
-from src.methos_v3.model import MethosV3Model, MethosV3Config
+from src.dhara.model import DharaModel, DharaConfig
 
 # Create tiny test model
-c = MethosV3Config(vocab_size=100, hidden_size=64, d_state=32, d_hidden=64, ...)
-m = MethosV3Model(config=c)
+c = DharaConfig(vocab_size=100, hidden_size=64, d_state=32, d_hidden=64, ...)
+m = DharaModel(config=c)
 
 # Forward pass
 x = torch.randint(0, 100, (2, 16))

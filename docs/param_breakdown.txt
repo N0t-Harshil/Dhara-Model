@@ -1,5 +1,5 @@
 =====================================================================
-  PARAMETER AUDIT REPORT -- Methos Class Model (Small) (methos_v3)
+  PARAMETER AUDIT REPORT -- Dhara Class Model (Small) (dhara_v3)
 =====================================================================
 Config File:             config_small.yaml
 Vocab Size:              128,000

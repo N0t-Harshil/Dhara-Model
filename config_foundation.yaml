@@ -1,28 +1,28 @@
 # ======================================================================
-# Methos Foundation Pretraining Configuration
+# Dhara Foundation Pretraining Configuration
 # Optimized for Single NVIDIA A100 80GB
 # Target: ~160M parameters
 # ======================================================================
 
 project:
-  name: Methos Foundation
+  name: Dhara Foundation
   seed: 42
 
 model:
-  name: Methos Foundation
+  name: Dhara Foundation
   dtype: bfloat16
   device: auto
   train_from_scratch: true
 
   architecture:
-    model_type: methos_v3
+    model_type: dhara_v3
     vocab_size: 64000
     hidden_size: 576
     gradient_checkpointing: false
     activation_checkpointing: false
     tie_word_embeddings: true
 
-    methos_v3:
+    dhara_v3:
       d_state: 288
       d_hidden: 576
       n_ssm_layers: 3
@@ -175,7 +175,9 @@ distributed:
 
 data:
 
-  hf_token: 
+  # NEVER hardcode a token here. Set the HF_TOKEN environment variable instead;
+  # this field is only a fallback override (empty = use env / anonymous access).
+  hf_token: ""
   use_registry: true
   cache_dir: ./hf_cache
   streaming: true
@@ -431,53 +433,41 @@ data:
     # Dataset Registry — Production Corpus v2
     # ====================================================================
     # The dataset registry (src/data/registry.py) defines the full mixture
-    # with 41 entries across 8 categories. Total weight = 1.000.
+    # with 54 primary entries (+4 fallback-only) across 8 categories.
+    # Total weight = 1.000.
     #
-    #   Code (35%):
-    #     bigcode/the-stack-v2-dedup (19 languages): 29%
-    #     code_search_net: 2.5%
-    #     codeparrot/codeparrot-clean: 2.5%
-    #     deepmind/code_contests: 1%
+    #   Code (0.30):
+    #     openai/codex (opc), bigcode/the-stack-v2-dedup (18 languages),
+    #     code_search_net, codeparrot/codeparrot-clean, deepmind/code_contests
     #
-    #   Web text (20%):
-    #     HuggingFaceFW/fineweb: 18%
-    #     cerebras/SlimPajama-627B: 2%
+    #   Web text (0.20):
+    #     HuggingFaceFW/fineweb, cerebras/SlimPajama-627B
     #
-    #   Documentation (15%):
-    #     HuggingFaceFW/fineweb-edu (general + ml): 15%
+    #   Documentation (0.15):
+    #     18 web scrapers (src/data/doc_builder.py) + HuggingFaceFW/fineweb-edu
     #
-    #   Wikipedia / Reference (10%):
-    #     wikimedia/wikipedia (20231101.en): 10%
+    #   Wikipedia / Reference (0.10):
+    #     wikimedia/wikipedia (20231101.en)
     #
-    #   Mathematics (8%):
-    #     open-web-math/open-web-math: 3%
-    #     AI-MO/NuminaMath-CoT: 2%
-    #     AI-MO/NuminaMath-1.5: 1.5%
-    #     GAIR/MathPile: 1%
-    #     FineWeb-Edu (math proxy): 0.5%
+    #   Mathematics (0.10):
+    #     open-web-math/open-web-math, AI-MO/NuminaMath-CoT, AI-MO/NuminaMath-1.5,
+    #     GAIR/MathPile
     #
-    #   Scientific Literature (5%):
-    #     S2ORC: 2.5%
-    #     FineWeb-Edu (science proxy): 1.5%
-    #     OpenAlex: 1%
+    #   Scientific Literature (0.05):
+    #     S2ORC, OpenAlex
     #
-    #   Books (5%):
-    #     deepmind/pg19: 2.5%
-    #     FineWeb-Edu (books proxy): 1.5%
-    #     FineWeb (books proxy): 1%
+    #   Books (0.05):
+    #     deepmind/pg19
     #
-    #   Structured Knowledge (2%):
-    #     google/wit: 1%
-    #     FineWeb-Edu (structured proxy): 1%
+    #   Structured Knowledge (0.05):
+    #     google/wit
     #
     # Fallback chains:
     #   fineweb -> dolma -> SlimPajama -> RedPajama -> Falcon RefinedWeb
     #   NuminaMath-CoT -> NuminaMath-1.5
     #   MathPile -> open-web-math
-    #   code_contests -> Stack v2
-    #   pg19 -> fineweb-edu
-    #   openalex -> fineweb-edu
-    #   google/wit -> fineweb-edu
+    #   code_contests -> the-stack-v2-dedup
+    #   pg19 / openalex / google/wit -> fineweb-edu
     # ====================================================================
 
   # Registry mode (use_registry: true) drives the dataset mixture.
@@ -503,9 +493,9 @@ tokenizer:
 # ======================================================================
 
 output:
-  model_dir: ./models/methos-foundation
+  model_dir: ./models/dhara-foundation
   data_dir: ./data
-  checkpoint_dir: ./models/methos-foundation/checkpoints
+  checkpoint_dir: ./models/dhara-foundation/checkpoints
   log_dir: ./logs
   experiment_tracking:
     enabled: false

@@ -45,7 +45,7 @@ def sample_functions_or_fallback(
     filtered = [f for f in funcs if min_len <= len(f.split('\n')) <= max_len]
     if not filtered:
         return code
-    chosen = filtered[:limit]
+    chosen = random.sample(filtered, limit) if len(filtered) > limit else filtered
     return '\n\n'.join(chosen)
 
 

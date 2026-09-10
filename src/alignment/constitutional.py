@@ -40,6 +40,27 @@ class ConstitutionalTrainer:
         parts.append("### Response\n")
         return "\n\n".join(parts)
 
+    def _generate(self, prompt: str, *, temperature: float, top_p: float) -> str:
+        """Tokenize + generate with a guaranteed positive generation budget.
+
+        The prompt is truncated to leave room for new tokens so that
+        ``max_new_tokens`` can never reach 0 (which would crash generate) and
+        so trailing prompt scaffolds ("### Critique" etc.) survive truncation.
+        """
+        gen_budget = max(1, min(512, self.max_length // 4))
+        inputs = self.tokenizer(
+            prompt, return_tensors="pt", truncation=True,
+            max_length=max(1, self.max_length - gen_budget),
+        ).to(self.device)
+        outputs = self.model.generate(
+            **inputs,
+            max_new_tokens=gen_budget,
+            temperature=temperature,
+            top_p=top_p,
+            do_sample=True,
+        )
+        return self.tokenizer.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True).strip()
+
     @torch.no_grad()
     def critique(self, instruction: str, response: str) -> str:
         prompt = (
@@ -47,15 +68,7 @@ class ConstitutionalTrainer:
             f"{chr(10).join(f'- {p}' for p in self.constitution)}\n\n"
             f"Response to critique:\n{response}\n\n### Critique\n"
         )
-        inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=self.max_length).to(self.device)
-        outputs = self.model.generate(
-            **inputs,
-            max_new_tokens=min(self.max_length, self.max_length - inputs["input_ids"].shape[1]),
-            temperature=0.3,
-            top_p=0.9,
-            do_sample=True,
-        )
-        return self.tokenizer.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True).strip()
+        return self._generate(prompt, temperature=0.3, top_p=0.9)
 
     @torch.no_grad()
     def revise(self, instruction: str, response: str, critique: str) -> str:
@@ -65,15 +78,7 @@ class ConstitutionalTrainer:
             f"### Critique\n{critique}\n\n"
             f"### Revised Response\n"
         )
-        inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=self.max_length).to(self.device)
-        outputs = self.model.generate(
-            **inputs,
-            max_new_tokens=min(self.max_length, self.max_length - inputs["input_ids"].shape[1]),
-            temperature=0.3,
-            top_p=0.9,
-            do_sample=True,
-        )
-        return self.tokenizer.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True).strip()
+        return self._generate(prompt, temperature=0.3, top_p=0.9)
 
     def generate_preference_pairs(
         self,
@@ -83,17 +88,7 @@ class ConstitutionalTrainer:
         pairs: List[Dict[str, str]] = []
         for instruction in instructions:
             prompt = self.build_constitutional_prompt(instruction)
-            inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=self.max_length).to(self.device)
-
-            outputs = self.model.generate(
-                **inputs,
-                max_new_tokens=min(self.max_length, self.max_length - inputs["input_ids"].shape[1]),
-                temperature=0.8,
-                top_p=0.95,
-                do_sample=True,
-                num_return_sequences=1,
-            )
-            response = self.tokenizer.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True).strip()
+            response = self._generate(prompt, temperature=0.8, top_p=0.95)
 
             revised = response
             for _ in range(num_critique_steps):

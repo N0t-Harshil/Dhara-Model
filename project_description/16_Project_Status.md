@@ -3,7 +3,7 @@
 ## Completed Features
 
 ### Data Pipeline
-- ✅ **Dataset registry** with 55+ entries across 8 categories with weight normalization to match target token distribution (`CATEGORY_WEIGHTS`)
+- ✅ **Dataset registry** with 54 primary entries (58 registered incl. fallback-only) across 8 categories with weight normalization to match target token distribution (`CATEGORY_WEIGHTS`)
 - ✅ **Streaming with fallback chains** — datasets automatically fail over to configured fallbacks; fallback usage is logged and tracked
 - ✅ **Text field auto-detection** — priority-based field scanning (`TEXT_FIELD_PRIORITY`) with fallback to longest string values
 - ✅ **Metadata preservation** — packed sequences carry `_dataset`, `_category`, `_language`, `_domain`, `_segments`, `_avg_quality` metadata
@@ -33,13 +33,13 @@
 - ✅ **Multiple config files** for different scales: `config.yaml`, `config_foundation.yaml`, `config_small.yaml`
 
 ### Models
-- ✅ **Model factory** supporting 6 architectures: llama, mixtral, qwen2_moe, deepseek_v2, nslt, methos_v3
-- ✅ **MethosV3 model** — 11-layer architecture (`IntelligentTokenizer` → `AdaptiveSemanticEmbedding` → `HierarchicalMemoryEngine` → `IntentUnderstanding` → `GlobalPlanner` → `AdaptiveContinuousReasoning` → `CognitiveWorkspace` → `SpecialistSandbox` → `QualityAssurance` → `HierarchicalSparseDecoder` + `ExecutiveController`), `PreTrainedModel` compatible
+- ✅ **Model factory** supporting 6 architectures: llama, mixtral, qwen2_moe, deepseek_v2, nslt, dhara_v3
+- ✅ **Dhara model** — 11-layer architecture (`IntelligentTokenizer` → `AdaptiveSemanticEmbedding` → `HierarchicalMemoryEngine` → `IntentUnderstanding` → `GlobalPlanner` → `AdaptiveContinuousReasoning` → `CognitiveWorkspace` → `SpecialistSandbox` → `QualityAssurance` → `HierarchicalSparseDecoder` + `ExecutiveController`), `PreTrainedModel` compatible
 - ✅ **NSLT model** — 4-layer architecture (SSM Compression Engine → LTC Routing → Latent Sandbox → Sparse Output), O(1) memory complexity, RoPE position encoding
 - ✅ **Sparse output layer** — `SparseOutputSynthesizer` avoids O(V) logit materialization; uses top-k vocabulary projection
 - ✅ **Model size estimation** — parameter count estimates for all 6 architectures
 - ✅ **Checkpoint compatibility checking** — `is_compatible()` validates saved config against current config
-- ✅ **MoE variants** — `MoEMethosV3Model`, `MoENSLTModel` with expert routing and load-balancing loss
+- ✅ **MoE variants** — `DharaMoEModel`, `MoENSLTModel` with expert routing and load-balancing loss
 
 ### Validation
 - ✅ **8-phase production validation** — automated checks for datasets, documentation, token distribution, decoded samples, packing quality, fallbacks, smoke test, checkpoint save/load
@@ -83,11 +83,11 @@
 ## Experimental Components
 
 - 🧪 **MCTS latent sandbox** (`src/nslt/mcts_sandbox.py`) — Monte Carlo Tree Search-based reasoning in latent space; alternative to energy-based sandbox
-- 🧪 **MoE variants** (`MoEMethosV3Model`, `MoENSLTModel`) — Mixture-of-Experts SSM blocks; not benchmarked against base variants
+- 🧪 **MoE variants** (`DharaMoEModel`, `MoENSLTModel`) — Mixture-of-Experts SSM blocks; not benchmarked against base variants
 - 🧪 **Triton SSM scan kernel** (`src/nslt/ssm_scan.py`) — `selective_scan_vectorized()` function scaffolded for GPU-accelerated SSM scan; not verified against native implementation
 - 🧪 **Curricula learning** — Config parameters exist and are wired through the training pipeline; effectiveness not validated
-- 🧪 **Auxiliary losses** — `AuxiliaryLossComputer` in methos_v3 supports multiple auxiliary loss functions; loss weight tuning is experimental
-- 🧪 **World model** — `WorldModel` module in methos_v3 for entity tracking and event prediction; not validated on real tasks
+- 🧪 **Auxiliary losses** — `AuxiliaryLossComputer` in `src/dhara/` supports multiple auxiliary loss functions; loss weight tuning is experimental
+- 🧪 **World model** — `WorldModel` module in `src/dhara/` for entity tracking and event prediction; not validated on real tasks
 
 ---
 
@@ -133,8 +133,8 @@
 
 | File | Lines | Issue |
 |---|---|---|
-| `src/data/pipeline.py` | 1123 lines | Very long; could be split into `quality.py`, `packing.py`, `dataset_building.py` |
-| `src/methos_v3/model.py` | 414 lines | `forward()` method is complex with many branch paths |
-| `scripts/production_validation.py` | 768 lines | 29KB; could be split by phase into separate modules |
-| `src/config/schema.py` | 666 lines | Many config classes; could be split into sub-modules |
-| `src/nsl/t/model.py` | 719 lines | Combines `NSLTModel`, `MoENSLTModel`, and support modules; could be split |
+| `src/data/pipeline.py` | 2604 lines | Very long; could be split into `quality.py`, `packing.py`, `dataset_building.py` |
+| `src/dhara/model.py` | 490 lines | `forward()` method is complex with many branch paths |
+| `scripts/production_validation.py` | 778 lines | 29KB; could be split by phase into separate modules |
+| `src/config/schema.py` | 765 lines | Many config classes; could be split into sub-modules |
+| `src/nslt/model.py` | 759 lines | Combines `NSLTModel`, `MoENSLTModel`, and support modules; could be split |

@@ -192,10 +192,17 @@ class LatentSandbox(nn.Module):
             energy = energy_flat.view(batch, self.n_trajectories)  # [batch, K]
             grad = grad_flat.view(batch, self.n_trajectories, self.d_hidden)
 
-            # Gradient descent on energy (detach from graph after update)
-            with torch.no_grad():
+            # Gradient descent on energy. Iterations 0..n-2 stay a memory-
+            # bounded search (detached); the LAST step keeps the graph so the
+            # learned energy_fn (and this module's other params) receive
+            # end-to-end gradients.
+            if step == self.n_sim_steps - 1:
                 z_k = z_k - self.learning_rate * grad
                 z_k = z_k + 0.01 * self.noise_scale * torch.randn_like(z_k)
+            else:
+                with torch.no_grad():
+                    z_k = z_k - self.learning_rate * grad
+                    z_k = z_k + 0.01 * self.noise_scale * torch.randn_like(z_k)
 
             # Track best energies
             best_k = energy.argmin(dim=1)
@@ -215,17 +222,16 @@ class LatentSandbox(nn.Module):
             if trajectory_log is not None:
                 trajectory_log.append(z_k.detach().clone())
 
-        # Select the best trajectory for each batch item
-        with torch.no_grad():
-            z_flat_final = z_k.view(batch * self.n_trajectories, self.d_hidden)
-            energy_final, _ = self.energy_fn(z_flat_final)
-            energy_final = energy_final.view(batch, self.n_trajectories)
-            best_k = energy_final.argmin(dim=1)  # [batch]
+        # Select the best trajectory for each batch item. Kept in-graph so
+        # gradients flow from the output through energy_fn / out_proj / norm.
+        z_flat_final = z_k.view(batch * self.n_trajectories, self.d_hidden)
+        energy_final, _ = self.energy_fn(z_flat_final)
+        energy_final = energy_final.view(batch, self.n_trajectories)
+        best_k = energy_final.argmin(dim=1)  # [batch]
 
-            # Gather best trajectory
-            z_selected = torch.zeros(batch, self.d_hidden, device=device, dtype=dtype)
-            for b in range(batch):
-                z_selected[b] = z_k[b, best_k[b]]
+        # Gather best trajectory (indexing preserves the autograd graph)
+        z_k3 = z_k.view(batch, self.n_trajectories, self.d_hidden)
+        z_selected = torch.stack([z_k3[b, best_k[b]] for b in range(batch)])
 
         # Output projection
         output = self.out_proj(z_selected)  # [batch, d_hidden]
@@ -255,7 +261,7 @@ class LatentSandboxEfficient(LatentSandbox):
         dtype = z_ltc.dtype
 
         # Initialize best state
-        z_best_all = torch.zeros(batch, self.d_hidden, device=device, dtype=dtype)
+        selected: List[torch.Tensor] = []
 
         for b in range(batch):
             z_single = z_ltc[b:b+1]  # [1, d_hidden]
@@ -269,9 +275,13 @@ class LatentSandboxEfficient(LatentSandbox):
 
                 energy, grad = self.energy_fn(z_k)
 
-                with torch.no_grad():
+                if step == self.n_sim_steps - 1:
                     z_k = z_k - self.learning_rate * grad
                     z_k = z_k + 0.01 * self.noise_scale * torch.randn_like(z_k)
+                else:
+                    with torch.no_grad():
+                        z_k = z_k - self.learning_rate * grad
+                        z_k = z_k + 0.01 * self.noise_scale * torch.randn_like(z_k)
 
                 if (step + 1) % self.select_every == 0 and step < self.n_sim_steps - 1:
                     with torch.no_grad():
@@ -282,10 +292,14 @@ class LatentSandboxEfficient(LatentSandbox):
                                 self.d_hidden, device=device, dtype=dtype
                             )
 
-            # Select best
-            with torch.no_grad():
-                energy, _ = self.energy_fn(z_k)
-                z_best_all[b] = z_k[energy.argmin()]
+            # Select best (kept in-graph so energy_fn / out_proj / norm train)
+            energy, _ = self.energy_fn(z_k)
+            selected.append(z_k[energy.argmin()])
+
+        if selected:
+            z_best_all = torch.stack(selected, dim=0)
+        else:
+            z_best_all = torch.zeros(batch, self.d_hidden, device=device, dtype=dtype)
 
         output = self.out_proj(z_best_all)
         output = self.norm(output)

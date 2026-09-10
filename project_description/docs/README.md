@@ -13,7 +13,7 @@
 - [05_Data_Pipeline.md](../05_Data_Pipeline.md) — End-to-end data pipeline (8 stages)
 - [06_Documentation_Builder.md](../06_Documentation_Builder.md) — Web scraping system (18 sources)
 - [07_Training_Pipeline.md](../07_Training_Pipeline.md) — Configuration, training stages, checkpointing
-- [08_Dataset_Registry.md](../08_Dataset_Registry.md) — All 55 datasets with weights and metadata
+- [08_Dataset_Registry.md](../08_Dataset_Registry.md) — All 54 primary datasets with weights and metadata
 - [09_Validation_System.md](../09_Validation_System.md) — 8-phase production validation
 
 ## Operations

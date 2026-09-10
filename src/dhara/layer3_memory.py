@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from src.methos_v3.hssm import HierarchicalSSMStack
+from src.dhara.hssm import HierarchicalSSMStack
 
 
 class ForgetGate(nn.Module):

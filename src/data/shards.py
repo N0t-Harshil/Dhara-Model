@@ -83,6 +83,12 @@ class ShardProgressStore:
             self.root.mkdir(parents=True, exist_ok=True)
             tmp = self.root / f".{key}.{uuid.uuid4().hex}.tmp"
             tmp.write_text(json.dumps(rec, indent=2, default=str), encoding="utf-8")
+            try:
+                with open(tmp, "ab") as f:
+                    f.flush()
+                    os.fsync(f.fileno())
+            except OSError:
+                pass
             os.replace(tmp, self._path(key))
         except Exception as e:
             logger.warning("Shard progress save failed for %s (%s)", key, e)

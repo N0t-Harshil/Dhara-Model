@@ -9,7 +9,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from src.nslt.layer1_ssm import SSMCompressionEngine
-from src.nslt.ssm_scan import selective_scan_sequential
 
 logger = logging.getLogger(__name__)
 
@@ -58,23 +57,9 @@ class GatedMemoryCell(nn.Module):
         """
         write = torch.sigmoid(self.write_gate(z))
         erase = torch.sigmoid(self.erase_gate(z))
-        return erase * h + write * z
-
-
-class LevelState:
-    """
-    Holds state for one level in the multi-scale hierarchy.
-    Tracks the current hidden state and the step counter.
-    """
-
-    def __init__(self, d_state: int):
-        self.h: Optional[torch.Tensor] = None
-        self.step: int = 0
-        self.d_state = d_state
-
-    def reset(self, batch: int, device: torch.device, dtype: torch.dtype) -> None:
-        self.h = torch.zeros(batch, self.d_state, device=device, dtype=dtype)
-        self.step = 0
+        # Complementary gates so memory stays bounded (previously erase+write
+        # could both be 1 → double). Use erase for retention and write for update.
+        return erase * h + (1 - erase) * write * z
 
 
 class MultiScaleSSM(nn.Module):
@@ -181,15 +166,25 @@ class MultiScaleSSM(nn.Module):
         device = x.device
         dtype = x.dtype
 
+        if seq_len == 0:
+            empty = torch.zeros(batch, 0, d_model, device=device, dtype=dtype)
+            h_total = torch.zeros(batch, self.d_state * 3, device=device, dtype=dtype)
+            return (empty, h_total) if return_state else (empty, h_total.detach())
+
         h_med = torch.zeros(batch, self.d_state, device=device, dtype=dtype)
         h_slow = torch.zeros(batch, self.d_state, device=device, dtype=dtype)
+        h_fast_t = torch.zeros(batch, self.d_state, device=device, dtype=dtype)
 
         medium_counter = 0
         slow_counter = 0
 
         outputs = []
 
-        # Process token-by-token to maintain hierarchical update schedule
+        # NOTE: per-token Python loop is required for the hierarchical schedule
+        # (medium/slow levels update every K/L tokens). Batched scan would need
+        # ragged scheduling; this is intentionally sequential. For long contexts
+        # the fast SSM itself is vectorized (selective_scan) so per-step cost is
+        # dominated by SSM, not Python overhead.
         for t in range(seq_len):
             xt = x[:, t:t+1, :]  # [batch, 1, d_model]
 
@@ -233,7 +228,10 @@ class MultiScaleSSM(nn.Module):
     def get_config(self) -> dict:
         return {
             "type": "MultiScaleSSM",
+            "d_model": self.d_model,
             "d_state": self.d_state,
+            "dt_rank": self.dt_rank,
+            "expand_factor": 2,
             "n_ssm_layers": self.n_ssm_layers,
             "k_medium": self.k_medium,
             "k_slow": self.k_slow,

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# 4-GPU FSDP Training — NSLT / MethosV3 on 4x A100 80GB (320GB pooled)
+# 4-GPU FSDP Training — NSLT / Dhara on 4x A100 80GB (320GB pooled)
 # =============================================================================
 # Usage:
 #   bash scripts/train_4gpu.sh                        # start full training
@@ -69,7 +69,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # SFT: 100K steps x 16 eff_batch x 4096 seq_len = ~6.5B tokens
 # Instruction: 50K steps x 16 eff_batch x 4096 seq_len = ~3.3B tokens
 echo "====================================================================="
-echo "  Launching FSDP training — Methos Class Model"
+echo "  Launching FSDP training — Dhara Class Model"
 echo "  Config:   ${CONFIG}"
 echo "  GPUs:     ${NUM_GPUS} GPUs (CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES})"
 echo "  Strategy: FSDP full_shard"

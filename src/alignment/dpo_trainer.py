@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
-from torch import nn
-from torch.utils.data import DataLoader, Dataset
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 logger = logging.getLogger(__name__)
@@ -35,6 +33,33 @@ def _sequence_logps(
     return (per_token_logps * valid_mask.float()).sum(dim=-1)
 
 
+def _sequence_logps_mean(
+    model: PreTrainedModel,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    labels: torch.Tensor,
+) -> torch.Tensor:
+    """Per-token-mean sequence log-probs (length-normalized).
+
+    Length normalization is REQUIRED by SimPO and by ORPO's SFT term:
+    with summed logps, longer responses dominate and β/γ operate on an
+    unintended scale, collapsing training to a length preference.
+    """
+    summed = _sequence_logps(model, input_ids, attention_mask, labels)
+    shift_labels = labels[:, 1:]
+    n_tokens = (shift_labels != -100).float().sum(dim=-1).clamp(min=1.0)
+    return summed / n_tokens
+
+
+def _resolve_device(device):
+    if device is not None:
+        return device
+    if torch.cuda.is_available():
+        # current_device() returns an int; wrap it explicitly.
+        return torch.device(f"cuda:{torch.cuda.current_device()}")
+    return torch.device("cpu")
+
+
 class DPOTrainer:
     def __init__(
         self,
@@ -52,7 +77,7 @@ class DPOTrainer:
         self.beta = beta
         self.learning_rate = learning_rate
         self.max_length = max_length
-        self.device = device or (torch.cuda.current_device() if torch.cuda.is_available() else torch.device("cpu"))
+        self.device = _resolve_device(device)
 
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=learning_rate)
 
@@ -96,13 +121,16 @@ class DPOTrainer:
         policy_chosen_logps = self._get_batch_logps(self.model, chosen_input_ids, chosen_attention_mask, chosen_labels)
         policy_rejected_logps = self._get_batch_logps(self.model, rejected_input_ids, rejected_attention_mask, rejected_labels)
 
-        if self.ref_model is not None:
-            with torch.no_grad():
-                ref_chosen_logps = self._get_batch_logps(self.ref_model, chosen_input_ids, chosen_attention_mask, chosen_labels)
-                ref_rejected_logps = self._get_batch_logps(self.ref_model, rejected_input_ids, rejected_attention_mask, rejected_labels)
-        else:
-            ref_chosen_logps = policy_chosen_logps.detach()
-            ref_rejected_logps = policy_rejected_logps.detach()
+        if self.ref_model is None:
+            # DPO against the policy itself zeroes the KL signal: ref ratios
+            # cancel and the loss degenerates to -logsigmoid(β·(pc-pr)) —
+            # i.e. margin-less SimPO, not DPO. Fail loudly instead.
+            raise ValueError(
+                "DPOTrainer requires an explicit frozen ref_model. "
+                "Use AlignmentPipeline._get_ref_model() to obtain one.")
+        with torch.no_grad():
+            ref_chosen_logps = self._get_batch_logps(self.ref_model, chosen_input_ids, chosen_attention_mask, chosen_labels)
+            ref_rejected_logps = self._get_batch_logps(self.ref_model, rejected_input_ids, rejected_attention_mask, rejected_labels)
 
         loss, chosen_reward, rejected_reward = self.dpo_loss(
             policy_chosen_logps, policy_rejected_logps,
@@ -136,7 +164,7 @@ class ORPOTrainer:
         self.beta = beta
         self.learning_rate = learning_rate
         self.max_length = max_length
-        self.device = device or (torch.cuda.current_device() if torch.cuda.is_available() else torch.device("cpu"))
+        self.device = _resolve_device(device)
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=learning_rate)
 
     def orpo_loss(
@@ -145,6 +173,9 @@ class ORPOTrainer:
         rejected_logps: torch.Tensor,
     ) -> torch.Tensor:
         log_odds = chosen_logps - rejected_logps
+        # Canonical ORPO length-normalizes the SFT term (mean per-token NLL);
+        # summed logps scale its gradient linearly with response length and
+        # overwhelm the odds-ratio term.
         sft_loss = -chosen_logps.mean()
         orpo_loss = sft_loss + self.beta * (-F.logsigmoid(log_odds)).mean()
         return orpo_loss
@@ -159,8 +190,8 @@ class ORPOTrainer:
         rejected_labels: torch.Tensor,
     ) -> Dict[str, float]:
         self.model.train()
-        chosen_logps = self._get_logps(self.model, chosen_input_ids, chosen_attention_mask, chosen_labels)
-        rejected_logps = self._get_logps(self.model, rejected_input_ids, rejected_attention_mask, rejected_labels)
+        chosen_logps = self._get_mean_logps(self.model, chosen_input_ids, chosen_attention_mask, chosen_labels)
+        rejected_logps = self._get_mean_logps(self.model, rejected_input_ids, rejected_attention_mask, rejected_labels)
         loss = self.orpo_loss(chosen_logps, rejected_logps)
         self.optimizer.zero_grad()
         loss.backward()
@@ -169,6 +200,9 @@ class ORPOTrainer:
 
     def _get_logps(self, model, input_ids, attention_mask, labels):
         return _sequence_logps(model, input_ids, attention_mask, labels)
+
+    def _get_mean_logps(self, model, input_ids, attention_mask, labels):
+        return _sequence_logps_mean(model, input_ids, attention_mask, labels)
 
 
 class KTOtrainer:
@@ -190,9 +224,9 @@ class KTOtrainer:
         self.beta = beta
         self.learning_rate = learning_rate
         self.max_length = max_length
-        self.device = device or (torch.cuda.current_device() if torch.cuda.is_available() else torch.device("cpu"))
         self.desirable_weight = desirable_weight
         self.undesirable_weight = undesirable_weight
+        self.device = _resolve_device(device)
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=learning_rate)
 
     def kto_loss(
@@ -202,7 +236,9 @@ class KTOtrainer:
         is_desirable: torch.Tensor,
     ) -> torch.Tensor:
         kl = policy_logps - ref_logps
-        kl_mean = kl.mean()
+        # The KL baseline must be DETACHED: gradients flowing through it would
+        # couple every example in the batch through the baseline term.
+        kl_mean = kl.mean().detach()
         losses = torch.where(
             is_desirable,
             self.desirable_weight * -F.logsigmoid(self.beta * (kl - kl_mean)),
@@ -231,9 +267,15 @@ class KTOtrainer:
 
         policy_logps = self._get_logps(self.model, input_ids, attention_mask, labels)
 
-        ref_model = self.ref_model if self.ref_model is not None else self.model
+        if self.ref_model is None:
+            # Without a reference model, ref_logps == policy_logps ⇒ kl ≡ 0
+            # ⇒ loss is the constant -logsigmoid(0) = log 2 with zero gradient:
+            # training would silently do nothing.
+            raise ValueError(
+                "KTOtrainer requires an explicit frozen ref_model. "
+                "Use AlignmentPipeline._get_ref_model() to obtain one.")
         with torch.no_grad():
-            ref_logps = self._get_logps(ref_model, input_ids, attention_mask, labels).detach()
+            ref_logps = self._get_logps(self.ref_model, input_ids, attention_mask, labels).detach()
 
         loss = self.kto_loss(policy_logps, ref_logps, is_desirable)
         self.optimizer.zero_grad()
@@ -262,7 +304,7 @@ class SimPOTrainer:
         self.beta = beta
         self.learning_rate = learning_rate
         self.max_length = max_length
-        self.device = device or (torch.cuda.current_device() if torch.cuda.is_available() else torch.device("cpu"))
+        self.device = _resolve_device(device)
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=learning_rate)
 
     def simpo_loss(
@@ -270,6 +312,8 @@ class SimPOTrainer:
         chosen_logps: torch.Tensor,
         rejected_logps: torch.Tensor,
     ) -> torch.Tensor:
+        # Inputs are per-token-MEAN logps (see _sequence_logps_mean): SimPO's
+        # β/γ operate on averaged log-probs, not sums.
         logits = self.beta * (chosen_logps - rejected_logps - self.gamma)
         loss = -F.logsigmoid(logits).mean()
         return loss
@@ -284,8 +328,8 @@ class SimPOTrainer:
         rejected_labels: torch.Tensor,
     ) -> Dict[str, float]:
         self.model.train()
-        chosen_logps = self._get_logps(self.model, chosen_input_ids, chosen_attention_mask, chosen_labels)
-        rejected_logps = self._get_logps(self.model, rejected_input_ids, rejected_attention_mask, rejected_labels)
+        chosen_logps = self._get_mean_logps(self.model, chosen_input_ids, chosen_attention_mask, chosen_labels)
+        rejected_logps = self._get_mean_logps(self.model, rejected_input_ids, rejected_attention_mask, rejected_labels)
         loss = self.simpo_loss(chosen_logps, rejected_logps)
         self.optimizer.zero_grad()
         loss.backward()
@@ -294,3 +338,6 @@ class SimPOTrainer:
 
     def _get_logps(self, model, input_ids, attention_mask, labels):
         return _sequence_logps(model, input_ids, attention_mask, labels)
+
+    def _get_mean_logps(self, model, input_ids, attention_mask, labels):
+        return _sequence_logps_mean(model, input_ids, attention_mask, labels)

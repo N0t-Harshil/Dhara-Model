@@ -8,8 +8,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-os.environ["HF_TOKEN"] = ""
-
 from transformers import AutoTokenizer
 from src.config.schema import load_config
 from src.data.pipeline import remove_boilerplate, random_window_sample, pack_sequences

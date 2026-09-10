@@ -17,6 +17,11 @@ pip-wheel-metadata/
 hf_cache/
 .cache/
 
+# Runtime artifacts
+cache/shards/
+logs/
+models/
+
 # Editor directories and files
 .vscode/
 .idea/

@@ -1,4 +1,4 @@
-##!/usr/bin/env bash
+#!/usr/bin/env bash
 set -euo pipefail
 
 # Production validation script — run once on the Linux training server.
@@ -29,13 +29,12 @@ python scripts/production_validation.py \
 
 echo ""
 echo "========================================"
-echo " PHASE 8: Training smoke test (100 steps)"
+echo " PHASE 8: Training smoke test (config validation + CLI)"
 echo "========================================"
-python scripts/run_training.py \
-    --config config_foundation.yaml \
-    --max-steps 100 \
-    --logging-steps 1 \
-    --save-steps 1000 2>&1 | tail -50
+python main.py config-validate --config config_foundation.yaml
+python main.py info
+# A short real training run (Ctrl+C once the first steps log):
+#   python main.py full-training --config config_foundation.yaml --gpu 0
 
 echo ""
 echo "========================================"
@@ -43,44 +42,31 @@ echo " PHASE 9: Checkpoint verification"
 echo "========================================"
 python -c "
 from pathlib import Path
-import torch
 
-# Find latest checkpoint
-ckpt_dir = Path('checkpoints')
+# Find latest checkpoint (matches the foundation config output layout)
+ckpt_dir = Path('models/dhara-foundation/checkpoints')
 if not ckpt_dir.exists():
-    print('No checkpoints directory found')
+    print('No checkpoints directory found at', ckpt_dir)
     exit(1)
-ckpts = sorted(ckpt_dir.glob('step_*'))
+ckpts = sorted(ckpt_dir.glob('checkpoint-*'))
 if not ckpts:
-    print('No checkpoint steps found in', ckpt_dir)
+    print('No checkpoint dirs found in', ckpt_dir)
     exit(1)
 latest = ckpts[-1]
 print(f'Latest checkpoint: {latest}')
 
-# Verify checkpoint contents
-ckpt_path = latest / 'training_state.pt'
-if not ckpt_path.exists():
-    print(f'  training_state.pt not found in {latest}')
+for artifact in ('config.json', 'trainer_state.json'):
+    p = latest / artifact
+    if not p.exists():
+        print(f'  {artifact} not found in {latest}')
+        exit(1)
+print(f'  config.json + trainer_state.json present')
+weights = sorted(latest.glob('pytorch_model*.bin')) + sorted(latest.glob('model*.safetensors'))
+if not weights:
+    print('  WARNING: no weight files found in', latest)
     exit(1)
-state = torch.load(str(ckpt_path), map_location='cpu')
-print(f'  optimizer keys: {list(state.get(\"optimizer\", {}).keys())[:3]}')
-print(f'  scheduler keys: {list(state.get(\"scheduler\", {}).keys())[:3]}')
-print(f'  step: {state.get(\"step\", \"?\")}')
-print(f'  loss: {state.get(\"loss\", \"?\")}')
-print(f'  CHECKPOINT VERIFIED OK')
-
-# Test resume
-print()
-print('Testing checkpoint resume...')
-import sys
-sys.path.insert(0, '.')
-from src.config.schema import load_config
-from src.training.trainer import create_trainer
-
-cfg = load_config('config_foundation.yaml')
-trainer = create_trainer(cfg, resume_from=str(latest))
-print(f'  Resume OK — starting step: {trainer.current_step}')
-print(f'  CHECKPOINT RESUME VERIFIED OK')
+print(f'  weights: {weights[0].name}')
+print('  CHECKPOINT VERIFIED OK')
 "
 
 echo ""

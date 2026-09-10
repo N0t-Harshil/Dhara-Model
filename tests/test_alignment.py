@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import pytest
 import torch
+from torch import nn
 
-from src.alignment.dpo_trainer import DPOTrainer, ORPOTrainer, SimPOTrainer
+from src.alignment.dpo_trainer import DPOTrainer, KTOtrainer, ORPOTrainer, SimPOTrainer
+from src.alignment.pipeline import AlignmentPipeline
+from src.config.schema import Config
 
 
 def _dummy_logps(batch_size: int = 4) -> tuple:
@@ -84,3 +88,73 @@ class TestSimPO:
         trainer.beta = 2.0
         loss = trainer.simpo_loss(torch.tensor([-2.0]), torch.tensor([-4.0]))
         assert torch.isfinite(loss)
+
+
+class _TinyLM(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.embed = nn.Embedding(64, 16)
+        self.proj = nn.Linear(16, 64)
+
+    def forward(self, input_ids, attention_mask=None):
+        return type("Out", (), {"logits": self.proj(self.embed(input_ids))})
+
+
+@pytest.fixture
+def tiny_alignment_pipeline():
+    cfg = Config()
+    cfg.training.max_seq_length = 32
+    model = _TinyLM()
+    tokenizer = type("Tok", (), {})()
+    from src.alignment.constitutional import ConstitutionalTrainer
+    return AlignmentPipeline.__new__(AlignmentPipeline), model, tokenizer, cfg
+
+
+class TestRefModelFallback:
+    def test_get_ref_model_returns_frozen_distinct_copy(self, tiny_alignment_pipeline):
+        pipe, model, tokenizer, cfg = tiny_alignment_pipeline
+        pipe.model = model
+        pipe.tokenizer = tokenizer
+        pipe.cfg = cfg
+        pipe.ref_model = None
+        pipe._frozen_ref = None
+        pipe.device = torch.device("cpu")
+
+        ref = pipe._get_ref_model()
+        assert ref is not model, "Reference model must be a separate copy, not the policy"
+        assert all(not p.requires_grad for p in ref.parameters()), "Reference must be frozen"
+        assert pipe._get_ref_model() is ref, "Frozen reference should be cached/reused"
+        same_state = all(
+            (a == b).all()
+            for a, b in zip(model.state_dict().values(), ref.state_dict().values())
+        )
+        assert same_state, "Frozen reference should start as a copy of the policy"
+
+    def test_kto_trainer_receives_ref_model(self, tiny_alignment_pipeline):
+        pipe, model, tokenizer, cfg = tiny_alignment_pipeline
+        pipe.model = model
+        pipe.tokenizer = tokenizer
+        pipe.cfg = cfg
+        pipe.ref_model = None
+        pipe._frozen_ref = None
+        pipe.device = torch.device("cpu")
+
+        from torch.utils.data import Dataset
+
+        class FakeDataset(Dataset):
+            def __len__(self):
+                return 1
+
+            def __getitem__(self, i):
+                return {
+                    "chosen_input_ids": torch.zeros(8, dtype=torch.long),
+                    "chosen_attention_mask": torch.ones(8, dtype=torch.long),
+                    "chosen_labels": torch.zeros(8, dtype=torch.long),
+                    "rejected_input_ids": torch.zeros(8, dtype=torch.long),
+                    "rejected_attention_mask": torch.ones(8, dtype=torch.long),
+                    "rejected_labels": torch.zeros(8, dtype=torch.long),
+                }
+
+        results = pipe.run_kto(FakeDataset(), max_steps=1)
+        assert "loss" in results
+        assert torch.isfinite(torch.tensor(results["loss"]))

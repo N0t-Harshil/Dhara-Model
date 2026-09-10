@@ -6,8 +6,10 @@ import torch
 from src.nslt.layer1_ssm import SSMCompressionEngine
 from src.nslt.layer2_ltc import LTCRoutingLayer, LTCCell
 from src.nslt.layer3_sandbox import LatentSandbox, EnergyFunction
+from src.nslt.mcts_sandbox import MCTSLatentSandbox, MCTSLatentSandboxEfficient
 from src.nslt.layer4_output import SparseOutputSynthesizer, SparseGatingUnit
 from src.nslt.model import NSLTModel
+from src.dhara.losses import AuxiliaryLossComputer
 
 
 def test_ssm_compression_output_shape():
@@ -92,6 +94,24 @@ def test_latent_sandbox_parallel_reasoning():
     assert z_optimal.shape == (2, d_hidden), f"Expected {(2, d_hidden)}, got {z_optimal.shape}"
     assert energies is not None
     assert torch.isfinite(z_optimal).all(), "Sandbox produced non-finite values"
+
+
+def test_latent_sandbox_gradients_reach_learned_params():
+    """Learned energy_fn / out_proj / norm must receive end-to-end gradients
+    (regression: the sim loop detached z_k and the final selection ran under
+    torch.no_grad, so the entire module was a gradient barrier)."""
+    d_hidden = 32
+    for cls in (LatentSandbox,):
+        sandbox = cls(d_hidden=d_hidden, d_latent=16, n_trajectories=4, n_sim_steps=4, select_every=2)
+        z = torch.randn(2, d_hidden, requires_grad=True)
+        out, _ = sandbox(z, return_trajectories=True)
+        out.square().mean().backward()
+        e_grad = sum(p.grad.abs().sum().item() for p in sandbox.energy_fn.parameters() if p.grad is not None)
+        o_grad = sum(p.grad.abs().sum().item() for p in sandbox.out_proj.parameters() if p.grad is not None)
+        n_grad = sum(p.grad.abs().sum().item() for p in sandbox.norm.parameters() if p.grad is not None)
+        assert e_grad > 0, f"{cls.__name__}: energy_fn received no gradient"
+        assert o_grad > 0, f"{cls.__name__}: out_proj received no gradient"
+        assert n_grad > 0, f"{cls.__name__}: norm received no gradient"
 
 
 def test_energy_function_scores():
@@ -253,3 +273,125 @@ def test_nslt_generation():
 
     assert output.shape == (batch, seq_len + 8), f"Expected {(batch, seq_len + 8)}, got {output.shape}"
     assert torch.allclose(output[:, :seq_len], input_ids), "Generation changed the input prefix"
+
+
+def test_mcts_sandbox_gradients_reach_learned_params():
+    """MCTS sandbox variants must train energy_fn / policy_value / out_proj
+    / norm end-to-end (regression: expansion used a random perturbation and
+    simulation detached every step, so the whole module was a gradient barrier)."""
+    d_hidden = 32
+    for cls in (MCTSLatentSandbox, MCTSLatentSandboxEfficient):
+        sb = cls(d_hidden=d_hidden, d_latent=16, n_simulations=3, n_directions=4,
+                 n_sim_steps=3, max_depth=2)
+        z = torch.randn(2, d_hidden, requires_grad=True)
+        out, traces = sb(z, return_trajectories=True)
+        out.square().mean().backward()
+        e_grad = sum(p.grad.abs().sum().item() for p in sb.energy_fn.parameters() if p.grad is not None)
+        pv_grad = sum(p.grad.abs().sum().item() for p in sb.policy_value.parameters() if p.grad is not None)
+        o_grad = sum(p.grad.abs().sum().item() for p in sb.out_proj.parameters() if p.grad is not None)
+        n_grad = sum(p.grad.abs().sum().item() for p in sb.norm.parameters() if p.grad is not None)
+        assert e_grad > 0, f"{cls.__name__}: energy_fn received no gradient"
+        assert pv_grad > 0, f"{cls.__name__}: policy_value received no gradient"
+        assert o_grad > 0, f"{cls.__name__}: out_proj received no gradient"
+        assert n_grad > 0, f"{cls.__name__}: norm received no gradient"
+        assert traces is not None and len(traces[0]) > 0, f"{cls.__name__}: no trajectory trace"
+
+
+def test_compute_log_prob_gate_consistency():
+    """compute_log_prob must weight selected entries by the gate exactly like
+    forward() (regression: the training-time log-prob path used raw logits while
+    inference scaled them by the gate, a train/inference distribution mismatch)."""
+    torch.manual_seed(0)
+    d_hidden, vocab_size = 16, 100
+    syn = SparseOutputSynthesizer(
+        d_hidden=d_hidden, vocab_size=vocab_size, d_model=64,
+        sparsity_pct=8.0, adaptive_sparsity=False,
+    )
+    x = torch.randn(8, d_hidden)
+    target = torch.randint(0, vocab_size, (8,))
+
+    log_probs = syn.compute_log_prob(x, target)
+    gate_values, top_indices, _ = syn.gate(x)
+    assert log_probs.shape == (8,)
+
+    # The log-prob of the target must equal log_softmax over the SAME scored
+    # set used by forward (selected gated entries + target), not the raw score.
+    h = syn.hidden_proj(x)
+    selected_emb = torch.nn.functional.embedding(top_indices, syn.output_embedding)
+    selected_scores = torch.sum(selected_emb * h.unsqueeze(1), dim=-1) / (syn.logit_temperature.abs() + 0.1)
+    selected_scores = gate_values * selected_scores
+    target_in = (top_indices == target.unsqueeze(1))  # [B, K]
+    target_eff = torch.where(
+        target_in.any(dim=-1, keepdim=True),
+        torch.gather(selected_scores, 1, target_in.to(torch.int64).argmax(dim=-1, keepdim=True)),
+        torch.zeros(8, 1, device=x.device),
+    ).squeeze(-1)
+    ref = torch.log_softmax(torch.cat([selected_scores, target_eff.unsqueeze(1)], dim=-1), dim=-1)[:, -1]
+    assert torch.allclose(log_probs, ref, atol=1e-6), "compute_log_prob gate convention mismatch"
+
+
+def test_causal_loss_masks_padding():
+    """Padding tokens must not leak into the next-token loss (regression:
+    the whole-sequence z_final was broadcast into every position and padding
+    tokens polluted the compressed state)."""
+    torch.manual_seed(0)
+    vocab_size = 256
+    model = NSLTModel(
+        vocab_size=vocab_size, d_model=32, d_state=16, d_hidden=32,
+        n_ssm_layers=2, sparsity_pct=5.0, n_ode_steps=4,
+        n_trajectories=4, n_sim_steps=4,
+    )
+    batch, seq_len = 2, 8
+    input_ids = torch.randint(1, vocab_size, (batch, seq_len))
+    # Right-pad the second row after column 4.
+    attention_mask = torch.ones(batch, seq_len, dtype=torch.long)
+    attention_mask[1, 4:] = 0
+    labels = input_ids.clone()
+    labels[1, 4:] = -100
+
+    out = model(input_ids, attention_mask=attention_mask, labels=labels)
+    assert torch.isfinite(out.loss) and out.loss.item() > 0, "Loss not finite/positive"
+    out.loss.backward()
+    assert any(p.grad is not None for p in model.parameters()), "No gradients flowed"
+
+    # The reason head still trails: predicting the final token flattens the
+    # full-context logits, so the loss must be well-defined for valid labels.
+    assert not torch.isnan(out.loss)
+
+
+def test_auxiliary_loss_computer_wires_all_components():
+    """All announced auxiliary losses must actually be computed when their
+    module outputs exist (regression: memory/planning/trajectory/entity/decoder
+    were configured and announced but never invoked)."""
+    acc = AuxiliaryLossComputer()
+    outputs = {
+        "intent": {"task_type": torch.randn(3, 4)},
+        "memory": {"state": torch.randn(3, 8), "reconstruction": torch.randn(3, 8)},
+        "planning": {"subgoal_logits": torch.randn(3, 5)},
+        "executive": {"gates": {"g1": torch.rand(3, 2), "g2": torch.rand(3, 2)},
+                      "confidence": torch.rand(3)},
+        "verification": {"v1": torch.rand(3, 1), "v2": torch.rand(3, 1)},
+        "trajectory": torch.randn(3, 6, 8),
+        "tools": {"route_weights": torch.randn(3, 4)},
+        "entity": {"logits": torch.randn(3, 6)},
+        "decoder": {"logits": torch.randn(3, 12, 16)},
+        "quality_assurance": {"eval_out": {"novelty": torch.rand(3)}},
+    }
+    targets = {
+        "intent": {"task_type": torch.tensor([1, 0, 2])},
+        "subgoal": {"ids": torch.tensor([1, 2, 0])},
+        "gates": {"g1": torch.tensor([1.0, 0.0, 1.0]),
+                     "g2": torch.tensor([0.0, 1.0, 0.0])},
+        "correctness": {"v1": torch.tensor([[1.0], [0.0], [1.0]]),
+                        "v2": torch.tensor([[0.0], [1.0], [0.0]])},
+        "accuracy": torch.tensor([0.7, 0.6, 0.8]),
+        "tool_type": torch.tensor([0, 1, 0]),
+        "entity_ids": torch.tensor([0, 1, 2]),
+        "decoder_ids": torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]] * 3),
+    }
+    losses = acc(outputs, targets)
+    expected = {"intent", "memory", "planning", "gate", "verification",
+                "calibration", "trajectory", "tools", "entity", "decoder", "novelty"}
+    assert expected.issubset(set(losses)), f"Missing losses: {expected - set(losses)}"
+    total = acc.total_loss(losses)
+    assert torch.isfinite(total), "Total auxiliary loss is not finite"

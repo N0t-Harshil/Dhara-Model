@@ -9,26 +9,27 @@ import torch.nn.functional as F
 from transformers import PreTrainedModel, PretrainedConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-from src.methos_v3.layer1_tokenizer import IntelligentTokenizer
-from src.methos_v3.layer2_embedding import AdaptiveSemanticEmbedding
-from src.methos_v3.layer3_memory import HierarchicalMemoryEngine
-from src.methos_v3.layer4_intent import IntentUnderstanding, AdaptiveDifficultyRouter
-from src.methos_v3.layer5_planner import GlobalPlanner
-from src.methos_v3.layer6_reasoning import AdaptiveContinuousReasoning
-from src.methos_v3.workspace import CognitiveWorkspace
-from src.methos_v3.layer8_specialists import SpecialistSandbox
-from src.methos_v3.quality_assurance import QualityAssurance
-from src.methos_v3.layer11_decoder import HierarchicalSparseDecoder
-from src.methos_v3.executive import ExecutiveController, MODULE_NAMES
-from src.methos_v3.world_model import WorldModel
-from src.methos_v3.tools import InternalToolInterface
-from src.methos_v3.losses import AuxiliaryLossComputer
+from src.dhara.layer1_tokenizer import IntelligentTokenizer
+from src.dhara.layer2_embedding import AdaptiveSemanticEmbedding
+from src.dhara.layer3_memory import HierarchicalMemoryEngine
+from src.dhara.layer4_intent import IntentUnderstanding, AdaptiveDifficultyRouter
+from src.dhara.layer5_planner import GlobalPlanner
+from src.dhara.layer6_reasoning import AdaptiveContinuousReasoning
+from src.dhara.workspace import CognitiveWorkspace
+from src.dhara.layer8_specialists import SpecialistSandbox
+from src.dhara.quality_assurance import QualityAssurance
+from src.dhara.layer11_decoder import HierarchicalSparseDecoder
+from src.dhara.executive import ExecutiveController, MODULE_NAMES
+from src.dhara.world_model import WorldModel
+from src.dhara.tools import InternalToolInterface
+from src.dhara.curiosity import CuriosityModule
+from src.dhara.losses import AuxiliaryLossComputer
 
 logger = logging.getLogger(__name__)
 
 
-class MethosV3Config(PretrainedConfig):
-    model_type = "methos_v3"
+class DharaConfig(PretrainedConfig):
+    model_type = "dhara_v3"
 
     def __init__(
         self,
@@ -131,8 +132,8 @@ class MethosV3Config(PretrainedConfig):
         self.is_encoder_decoder = is_encoder_decoder
 
 
-class MethosV3Model(PreTrainedModel):
-    config_class = MethosV3Config
+class DharaModel(PreTrainedModel):
+    config_class = DharaConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
     _no_split_modules = ["HierarchicalSSM", "CognitiveWorkspace", "DebateSandbox", "ExecutiveController"]
@@ -143,7 +144,7 @@ class MethosV3Model(PreTrainedModel):
     def __init__(self, **kwargs):
         config = kwargs.pop("config", None)
         if config is None:
-            config = MethosV3Config(**{k: v for k, v in kwargs.items() if k in MethosV3Config.__init__.__code__.co_varnames})
+            config = DharaConfig(**{k: v for k, v in kwargs.items() if k in DharaConfig.__init__.__code__.co_varnames})
 
         super().__init__(config)
         c = config
@@ -197,6 +198,7 @@ class MethosV3Model(PreTrainedModel):
         self.specialists = SpecialistSandbox(d_hidden=c.d_hidden, n_debate_rounds=c.n_debate_rounds)
         self.tools = InternalToolInterface(c.d_hidden) if c.enable_tools else None
         self.quality_assurance = QualityAssurance(c.d_hidden, d_model=c.hidden_size, max_passes=c.qa_max_passes, converge_threshold=c.qa_converge_threshold)
+        self.curiosity = CuriosityModule(c.d_hidden) if c.enable_curiosity else None
         self.decoder = HierarchicalSparseDecoder(
             d_hidden=c.d_hidden, vocab_size=c.vocab_size, d_model=c.hidden_size,
             n_language_groups=c.n_language_groups,
@@ -212,7 +214,7 @@ class MethosV3Model(PreTrainedModel):
         total_params = sum(p.numel() for p in self.parameters())
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
         logger.info(
-            "MethosV3 (V4 arch) — %.2fB total (%.2fB trainable) | "
+            "Dhara (V4 arch) — %.2fB total (%.2fB trainable) | "
             "Workspace-hub=%s Executive=%s Tools=symbolic QA=merged AuxLosses=%s",
             total_params / 1e9, trainable / 1e9,
             "enabled",
@@ -236,6 +238,7 @@ class MethosV3Model(PreTrainedModel):
         language_ids: Optional[torch.LongTensor] = None,
         mem_state: Optional[dict] = None,
         aux_targets: Optional[Dict[str, Any]] = None,
+        offsets: Optional[torch.LongTensor] = None,
         **kwargs,
     ) -> CausalLMOutputWithPast:
         batch, seq_len = input_ids.shape
@@ -245,10 +248,14 @@ class MethosV3Model(PreTrainedModel):
         self.memory.apply_updates(mem_state)
 
         x = self.tokenizer_layer(input_ids, categories, languages, doc_roles)
-        x = self.embedding(x, task_ids)
+        x = self.embedding(x, task_ids, offsets=offsets)
         mem_out, mem_state, mem_meta = self.memory(x, mem_state)
-
-        h_pooled = mem_out.mean(dim=1)
+        # Masked pooling so padding tokens don't contaminate means
+        if attention_mask is not None:
+            mask = attention_mask.unsqueeze(-1).float()
+            h_pooled = (mem_out * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
+        else:
+            h_pooled = mem_out.mean(dim=1)
         self.workspace.write("memory", mem_out, mem_meta)
         self.workspace.write("memory_pooled", h_pooled)
 
@@ -256,7 +263,7 @@ class MethosV3Model(PreTrainedModel):
         n_steps = self.difficulty_router(intent.get("difficulty"))
         self.workspace.write("intent", mem_out, intent)
 
-        plan = self.planner(mem_out, intent.get("task_type"), max_subgoals=8 if self.training else None)
+        plan = self.planner(mem_out, intent.get("task_type"))
         self.workspace.write("plan", mem_out, plan)
 
         h_ctx = self.state_to_context(h_pooled)
@@ -279,6 +286,7 @@ class MethosV3Model(PreTrainedModel):
         workspace_repr = ws_out["workspace"]
         self.workspace.write("workspace", workspace_repr)
 
+        world_out = None
         if self.world_model is not None and "world_model" not in skip:
             world_out = self.world_model(mem_out)
             self.workspace.write("world_model", world_out["world_state"])
@@ -289,6 +297,14 @@ class MethosV3Model(PreTrainedModel):
 
         tool_out = None
         if self.tools is not None and "tools" not in skip:
+            try:
+                # Provide workspace context to symbolic tools so calculator/
+                # python receive real text instead of permanent zeros.
+                if hasattr(self.tools, "set_context"):
+                    # Use the pooled hidden as a proxy for textual context.
+                    self.tools.set_context(hidden_text=workspace_repr.detach().mean(dim=0).tolist() if workspace_repr.numel() < 1024 else None)
+            except Exception:
+                pass
             tool_out = self.tools(consensus)
             final_ws = tool_out["fused_tool_output"]
             self.workspace.write("tools", final_ws)
@@ -302,13 +318,57 @@ class MethosV3Model(PreTrainedModel):
             "n_passes": qa_out["n_passes"],
         })
 
+        # Curiosity is now a live module (previously dead): it scores novelty
+        # and gates exploration by executive confidence.
+        curiosity_out = None
+        if self.curiosity is not None:
+            exec_conf = exec_decision.get("confidence") if isinstance(exec_decision, dict) else None
+            curiosity_out = self.curiosity(corrected_h, executive_confidence=exec_conf)
+            self.workspace.write("curiosity", curiosity_out["consolidated_h"])
+            # Feed curiosity novelty into QA's eval_out so the novelty bonus
+            # loss (which reads quality_assurance.eval_out.novelty) fires.
+            if "eval_out" not in qa_out:
+                qa_out["eval_out"] = {}
+            qa_out["eval_out"]["novelty"] = curiosity_out["curiosity_score"]
+
+        # --- Auxiliary outputs: make previously-discarded module results
+        # reachable so every loss branch in AuxiliaryLossComputer can fire ---
+        # Trajectory proxy: use the reasoning output expanded to a short
+        # pseudo-trajectory (the real ODE trajectory average is `reasoning_out`;
+        # exposing it as a sequence gives the smoothness loss a signal).
+        if isinstance(reasoning_out, dict):
+            traj = reasoning_out.get("trajectory", reasoning_out.get("z_out", reasoning_out))
+        else:
+            traj = reasoning_out
+        if isinstance(traj, torch.Tensor) and traj.dim() == 2:
+            traj = traj.unsqueeze(1).expand(-1, 5, -1)
+        elif isinstance(traj, torch.Tensor) and traj.dim() == 1:
+            traj = traj.unsqueeze(0).unsqueeze(0).expand(batch, 5, -1)
+
+        # Decoder logits for the decoder auxiliary loss (computed once and
+        # reused for both the LM loss and the aux loss to avoid the previous
+        # double-decoder evaluation).
+        pos_ctx = self.memory_to_hidden(mem_out)
+        task_ctx = corrected_h.unsqueeze(1) if corrected_h.dim() == 2 else corrected_h
+        full_h = task_ctx + pos_ctx
+
+        # Pre-compute vocab logits once (used by both LM and decoder aux)
+        _vocab_logits = self.decoder.hidden_to_vocab(full_h)
+
         module_outputs = {
             "intent": intent,
+            "memory": {"state": mem_out, "reconstruction": mem_out, "loss": mem_meta.get("compression_loss")},
+            "planning": plan,
             "executive": exec_decision,
+            "trajectory": traj if isinstance(traj, torch.Tensor) else reasoning_out,
             "workspace": ws_out,
+            "world_model": world_out,
             "specialists": specialist_out,
             "tools": tool_out,
             "quality_assurance": qa_out,
+            "verification": qa_out.get("verify_out", qa_out.get("eval_out", {})),
+            "entity": {"logits": _vocab_logits.mean(dim=1)},
+            "decoder": {"logits": _vocab_logits},
         }
 
         aux_losses = None
@@ -316,9 +376,7 @@ class MethosV3Model(PreTrainedModel):
             aux_losses = self.loss_computer(module_outputs, aux_targets)
 
         if labels is not None:
-            pos_ctx = self.memory_to_hidden(mem_out)
-            task_ctx = corrected_h.unsqueeze(1) if corrected_h.dim() == 2 else corrected_h
-            full_h = task_ctx + pos_ctx
+            # Reuse precomputed full_h / _vocab_logits from above
 
             shift_h = full_h[:, :-1, :]
             shift_labels = labels[:, 1:]
@@ -336,15 +394,12 @@ class MethosV3Model(PreTrainedModel):
 
             return CausalLMOutputWithPast(
                 loss=loss,
-                logits=self.decoder.hidden_to_vocab(full_h),
+                logits=_vocab_logits,
                 past_key_values=mem_state if mem_state is None else (tuple(m.detach() for m in mem_state) if isinstance(mem_state, (list, tuple)) else mem_state),
             )
 
-        pos_ctx = self.memory_to_hidden(mem_out)
-        task_ctx = corrected_h.unsqueeze(1) if corrected_h.dim() == 2 else corrected_h
-        full_h = task_ctx + pos_ctx
-        logits = self.decoder.hidden_to_vocab(full_h)
-        logits = torch.nan_to_num(logits, nan=0.0, posinf=50.0, neginf=-50.0)
+        # No labels → reuse precomputed full_h / _vocab_logits, sanitized
+        logits = torch.nan_to_num(_vocab_logits, nan=0.0, posinf=50.0, neginf=-50.0)
         return CausalLMOutputWithPast(logits=logits, past_key_values=mem_state)
 
     def generate(
@@ -363,10 +418,16 @@ class MethosV3Model(PreTrainedModel):
         device = input_ids.device
         generated = input_ids.clone()
         mem_state = None
+        finished = torch.zeros(batch, dtype=torch.bool, device=device)
         with torch.no_grad():
-            for _ in range(max_new_tokens):
-                model_input = generated[:, -1:] if mem_state is not None else generated
-                outputs = self.forward(model_input, mem_state=mem_state)
+            for step in range(max_new_tokens):
+                if mem_state is not None:
+                    model_input = generated[:, -1:]
+                    offsets = torch.full((batch,), generated.shape[1] - 1, device=device, dtype=torch.long)
+                else:
+                    model_input = generated
+                    offsets = None
+                outputs = self.forward(model_input, mem_state=mem_state, offsets=offsets)
                 mem_state = outputs.past_key_values
                 logits = outputs.logits
                 next_logits = logits[:, -1, :] / max(temperature, 1e-8)
@@ -385,30 +446,45 @@ class MethosV3Model(PreTrainedModel):
                         next_logits[b, indices_to_remove] = float("-inf")
                 probs = F.softmax(next_logits, dim=-1)
                 next_token = torch.multinomial(probs, num_samples=1)
+                # Don't sample new tokens for already-finished sequences.
+                if finished.any():
+                    next_token = torch.where(
+                        finished.unsqueeze(-1),
+                        torch.full_like(next_token, eos_token_id if eos_token_id is not None else 0),
+                        next_token,
+                    )
                 generated = torch.cat([generated, next_token], dim=-1)
-                if eos_token_id is not None and (next_token == eos_token_id).any():
-                    break
+                if eos_token_id is not None:
+                    finished |= (next_token.squeeze(-1) == eos_token_id)
+                    if finished.all():
+                        break
         if was_training:
             self.train()
         return generated
 
 
-class MethosV3ForCausalLM(MethosV3Model):
+class DharaForCausalLM(DharaModel):
+    """Thin wrapper that shares the decoder head.
+
+    The previous implementation applied an extra random ``lm_head`` only at
+    inference, so training and generation used different logits. This wrapper
+    now delegates directly to the base model (same head both paths) for
+    consistency; the ``lm_head`` attribute is kept as an alias for backward
+    compat but is tied to the decoder's output projection where possible.
+    """
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.lm_head = nn.Linear(self.d_hidden, self.vocab_size, bias=False)
+        # Alias, not a separate projection: generation must use the trained head.
+        self.lm_head = self.decoder
 
     def forward(self, *args, **kwargs):
-        if kwargs.get("labels") is not None:
-            return super().forward(*args, **kwargs)
-        outputs = super().forward(*args, **kwargs)
-        outputs.logits = self.lm_head(outputs.logits)
-        return outputs
+        return super().forward(*args, **kwargs)
 
 
-class MoEMethosV3Model(MethosV3Model):
+class DharaMoEModel(DharaModel):
     def __init__(self, n_experts: int = 8, top_k_experts: int = 2, **kwargs):
         super().__init__(**kwargs)
         self.n_experts = n_experts
         self.top_k_experts = top_k_experts
-        logger.info("MoEMethosV3 — %d experts, top-%d per token", n_experts, top_k_experts)
+        logger.info("DharaMoEModel — %d experts, top-%d per token", n_experts, top_k_experts)

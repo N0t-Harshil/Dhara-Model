@@ -71,8 +71,8 @@ class NSLTConfig(BaseModel):
     sparsity_pct: float = 1.0
 
 
-class MethosV3Config(BaseModel):
-    """MethosV3 architecture parameters."""
+class DharaConfig(BaseModel):
+    """Dhara architecture parameters."""
     d_state: int = Field(default=4096, ge=1)
     d_hidden: int = Field(default=10240, ge=1)
     n_ssm_layers: int = Field(default=6, ge=1)
@@ -118,14 +118,14 @@ class MethosV3Config(BaseModel):
     loss_weights: Optional[Dict[str, float]] = None
 
     @model_validator(mode="after")
-    def validate_top_k_range(self) -> "MethosV3Config":
+    def validate_top_k_range(self) -> "DharaConfig":
         if self.adaptive_top_k_min > self.adaptive_top_k_max:
             raise ValueError(f"adaptive_top_k_min ({self.adaptive_top_k_min}) cannot exceed adaptive_top_k_max ({self.adaptive_top_k_max})")
         return self
 
 
 class ModelArchitectureConfig(BaseModel):
-    model_type: Literal["llama", "mixtral", "qwen2_moe", "deepseek_v2", "nslt", "methos_v3"] = "nslt"
+    model_type: Literal["llama", "mixtral", "qwen2_moe", "deepseek_v2", "nslt", "dhara_v3"] = "nslt"
     hidden_size: int = Field(default=7168, ge=1)
     num_hidden_layers: int = Field(default=56, ge=1)
     num_attention_heads: int = Field(default=56, ge=1)
@@ -133,7 +133,7 @@ class ModelArchitectureConfig(BaseModel):
     intermediate_size: int = Field(default=18432, ge=1)
     moe: MoEConfig = Field(default_factory=MoEConfig)
     nslt: NSLTConfig = Field(default_factory=NSLTConfig)
-    methos_v3: MethosV3Config = Field(default_factory=MethosV3Config)
+    dhara_v3: DharaConfig = Field(default_factory=DharaConfig)
     multimodal: MultimodalConfig = Field(default_factory=MultimodalConfig)
     max_position_embeddings: int = Field(default=16384, ge=1)
     rope_theta: float = Field(default=10000000.0, ge=0.0)
@@ -168,7 +168,7 @@ class ModelArchitectureConfig(BaseModel):
 
 
 class ModelConfig(BaseModel):
-    name: str = "Methos Class Model"
+    name: str = "Dhara"
     dtype: Literal["bfloat16", "float16", "float32"] = "bfloat16"
     device: str = "auto"
     train_from_scratch: bool = True
@@ -362,7 +362,7 @@ class TrainingConfig(BaseModel):
 class FSDPConfig(BaseModel):
     enabled: bool = True
     sharding_strategy: Literal["full_shard", "hybrid_shard", "no_shard"] = "full_shard"
-    transformer_layer_cls: str = "MethosV3Model"
+    transformer_layer_cls: str = "DharaModel"
     backward_prefetch: Literal["backward_pre", "backward_post", "no_prefetch"] = "backward_pre"
     forward_prefetch: bool = True
     activation_checkpointing: bool = True
@@ -657,13 +657,13 @@ class AlignmentConfig(BaseModel):
 class ExperimentTrackingConfig(BaseModel):
     enabled: bool = False
     provider: Literal["wandb", "mlflow", "tensorboard", "none"] = "none"
-    project: str = "methos-class-model"
+    project: str = "dhara-class-model"
 
 
 class OutputConfig(BaseModel):
-    model_dir: str = "./models/methos"
+    model_dir: str = "./models/dhara"
     data_dir: str = "./data"
-    checkpoint_dir: str = "./models/methos/checkpoints"
+    checkpoint_dir: str = "./models/dhara/checkpoints"
     log_dir: str = "./logs"
     experiment_tracking: ExperimentTrackingConfig = Field(default_factory=ExperimentTrackingConfig)
 

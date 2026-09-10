@@ -227,7 +227,7 @@ class TrainingPipeline:
         set_seed(cfg.project.get("seed", 42) if cfg.project else 42)
 
     def initialize(self, fresh_start: bool = False, resume_checkpoint: Optional[str] = None) -> None:
-        logger.info("Initializing Methos Class Model pipeline (fresh_start=%s, resume=%s)...", fresh_start, resume_checkpoint)
+        logger.info("Initializing Dhara Class Model pipeline (fresh_start=%s, resume=%s)...", fresh_start, resume_checkpoint)
         self._fresh_start = fresh_start
         if resume_checkpoint is not None:
             ckpt_path = Path(resume_checkpoint)
@@ -1683,7 +1683,7 @@ class TrainingPipeline:
             "max_position_embeddings": arch.max_position_embeddings,
             "rope_theta": arch.rope_theta,
             "nslt": arch.nslt.model_dump(mode="python") if arch.model_type == "nslt" else None,
-            "methos_v3": arch.methos_v3.model_dump(mode="python") if arch.model_type == "methos_v3" else None,
+            "dhara_v3": arch.dhara_v3.model_dump(mode="python") if arch.model_type == "dhara_v3" else None,
         }
         (path / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
         if hasattr(self.tokenizer, "save_pretrained"):
@@ -1737,7 +1737,7 @@ class TrainingPipeline:
             "max_position_embeddings": arch.max_position_embeddings,
             "rope_theta": arch.rope_theta,
             "nslt": arch.nslt.model_dump(mode="python") if arch.model_type == "nslt" else None,
-            "methos_v3": arch.methos_v3.model_dump(mode="python") if arch.model_type == "methos_v3" else None,
+            "dhara_v3": arch.dhara_v3.model_dump(mode="python") if arch.model_type == "dhara_v3" else None,
         }
 
         def _write(target: Path) -> None:

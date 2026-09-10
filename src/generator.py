@@ -216,16 +216,17 @@ class CodeGenerator:
         inside the fence is returned.  Otherwise the full text is returned
         with minor cleanup.
         """
-        # Try to extract fenced code block
-        pattern = rf"```(?:{language})?\s*\n(.*?)```"
+        # Try to extract fenced code block (language escaped for c++/objective-c)
+        lang_esc = re.escape(language) if language else r"\w*"
+        pattern = rf"```(?:{lang_esc})?\s*\n?(.*?)```"
         match = re.search(pattern, raw, re.DOTALL | re.IGNORECASE)
         if match:
             return match.group(1).strip()
 
         # Fallback: strip leading/trailing whitespace and stray markdown
         code = raw.strip()
-        # Remove possible trailing instruction markers
-        for marker in ("### Instruction", "### End", "###"):
+        # Remove possible trailing instruction markers (anchored to newline)
+        for marker in ("\n### Instruction", "\n### End"):
             idx = code.find(marker)
             if idx > 0:
                 code = code[:idx].strip()

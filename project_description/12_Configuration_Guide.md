@@ -18,8 +18,8 @@ Three config files are provided for different training scales:
 
 | Parameter | Config | Default | Range | Description |
 |-----------|--------|---------|-------|-------------|
-| `model.name` | All | `"Methos-7B-v4"` | string | Model identifier for logging and checkpoint naming |
-| `model.architecture.model_type` | All | `"methos_v3"` | methos_v3, nslt, llama, mixtral, qwen2_moe, deepseek_v2 | Architecture selection. Determines which model class is instantiated by ModelFactory |
+| `model.name` | All | `"Dhara"` | string | Model identifier for logging and checkpoint naming |
+| `model.architecture.model_type` | All | `"dhara_v3"` | dhara_v3, nslt, llama, mixtral, qwen2_moe, deepseek_v2 | Architecture selection. Determines which model class is instantiated by ModelFactory |
 | `model.architecture.hidden_size` | foundation | 576 | 64–10240 | Main model dimension (d_model). Larger = more capacity but more memory. Foundation: tiny 576. Full: 10240 |
 | `model.architecture.vocab_size` | foundation | 64000 | 1000–256000 | Vocabulary size. Foundation uses 64K (reduced cost). Full config uses 128K. Must match tokenizer |
 | `model.architecture.d_state` | foundation | 288 | 64–4096 | SSM compressed state dimension. Controls the O(1) memory bottleneck. Larger = more information retained |
@@ -34,6 +34,7 @@ Three config files are provided for different training scales:
 | `training.pretrain.learning_rate` | foundation | 1e-4 | 1e-6–1e-3 | Peak learning rate for cosine schedule. Foundation: 1e-4. Full: 2e-4. Small: 3e-4 |
 | `training.pretrain.batch_size` | foundation | 4 | 1–64 | Per-GPU batch size. Foundation single GPU: 4. Full 4 GPUs: 2 each |
 | `training.pretrain.gradient_accumulation_steps` | foundation | 4 | 1–128 | Accumulate gradients over N steps before optimizer update. Effective batch = batch_size × num_gpus × accumulation |
+| `training.pretrain.staging.enabled` | foundation | true | bool | Dataset-granular staged pretraining — 8 stages (8000/6000/10000/6000×4/2000) whose step counts sum to `training.pretrain.max_steps`; one cosine schedule over the full run |
 | `training.pretrain.weight_decay` | all | 0.1 | 0.0–1.0 | AdamW weight decay. Higher = stronger regularization. 0.1 is standard for LLM pretraining |
 | `training.pretrain.warmup_steps` | foundation | 3000 | 0–10000 | Linear warmup steps before cosine decay. ~3–10% of max_steps is typical |
 | `training.pretrain.max_grad_norm` | all | 1.0 | 0.1–10.0 | Gradient clipping threshold. Prevents gradient explosion. 1.0 is conservative |
@@ -64,8 +65,8 @@ Three config files are provided for different training scales:
 | `data.curriculum.enabled` | all | false | bool | Enable curriculum learning with staged dataset filtering. Foundation config has 4 predefined stages |
 | `tokenizer.source` | all | `huggingface` | huggingface, custom | Tokenizer source. `huggingface` = download pretrained. `custom` = train from scratch (not fully implemented) |
 | `tokenizer.huggingface_model` | all | `Xenova/claude-tokenizer` | string | HuggingFace tokenizer model ID |
-| `output.model_dir` | all | `./models/methos` | path | Directory for saving trained models |
-| `output.checkpoint_dir` | all | `./models/methos/checkpoints` | path | Directory for training checkpoints |
+| `output.model_dir` | all | `./models/dhara` | path | Directory for saving trained models |
+| `output.checkpoint_dir` | all | `./models/dhara/checkpoints` | path | Directory for training checkpoints |
 | `output.experiment_tracking.enabled` | all | false | bool | Enable experiment tracking (wandb/mlflow/tensorboard) |
 | `output.experiment_tracking.provider` | all | `none` | wandb, mlflow, tensorboard, none | Tracking backend |
 | `generation.temperature` | all | 0.7 | 0.0–2.0 | Sampling temperature. 0.0 = greedy. Higher = more random |
