@@ -105,7 +105,7 @@ Input → [Tokenizer] → [Embedding+RoPE] → [MemoryManager] → [Executive Co
 ## CLI Overview
 
 | Command | What it does |
-|---|---|---|
+|---|---|
 | `python main.py full-training` | Run pretrain → SFT → instruction tuning |
 | `python main.py reserved-training` | Wait for free GPU, lock it, then train |
 | `python main.py generate --prompt "..."` | Generate text from a checkpoint |
