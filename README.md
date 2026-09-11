@@ -8,7 +8,7 @@ Train a custom code-focused LLM from scratch on **4× A100 80GB** using the
   <img alt="Python" src="https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python">
   <img alt="PyTorch" src="https://img.shields.io/badge/PyTorch-2.6-EE4C2C?logo=pytorch">
   <img alt="CUDA" src="https://img.shields.io/badge/CUDA-12.8-76B900?logo=nvidia">
-    <img alt="Tests" src="https://img.shields.io/badge/tests-162%20passing-brightgreen">
+    <img alt="Tests" src="https://img.shields.io/badge/tests-287%20passing-brightgreen">
    <img alt="Bugs fixed" src="https://img.shields.io/badge/bugs%20fixed-25%2B-2ea44f">
    <img alt="CLI" src="https://img.shields.io/badge/cli-8%20commands-blue">
    <img alt="Architecture" src="https://img.shields.io/badge/architecture-Dhara-8A2BE2">
@@ -94,7 +94,7 @@ Input → [Tokenizer] → [Embedding+RoPE] → [MemoryManager] → [Executive Co
 - **FSDP full-shard** across 4 GPUs (ZeRO-3), enabled for single-GPU with CPU offload
 - **GPU reservation** — `reserved-training` command waits for free GPU, locks it, then trains
 - **9 benchmarks** — HumanEval, MBPP, MMLU, GSM8K, HellaSwag, ARC, TruthfulQA, Winogrande, BBH
-- **162 pytest tests + 431 script-suite checks** — all passing
+- **287 pytest tests (25 test files) + 431 script-suite checks** — all passing
 - **Claude-grade tokenizer** — `Xenova/claude-tokenizer` (BPE, ~100K vocab)
 - **5 SSM scan backends** — sequential, vectorized, Triton, TorchScript JIT, CUDA
 - **Dhara 14-component V4 architecture** — workspace-as-central-hub communication, symbolic tools with learned routing, merged QualityAssurance (reflection + verification + curiosity), RL-trained Executive Controller with gate enforcement, 14 auxiliary training losses
@@ -109,7 +109,7 @@ Input → [Tokenizer] → [Embedding+RoPE] → [MemoryManager] → [Executive Co
 | `python main.py full-training` | Run pretrain → SFT → instruction tuning |
 | `python main.py reserved-training` | Wait for free GPU, lock it, then train |
 | `python main.py generate --prompt "..."` | Generate text from a checkpoint |
-| `python main.py test` | Run the 162-test suite |
+| `python main.py test` | Run the 287-test suite |
 | `python main.py benchmark` | Run benchmarks against a checkpoint |
 | `python main.py download-tokenizer` | Download a HuggingFace tokenizer |
 | `python main.py config-validate` | Validate `config.yaml` |
@@ -164,7 +164,7 @@ python main.py generate \
 ### Testing
 
 ```bash
-python main.py test                          # all 162 pytest tests
+python main.py test                          # all 287 pytest tests
 python main.py test --filter ssm             # SSM scan tests only
 python -m pytest tests/ -v --tb=short -x      # verbose, stop on first failure
 python -m pytest tests/ --cov=src            # coverage
@@ -229,8 +229,8 @@ python main.py download-tokenizer --force
 │   │   ├── mcts_sandbox.py     # MCTS latent sandbox
 │   │   ├── multiscale_ssm.py   # Multi-scale hierarchy
 │   │   └── vision_encoder.py   # SigLIP vision encoder
-│   ├── config/schema.py        # Pydantic config (536 lines, 8 cross-field validators)
-│   ├── models/factory.py       # Model creation + loading (573 lines)
+│   ├── config/schema.py        # Pydantic config (765 lines, 8 cross-field validators)
+│   ├── models/factory.py       # Model creation + loading (764 lines)
 │   ├── training/pipeline.py    # Training orchestration
 │   ├── tokenizer_trainer.py    # Tokenizer download + BPE training
 │   ├── infrastructure/
@@ -246,13 +246,15 @@ python main.py download-tokenizer --force
 │   ├── verify_datasets.py      # HF Hub dataset verification
 │   ├── production_validation.py# 8-phase production validation
 │   └── test_local_validation.py# 14 local validation tests
-├── tests/                      # 162 tests
+├── tests/                      # 287 tests (25 files)
 └── hf_cache/                   # Dataset cache
 ```
 
 For the complete reference (every config field, every CLI flag, architecture
 deep-dive, troubleshooting guide, benchmark methodology), see
-[`PROJECT_DOCUMENTATION.md`](PROJECT_DOCUMENTATION.md).
+[`PROJECT_DOCUMENTATION.md`](PROJECT_DOCUMENTATION.md). For a big-picture
+overview — the vision, the 11-layer architecture, and the certainty-aware
+reasoning roadmap — see [`PROJECT_DESCRIPTION.md`](PROJECT_DESCRIPTION.md).
 
 ---
 
@@ -268,23 +270,34 @@ Requires Python 3.10+ and CUDA 12.1+ for GPU training.
 
 ## Test Suite
 
-162 pytest tests across 14 files, all passing (`python -m pytest tests/ -q`):
+287 pytest tests across 25 test files, all passing (`python -m pytest tests/ -q`):
 
 ```
-tests/test_nslt.py                   # 14 — All 4 layers + full model
-tests/test_integration.py            # 20 — SSM scan, training, MoE, vision, MCTS
-tests/test_alignment.py              # 8 — DPO/ORPO/SimPO/KTO loss + ref-model fallback
-tests/test_config.py                 # 8 — Config validation + migration
-tests/test_data_collector.py         # 5 — Dataset streaming
-tests/test_data_pipeline.py          # 29 — Text cleaning, quality, dedup, gaps
-tests/test_async_pipeline_overlap.py # 19 — UnitPrefetch + AsyncCheckpointWriter stress
-tests/test_foundation_pipeline.py    # 14 — 0-dataset foundation config
-tests/test_main_cli.py               # 4 — CLI parser flags
-tests/test_evaluation.py             # 5 — Safety, benchmarks
-tests/test_generation.py             # 10 — Code extraction, language aliasing
-tests/test_quality.py                # 10 — Quality scoring, contamination
-tests/test_trainer.py                # 6 — Prompt formatting, tokenization
-tests/test_validation.py             # 10 — Python syntax + execution
+tests/test_nslt.py                    # 18 — All 4 layers + full model (incl. MCTS/SSM regressions)
+tests/test_integration.py             # 20 — SSM scan, training, MoE, vision, MCTS
+tests/test_alignment.py               # 8 — DPO/ORPO/SimPO/KTO loss + ref-model fallback
+tests/test_config.py                  # 8 — Config validation + migration
+tests/test_data_collector.py          # 5 — Dataset streaming
+tests/test_data_pipeline.py           # 31 — Text cleaning, quality, dedup, gaps, contamination
+tests/test_async_pipeline_overlap.py  # 19 — UnitPrefetch + AsyncCheckpointWriter stress
+tests/test_async_pipeline_hardening.py# 30 — Async pipeline hardening (crashes, stalls, races)
+tests/test_foundation_pipeline.py     # 14 — 0-dataset foundation config
+tests/test_main_cli.py                # 4 — CLI parser flags
+tests/test_evaluation.py              # 8 — Safety, benchmarks
+tests/test_generation.py              # 10 — Code extraction, language aliasing
+tests/test_quality.py                 # 10 — Quality scoring, contamination
+tests/test_trainer.py                 # 6 — Prompt formatting, tokenization
+tests/test_validation.py              # 10 — Python syntax + execution
+tests/test_unit_prefetch_lifecycle.py # 10 — Unit prefetch slot/lifecycle
+tests/test_tokenizer_acquisition.py   # 6 — Tokenizer download/acquisition
+tests/test_step_accounting.py         # 6 — Stage/step accounting + resume
+tests/test_spec_hardening.py          # 8 — Spec/behavior hardening regressions
+tests/test_special_token_alignment.py # 5 — Special token alignment
+tests/test_shutdown_coordinator.py    # 9 — Graceful shutdown coordination
+tests/test_phase1_crash_fixes.py      # 17 — Phase-1 crash-fix regressions
+tests/test_health_reporter.py         # 16 — Dataset health report aggregation
+tests/test_cleanup_pool.py            # 4 — Cleanup pool behavior
+tests/test_cache_lockstep.py          # 5 — Cache lockstep consistency
 ```
 
 Plus script suites (not under pytest): `scripts/test_pipeline.py` 124, `scripts/test_pipeline_async.py` 43, `scripts/test_local_validation.py` 258, `scripts/benchmark_async_pipeline.py` 6 checks.
