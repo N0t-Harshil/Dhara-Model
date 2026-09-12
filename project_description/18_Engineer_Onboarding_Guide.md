@@ -32,7 +32,7 @@ specialized-coding-model/
 │   ├── infrastructure/      # Distributed + tracking
 │   └── utils/               # Logging + reproducibility
 ├── scripts/                 # 17 utility/validation scripts
-├── tests/                   # 26 test files, 287 tests
+├── tests/                   # 26 test files, 292 tests
 ├── data/docs/               # Scraped documentation datasets
 ├── notebooks/               # Jupyter notebooks
 └── models/tokenizer/        # Tokenizer files (empty - downloaded)

@@ -498,3 +498,56 @@ streams.
 `rewrite_hf_url()` also rewrites legacy single-component IDs
 (`hf://datasets/code_search_net@abc123/...` →
 `https://huggingface.co/datasets/code_search_net/resolve/abc123/...`).
+
+---
+
+## 14. Dhara v3 decoder, output head & LM loss
+
+`src/dhara/layer11_decoder.py` / `src/dhara/model.py`. This section states
+honestly what the output layer computes — it is *not* a sparse
+vocabulary head that avoids the dense projection.
+
+### 14.1 What the decoder actually computes
+
+`HierarchicalSparseDecoder` stacks a semantic (concept) decoder, a language
+decoder, and a `TokenDecoder`. `TokenDecoder` owns the vocab head:
+
+- `hidden_to_vocab = nn.Linear(d_hidden, vocab_size)` — the forward pass
+  computes the **full dense projection** `logits = hidden_to_vocab(h) /
+  temperature` over **all** `V` vocab entries. This is an `O(V)` operation
+  and it happens on every forward pass.
+- `torch.topk(logits, k)` then **selects** the adaptive top-k candidate set
+  (`top_indices`/`top_logits`, `k` between `adaptive_top_k_min` and
+  `adaptive_top_k_max`, default max 2048). Top-k is a *selection on top of the
+  full projection* — it does **not** replace it.
+- Difficulty/sparsity gates only scale `k` (and shape auxiliary signals);
+  they do not gate the projection itself.
+
+### 14.2 Single decoder evaluation per micro-batch (training speed fix)
+
+`DharaModel.forward` previously evaluated the decoder stack + dense vocab
+projection **twice** per micro-batch — once for `_vocab_logits`, and once more
+inside `decoder.hierarchical_log_prob(...)` for the LM loss. It now evaluates
+the decoder **once** per micro-batch; the resulting `_vocab_logits` back both
+the LM loss and the aux/entity outputs, and the causal shift (position `t`
+predicts label `t+1`) is applied via a target mask instead of re-decoding a
+shifted slice. Pure efficiency fix; the dense-mode loss math is identical and
+is pinned by a regression test comparing against the old path.
+
+### 14.3 `head_ce` — opt-in top-k loss target set
+
+`model.architecture.dhara_v3.head_ce` (`src/config/schema.py`, also read by
+`DharaModel`): `"dense"` (default) or `"topk"`.
+
+- **`dense` (default):** LM cross-entropy over the full-vocab log-softmax of
+  `_vocab_logits`.
+- **`topk`:** LM cross-entropy over the decoder's adaptive top-k candidate set
+  (its existing `top_indices`, bounded by `adaptive_top_k_max`) **union** the
+  target token, via `logsumexp` over that small set — an approximation that
+  shrinks the **loss/backward target set**.
+
+Honest scope of `topk`: the decoder still computes the full dense vocab
+projection in the forward pass for candidate scoring (see §14.1), so
+`head_ce: topk` reduces the loss/backward target set but does **not** remove
+the dense projection and does **not** change generation. Opt-in; enabled in
+`config_foundation.yaml`.

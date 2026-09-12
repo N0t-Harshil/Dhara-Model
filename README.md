@@ -8,7 +8,7 @@ Train a custom code-focused LLM from scratch on **4× A100 80GB** using the
   <img alt="Python" src="https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python">
   <img alt="PyTorch" src="https://img.shields.io/badge/PyTorch-2.6-EE4C2C?logo=pytorch">
   <img alt="CUDA" src="https://img.shields.io/badge/CUDA-12.8-76B900?logo=nvidia">
-    <img alt="Tests" src="https://img.shields.io/badge/tests-287%20passing-brightgreen">
+    <img alt="Tests" src="https://img.shields.io/badge/tests-292%20passing-brightgreen">
    <img alt="Bugs fixed" src="https://img.shields.io/badge/bugs%20fixed-25%2B-2ea44f">
    <img alt="CLI" src="https://img.shields.io/badge/cli-8%20commands-blue">
    <img alt="Architecture" src="https://img.shields.io/badge/architecture-Dhara-8A2BE2">
@@ -94,11 +94,14 @@ Input → [Tokenizer] → [Embedding+RoPE] → [MemoryManager] → [Executive Co
 - **FSDP full-shard** across 4 GPUs (ZeRO-3), enabled for single-GPU with CPU offload
 - **GPU reservation** — `reserved-training` command waits for free GPU, locks it, then trains
 - **9 benchmarks** — HumanEval, MBPP, MMLU, GSM8K, HellaSwag, ARC, TruthfulQA, Winogrande, BBH
-- **287 pytest tests (25 test files) + 431 script-suite checks** — all passing
+- **292 pytest tests (26 test files) + 431 script-suite checks** — all passing
 - **Claude-grade tokenizer** — `Xenova/claude-tokenizer` (BPE, ~100K vocab)
 - **5 SSM scan backends** — sequential, vectorized, Triton, TorchScript JIT, CUDA
 - **Dhara 14-component V4 architecture** — workspace-as-central-hub communication, symbolic tools with learned routing, merged QualityAssurance (reflection + verification + curiosity), RL-trained Executive Controller with gate enforcement, 14 auxiliary training losses
 - **Causal LM training** — proper label shift (position i predicts i+1), per-position decoder context
+- **Single-pass decoder loss** — one decoder + vocab projection per micro-batch (the LM loss reuses those logits with a causal-shift mask instead of re-decoding)
+- **Selectable head CE** — `model.architecture.dhara_v3.head_ce: dense` (default) or `topk` (candidate-set CE over the decoder's adaptive top-k ∪ target)
+- **Stall-proof pretraining** — pretrain reads batches on the main thread (`dataloader_num_workers=0`) to avoid fork-inherited-lock deadlocks; a `[TRAIN] step 0/N` heartbeat and a `kill -USR1 <pid>` thread-stack dump make stalls visible in seconds
 
 ---
 
@@ -109,7 +112,7 @@ Input → [Tokenizer] → [Embedding+RoPE] → [MemoryManager] → [Executive Co
 | `python main.py full-training` | Run pretrain → SFT → instruction tuning |
 | `python main.py reserved-training` | Wait for free GPU, lock it, then train |
 | `python main.py generate --prompt "..."` | Generate text from a checkpoint |
-| `python main.py test` | Run the 287-test suite |
+| `python main.py test` | Run the 292-test suite |
 | `python main.py benchmark` | Run benchmarks against a checkpoint |
 | `python main.py download-tokenizer` | Download a HuggingFace tokenizer |
 | `python main.py config-validate` | Validate `config.yaml` |
@@ -164,7 +167,7 @@ python main.py generate \
 ### Testing
 
 ```bash
-python main.py test                          # all 287 pytest tests
+python main.py test                          # all 292 pytest tests
 python main.py test --filter ssm             # SSM scan tests only
 python -m pytest tests/ -v --tb=short -x      # verbose, stop on first failure
 python -m pytest tests/ --cov=src            # coverage
@@ -246,7 +249,7 @@ python main.py download-tokenizer --force
 │   ├── verify_datasets.py      # HF Hub dataset verification
 │   ├── production_validation.py# 8-phase production validation
 │   └── test_local_validation.py# 14 local validation tests
-├── tests/                      # 287 tests (25 files)
+├── tests/                      # 292 tests (26 files)
 └── hf_cache/                   # Dataset cache
 ```
 
@@ -270,7 +273,7 @@ Requires Python 3.10+ and CUDA 12.1+ for GPU training.
 
 ## Test Suite
 
-287 pytest tests across 25 test files, all passing (`python -m pytest tests/ -q`):
+292 pytest tests across 26 test files, all passing (`python -m pytest tests/ -q`):
 
 ```
 tests/test_nslt.py                    # 18 — All 4 layers + full model (incl. MCTS/SSM regressions)
@@ -298,6 +301,7 @@ tests/test_phase1_crash_fixes.py      # 17 — Phase-1 crash-fix regressions
 tests/test_health_reporter.py         # 16 — Dataset health report aggregation
 tests/test_cleanup_pool.py            # 4 — Cleanup pool behavior
 tests/test_cache_lockstep.py          # 5 — Cache lockstep consistency
+tests/test_head_ce.py                 # 5 — Head CE: dense-vs-reference, top-k bound, factory wiring
 ```
 
 Plus script suites (not under pytest): `scripts/test_pipeline.py` 124, `scripts/test_pipeline_async.py` 43, `scripts/test_local_validation.py` 258, `scripts/benchmark_async_pipeline.py` 6 checks.
@@ -332,6 +336,8 @@ Plus script suites (not under pytest): `scripts/test_pipeline.py` 124, `scripts/
 | Architecture mismatch | `rm -rf models/dhara/checkpoints; bash scripts/train_4gpu.sh --fresh-start` |
 | "No module named 'src'" | Run from the project root directory |
 | Training hangs at init | Check GPUs with `nvidia-smi`, kill stale `torchrun` processes |
+| Training stuck at step 0 (progress bar not moving) | Pretrain now uses `dataloader_num_workers=0` to avoid forked DataLoader workers deadlocking on locks held by async-prefetch threads. Watch for `[TRAIN] step 0/N — entering training loop, awaiting first batch...`; if it still stalls, `kill -USR1 <pid>` dumps all thread stacks to the log |
+| Head CE out of memory / too slow | The decoder's full-vocab projection is the step bottleneck. Set `model.architecture.dhara_v3.head_ce: topk` (candidate-set CE) and/or lower `max_seq_length` |
 | `mixed_precision` key not found | Config uses `"mixed_precision": "fp16"`; both `fp16` and `mixed_precision` are accepted |
 | HSSM state tensor shape mismatch | HSSM `A` tensor uses `d_state` dimension from `num_heads`, not `d_model` |
 | Missing `config.json` when loading | Models save/load via `save_pretrained()` which writes `config.json` |
@@ -344,6 +350,18 @@ Plus script suites (not under pytest): `scripts/test_pipeline.py` 124, `scripts/
 ---
 
 ## Changelog
+
+### 2026-09 — Pretrain stall fix, single-pass decoder loss, head CE option
+
+| Area | Change |
+|------|--------|
+| **Pretrain step-0 stall (fork-lock deadlock)** | `_build_trainer` (`src/training/pipeline.py`) forces `dataloader_num_workers=0` for the `pretrain` stage. The async-prefetch/streaming threads hold internal locks at fork time; forked DataLoader workers inherited those locked locks and deadlocked on their first batch fetch, pinning training at `0/50000` forever (main thread futex-waited). Pretrain now reads batches on the main thread |
+| **SIGUSR1 stack dump** | `main.py` installs a stack-dump handler at startup: `kill -USR1 <pid>` dumps every Python thread's stack to stderr/the training log — no root/ptrace needed, process keeps running |
+| **Train heartbeat** | New `_TrainHeartbeatCallback` logs `[TRAIN] step 0/N — entering training loop, awaiting first batch...` the moment the loop starts, then every 100 steps, so a silent stall is visible within seconds |
+| **Double decoder evaluation removed** | `DharaModel.forward` ran the full decoder stack + dense vocab projection twice per micro-batch (`hidden_to_vocab()` for the logits, then `hierarchical_log_prob()` for the loss). It now decodes once; the LM loss reuses those logits and applies the causal shift with a target mask. Verified byte-identical to the old dense path by regression test |
+| **`head_ce` option** | New `model.architecture.dhara_v3.head_ce: dense \| topk` (default `dense`, existing configs unchanged). `topk` computes candidate-set CE over the decoder's adaptive top-k indices ∪ target instead of a full-vocab log-softmax. Honest caveat: the forward still performs the full dense projection; `topk` narrows the loss/backward target set (an approximation) and does not change generation. Enabled in `config_foundation.yaml` |
+
+Touched: `main.py`, `src/training/pipeline.py`, `src/dhara/model.py`, `src/config/schema.py`, `src/models/factory.py`, `config_foundation.yaml`, `tests/test_head_ce.py`, and the docs suite. Verified: **pytest 292 tests / 26 files** (plus the pre-existing unseeded `test_nslt_loss_decreases` flake).
 
 ### 2026-08 — Model-correctness audit pass (third audit follow-up)
 

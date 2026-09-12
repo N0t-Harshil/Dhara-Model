@@ -26,6 +26,8 @@
 
 3. **Packing overhead**: Random window sampling + EOS concatenation adds negligible GPU cost (<1%).
 
+4. **Decoder evaluation redundancy (fixed)**: `DharaModel.forward` previously ran the hierarchical decoder stack + dense vocab projection twice per micro-batch (once for `_vocab_logits`, again inside `hierarchical_log_prob`). It now runs exactly once and reuses the logits for the LM loss (causal shift applied via a target mask), roughly halving the dominant per-step cost. Dense-mode loss math is unchanged. The opt-in `head_ce: topk` can further shrink the loss/backward target set to the decoder's adaptive top-k indices union the target token, but the dense vocab projection still runs in the forward pass for candidate scoring.
+
 ### I/O Bottlenecks
 1. **Dataset loading from HF Hub**: Network-bound for streaming datasets.
    - **Optimization**: Enable local caching (`cache_dir` in config)

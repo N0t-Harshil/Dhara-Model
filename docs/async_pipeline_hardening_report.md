@@ -675,8 +675,11 @@ with `eval_strategy="no"` and would crash if a user enabled eval while leaving
   - `test_health_reporter.py::test_per_dataset_lang_domain_distribution_sums_without_inflation`,
     `test_compute_global_stats_refreshes_timestamp`.
   - `test_async_pipeline_hardening.py::test_telemetry_stage_tags_use_actual_stage_index`.
-- Full suite: **287 passed** (was 282 this repo's Phase-12 record; +5 new) in
-  ~8:46. No skips, no xfail.
+- Full suite: **292 passed** across **26 test files** (was 287 / 25 this
+  repo's prior record; +5 new in `tests/test_head_ce.py`) in ~8:46. No skips,
+  no xfail; the one pre-existing intermittent flake is
+  `test_integration.py::TestEndToEndTraining::test_nslt_loss_decreases`
+  (unseeded NSLT init, green in isolation).
 
 Constraints honored by construction: filtered counts/weights untouched,
 tokenizer untouched, prefetch timeout untouched, no blanket `except`.
@@ -703,3 +706,50 @@ tokenizer untouched, prefetch timeout untouched, no blanket `except`.
 3. The aggregate-numbers `accuracy/ce`-style parity is covered by existing
    unit/step tests; run `tests/test_async_pipeline_overlap.py` on the box if the
    async overlap/streaming path is ever re-enabled with multiple units.
+
+---
+
+## P. Pretrain DataLoader Fork-Lock Fix & Stall Diagnostics (2026-09-12)
+
+Mandate: a real run hung with the progress bar pinned at `0/50000` for hours —
+the main thread futex-waited forever on the first batch of step 0. Root cause,
+fix, and the diagnostics that make the next stall visible in seconds, below.
+
+### P.1 Root cause — fork-inherited locks from async prefetch
+
+The staged-pretrain DataLoader spawns worker **processes**
+(`dataloader_num_workers` > 0). On `fork` start each worker inherits every lock
+the parent held at fork time — including the internal locks the
+async-prefetch/streaming threads (`src/training/asyncprefetch.py`, the new
+variable that introduced them) hold while a background unit build is in
+flight. Every worker therefore wedged on its first batch fetch on a lock that
+was already held and never released (the holder was a parent-process thread the
+worker does not own): all DataLoader workers deadlocked, the main thread
+blocked on the worker queue, and training never advanced past step 0.
+
+### P.2 Fix — pretrain reads batches on the main thread
+
+- `_build_trainer` (`src/training/pipeline.py`) now forces
+  `dataloader_num_workers=0` for the **pretrain** stage. Batch fetching moves
+  to the main (training) thread, so no worker process ever forks across the
+  prefetch threads' live locks.
+- Fork-safety is now documented as a design constraint of the async prefetch
+  subsystem (see `docs/async_pipeline_design.md` §2).
+
+### P.3 Diagnostics — stalls visible within seconds
+
+- **SIGUSR1 stack dump (`main.py`):** a `SIGUSR1` handler is installed at
+  startup; a non-root user can run `kill -USR1 <pid>` to dump **all** Python
+  thread stacks to stderr/the training log — no ptrace or sudo required.
+- **`_TrainHeartbeatCallback` (`src/training/pipeline.py`):** logs
+  `[TRAIN] step 0/N — entering training loop, awaiting first batch...` the
+  instant the training loop starts, then a heartbeat every 100 steps. A silent
+  stall is now visible within seconds instead of hours.
+
+### P.4 Test & validation evidence
+
+- Full suite is now **292 passed across 26 test files** (the O.4 record was
+  287/25; the 5 new tests live in `tests/test_head_ce.py`). The one
+  pre-existing intermittent flake is
+  `test_integration.py::TestEndToEndTraining::test_nslt_loss_decreases`
+  (unseeded NSLT init, green in isolation).

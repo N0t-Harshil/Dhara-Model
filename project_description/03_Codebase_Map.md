@@ -260,7 +260,7 @@
 
 ---
 
-## `tests/` — 26 Test Files (287 tests, full suite green)
+## `tests/` — 26 Test Files (292 tests, full suite green)
 
 | Test File | Coverage |
 |---|---|
@@ -274,6 +274,7 @@
 | `test_generation.py` | Code generation — Generator + validator integration |
 | `test_data_collector.py` | Legacy MassiveDataCollector |
 | `test_foundation_pipeline.py` | Foundation config pipeline test |
+| `test_head_ce.py` | LM head CE modes — dense-vs-reference regression, top-k bound, gradient flow, schema default, factory wiring |
 | `test_integration.py` | End-to-end integration tests |
 | `test_validation.py` | Code validation — syntax checking, execution |
 | `test_async_pipeline_hardening.py` | Async hardening — ownership, cancellation, journal-first sched, regressions |

@@ -70,6 +70,7 @@ Cross-field validators ensure consistency:
 - **Disabled**: SFT, instruction tuning, alignment, safety, curriculum
 - **FSDP**: Disabled (single GPU)
 - **Async prefetch**: per-slot staged unit prefetch (daemon producers, cancellation, retry/backoff) keeps streaming/filtering/tokenization ahead of the GPU
+- **DataLoader**: pretrain forces `dataloader_num_workers=0` — batches are read on the main thread (forked workers previously inherited internal locks held by the async-prefetch/streaming threads and deadlocked on their first batch fetch)
 
 ### Stage 2: Full Pretraining (config.yaml)
 
@@ -108,6 +109,21 @@ effective_batch = per_device_batch * num_gpus * gradient_accumulation_steps
 ```
 
 For production: 2 × 4 × 8 = 64 effective batch.
+
+### Decoder Evaluation & LM Loss (`head_ce`)
+
+`DharaModel.forward` (`src/dhara/model.py`) now evaluates the hierarchical decoder stack + vocab projection exactly **once** per micro-batch. Previously it ran twice — once via `decoder.hidden_to_vocab(full_h)` for `_vocab_logits`, and again inside `decoder.hierarchical_log_prob(...)` for the loss. The LM loss now reuses those logits and applies the causal shift (position *t* predicts label *t+1*) via a target mask. This roughly halves the dominant per-step cost. It is a pure efficiency fix — the dense-mode loss math is identical (verified by a regression test that byte-compares against the old `hierarchical_log_prob` path).
+
+`model.architecture.dhara_v3.head_ce` controls how the LM cross-entropy loss is reduced:
+
+- **`"dense"`** (default) — standard full-vocab log-softmax CE; unchanged behavior, all existing configs unaffected.
+- **`"topk"`** (used by `config_foundation.yaml`) — candidate-set CE computed over the decoder's own adaptive top-k token indices (the `top_indices` `HierarchicalSparseDecoder` already produces, bounded by `adaptive_top_k_max`) **union** the target token, instead of a full-vocab log-softmax.
+
+`head_ce: topk` is opt-in and an approximation: the decoder still performs the full dense vocab projection in the forward pass for candidate scoring; the flag reduces only the loss computation and the gradient target set. The architecture, forward pass, and generation/sampling are unchanged by this flag.
+
+### Pretrain DataLoader Worker Safety
+
+`_build_trainer` (`src/training/pipeline.py`) forces `dataloader_num_workers=0` for the `pretrain` stage. Forked DataLoader worker processes previously inherited internal locks held by the async-prefetch/streaming threads at fork time, deadlocking every worker on its first batch fetch and pinning training at step 0 forever (main thread futex-wait, progress bar stuck at `0/50000`). Pretrain reads batches on the main thread.
 
 ### Mixed Precision (FP16/BF16)
 

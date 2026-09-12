@@ -88,7 +88,7 @@ graph TB
 | Alignment pipeline | ⚠️ Scaffolded | DPO trainer, Constitutional AI |
 | Distributed training | ⚠️ Scaffolded | FSDP/DeepSpeed/DDP configs exist |
 | Evaluation | ⚠️ Partially implemented | Benchmarks scaffolded |
-| Tests | ✅ 26 test files, 287 passing | Covers data pipeline, async hardening, health reporter, trainers, CLI, registry builds |
+| Tests | ✅ 26 test files, 292 passing | Covers data pipeline, async hardening, health reporter, trainers, CLI, registry builds |
 | Documentation | ✅ Good | README, ARCHITECTURE.md, PROJECT_DOCUMENTATION.md exist |
 
 ## Intended Users

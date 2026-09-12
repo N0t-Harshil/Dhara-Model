@@ -52,6 +52,22 @@
   - Check for corrupted data samples
 - **Verify**: Re-run with --smoke-steps 50 to isolate
 
+### 7. Training Stuck at Step 0 / Progress Bar Not Moving
+- **Symptom**: Progress bar pinned at `0/50000` for hours; GPU idle; main thread futex-waiting
+- **Cause**: Forked DataLoader worker processes inherit internal locks held by the async-prefetch/streaming threads at fork time; every worker deadlocks on its first batch fetch
+- **Fix**: Pretrain now forces `dataloader_num_workers=0` in `_build_trainer` (`src/training/pipeline.py`); batches are read on the main thread
+- **Verify**: The initial `[TRAIN] step 0/N — entering training loop, awaiting first batch...` line should be followed by progress within seconds
+
+### 8. Dumping Thread Stacks Without Root (`kill -USR1 <pid>`)
+- **Symptom**: Need to know where a stuck training process is blocked but have no ptrace/sudo access
+- **Fix**: `main.py` installs a SIGUSR1 stack-dump handler at startup; run `kill -USR1 <pid>` to dump ALL thread stacks to stderr / the training log
+- **Use with**: Silent stalls where the heartbeat suggests the process is alive but throughput is zero
+
+### 9. `[TRAIN] step 0/N ... awaiting first batch` Heartbeat Line
+- **Symptom**: New workers want a health signal for a possibly-stuck trainer
+- **Cause**: A `_TrainHeartbeatCallback` logs this line immediately when training starts, then a heartbeat every 100 steps
+- **Read**: The first line means the training loop entered but the first batch has not arrived yet (data pipeline stall). A heartbeat cadence every 100 steps makes silent stalls visible within seconds
+
 ### Where Logs Are Stored
 - Console: stdout/stderr (always visible)
 - File: configurable via cfg.output.log_dir (default: logs/)
@@ -95,6 +111,12 @@ Dataset Load Error
 #### Training Failure Flowchart
 ```
 Training fails
+    ├── Stuck at step 0 / progress bar not moving?
+    │   ├── Check for `[TRAIN] step 0/N — awaiting first batch` heartbeat lines
+    │   ├── If stuck on first batch: forked DataLoader worker deadlock (locks inherited at fork)
+    │   │   └── Pretrain now uses dataloader_num_workers=0 — batches read on main thread
+    │   ├── Dump thread stacks with `kill -USR1 <pid>` (no sudo/ptrace needed)
+    │   └── Confirm heartbeats advance every 100 steps
     ├── NaN loss?
     │   ├── Reduce learning rate
     │   ├── Increase gradient clipping (lower max_grad_norm)

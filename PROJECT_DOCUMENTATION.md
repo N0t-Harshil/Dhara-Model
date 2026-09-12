@@ -1553,21 +1553,38 @@ src/
 
 ## 11. Test Suite
 
-109 tests across 11 files.
+292 pytest tests across 26 test files, all passing (`python -m pytest tests/ -q`):
 
-| File | Tests | Key fixtures | What's tested |
-|---|---|---|---|
-| `tests/test_nslt.py` | 17 | `nslt_model` | SSM shapes, LTC ODE, sandbox, sparse output, full model forward/train/gen |
-| `tests/test_integration.py` | 12 | `tiny_nslt`, `tiny_moe` | SSM scan correctness, loss convergence, MoE forward, vision encoder, MCTS |
-| `tests/test_alignment.py` | 4 | — | DPO loss prefers chosen, ORPO loss finite, SimPO correctness |
-| `tests/test_config.py` | 7 | — | Loading, defaults, v1→v2 migration, invalid dtype rejection |
-| `tests/test_data_collector.py` | 3 | — | Chat schema, problem-solution, max_samples |
-| `tests/test_data_pipeline.py` | 20 | — | Text cleaning, language detection, field extraction, quality filtering |
-| `tests/test_evaluation.py` | 4 | — | Safety keywords, benchmark result formatting |
-| `tests/test_generation.py` | 8 | — | Code extraction, language aliasing, model not-ready error |
-| `tests/test_quality.py` | 6 | — | Length check, low-quality markers, dedup, contamination |
-| `tests/test_trainer.py` | 3 | — | Constitutional prompt, supervised tokenization, format |
-| `tests/test_validation.py` | 10 | — | Python syntax, execution, timeout, batch validation |
+| File | Tests | What's tested |
+|---|---|---|
+| `tests/test_nslt.py` | 18 | All 4 layers + full model (incl. MCTS/SSM regressions) |
+| `tests/test_integration.py` | 20 | SSM scan, training, MoE, vision, MCTS |
+| `tests/test_alignment.py` | 8 | DPO/ORPO/SimPO/KTO loss + ref-model fallback |
+| `tests/test_config.py` | 8 | Config validation + migration |
+| `tests/test_data_collector.py` | 5 | Dataset streaming |
+| `tests/test_data_pipeline.py` | 31 | Text cleaning, quality, dedup, gaps, contamination |
+| `tests/test_async_pipeline_overlap.py` | 19 | UnitPrefetch + AsyncCheckpointWriter stress |
+| `tests/test_async_pipeline_hardening.py` | 30 | Async pipeline hardening (crashes, stalls, races) |
+| `tests/test_foundation_pipeline.py` | 14 | 0-dataset foundation config |
+| `tests/test_main_cli.py` | 4 | CLI parser flags |
+| `tests/test_evaluation.py` | 8 | Safety, benchmarks |
+| `tests/test_generation.py` | 10 | Code extraction, language aliasing |
+| `tests/test_quality.py` | 10 | Quality scoring, contamination |
+| `tests/test_trainer.py` | 6 | Prompt formatting, tokenization |
+| `tests/test_validation.py` | 10 | Python syntax + execution |
+| `tests/test_unit_prefetch_lifecycle.py` | 10 | Unit prefetch slot/lifecycle |
+| `tests/test_tokenizer_acquisition.py` | 6 | Tokenizer download/acquisition |
+| `tests/test_step_accounting.py` | 6 | Stage/step accounting + resume |
+| `tests/test_spec_hardening.py` | 8 | Spec/behavior hardening regressions |
+| `tests/test_special_token_alignment.py` | 5 | Special token alignment |
+| `tests/test_shutdown_coordinator.py` | 9 | Graceful shutdown coordination |
+| `tests/test_phase1_crash_fixes.py` | 17 | Phase-1 crash-fix regressions |
+| `tests/test_health_reporter.py` | 16 | Dataset health report aggregation |
+| `tests/test_cleanup_pool.py` | 4 | Cleanup pool behavior |
+| `tests/test_cache_lockstep.py` | 5 | Cache lockstep consistency |
+| `tests/test_head_ce.py` | 5 | Head CE: dense-vs-reference, top-k bound, factory wiring |
+
+Plus script suites (not under pytest): `scripts/test_pipeline.py` 124, `scripts/test_pipeline_async.py` 43, `scripts/test_local_validation.py` 258, `scripts/benchmark_async_pipeline.py` 6 checks.
 
 **Run all:** `python -m pytest tests/ -q`
 **With coverage:** `python -m pytest tests/ --cov=src --cov-report=term-missing`

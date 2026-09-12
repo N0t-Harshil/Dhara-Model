@@ -274,6 +274,7 @@ class ModelFactory:
                 max_events=v3.max_events,
                 n_tool_types=v3.n_tool_types,
                 loss_weights=getattr(v3, "loss_weights", None),
+                head_ce=v3.head_ce,
                 enable_executive=v3.enable_executive,
                 enable_world_model=v3.enable_world_model,
                 enable_tools=v3.enable_tools,

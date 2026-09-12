@@ -116,6 +116,7 @@ class DharaConfig(BaseModel):
     qa_max_passes: int = Field(default=5, ge=1)
     qa_converge_threshold: float = Field(default=0.05, ge=0.0, le=1.0)
     loss_weights: Optional[Dict[str, float]] = None
+    head_ce: Literal["dense", "topk"] = "dense"
 
     @model_validator(mode="after")
     def validate_top_k_range(self) -> "DharaConfig":

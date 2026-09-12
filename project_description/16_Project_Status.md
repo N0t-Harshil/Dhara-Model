@@ -36,7 +36,7 @@
 - ✅ **Model factory** supporting 6 architectures: llama, mixtral, qwen2_moe, deepseek_v2, nslt, dhara_v3
 - ✅ **Dhara model** — 11-layer architecture (`IntelligentTokenizer` → `AdaptiveSemanticEmbedding` → `HierarchicalMemoryEngine` → `IntentUnderstanding` → `GlobalPlanner` → `AdaptiveContinuousReasoning` → `CognitiveWorkspace` → `SpecialistSandbox` → `QualityAssurance` → `HierarchicalSparseDecoder` + `ExecutiveController`), `PreTrainedModel` compatible
 - ✅ **NSLT model** — 4-layer architecture (SSM Compression Engine → LTC Routing → Latent Sandbox → Sparse Output), O(1) memory complexity, RoPE position encoding
-- ✅ **Sparse output layer** — `SparseOutputSynthesizer` avoids O(V) logit materialization; uses top-k vocabulary projection
+- ✅ **Sparse output layer** — `SparseOutputSynthesizer` uses top-k vocabulary projection for candidate selection; the forward pass still computes the full-vocab projection, and the opt-in `head_ce: topk` narrows the loss/backward target set
 - ✅ **Model size estimation** — parameter count estimates for all 6 architectures
 - ✅ **Checkpoint compatibility checking** — `is_compatible()` validates saved config against current config
 - ✅ **MoE variants** — `DharaMoEModel`, `MoENSLTModel` with expert routing and load-balancing loss

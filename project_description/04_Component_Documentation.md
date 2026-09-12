@@ -479,7 +479,7 @@ Each module contributes a differentiable loss: memory reconstruction, intent CE,
 - **O(1) memory**: SSM compression replaces KV cache
 - **Continuous ODE reasoning**: LTC routing with liquid time-constants
 - **Energy-based reasoning**: LatentSandbox with parallel trajectory simulation
-- **Sparse output**: Top-1% vocabulary gating (O(top_k) vs O(V))
+- **Sparse output**: Top-1% vocabulary gating — top-k selects the candidate set for scoring/loss, but the forward pass still performs the full-vocab projection; the opt-in `head_ce: topk` narrows the loss/backward target set
 - **Multimodal**: Vision encoder integration via SigLIP + projection
 
 ### Architecture Flow

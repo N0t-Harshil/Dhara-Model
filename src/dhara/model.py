@@ -79,6 +79,7 @@ class DharaConfig(PretrainedConfig):
         qa_max_passes: int = 5,
         qa_converge_threshold: float = 0.05,
         loss_weights: Optional[Dict[str, float]] = None,
+        head_ce: str = "dense",
         is_encoder_decoder: bool = False,
         **kwargs,
     ):
@@ -129,6 +130,7 @@ class DharaConfig(PretrainedConfig):
         self.qa_max_passes = qa_max_passes
         self.qa_converge_threshold = qa_converge_threshold
         self.loss_weights = loss_weights
+        self.head_ce = head_ce
         self.is_encoder_decoder = is_encoder_decoder
 
 
@@ -158,6 +160,7 @@ class DharaModel(PreTrainedModel):
         self.enable_world_model = c.enable_world_model
         self.enable_tools = c.enable_tools
         self.enable_aux_losses = c.enable_aux_losses
+        self.head_ce = getattr(c, "head_ce", "dense")
 
         self.tokenizer_layer = IntelligentTokenizer(
             vocab_size=c.vocab_size, d_model=c.hidden_size,
@@ -345,15 +348,24 @@ class DharaModel(PreTrainedModel):
         elif isinstance(traj, torch.Tensor) and traj.dim() == 1:
             traj = traj.unsqueeze(0).unsqueeze(0).expand(batch, 5, -1)
 
-        # Decoder logits for the decoder auxiliary loss (computed once and
-        # reused for both the LM loss and the aux loss to avoid the previous
-        # double-decoder evaluation).
+        # Single decoder evaluation over the full sequence: the resulting vocab
+        # logits back the LM loss AND the aux/entity outputs. Previously both
+        # hidden_to_vocab() and hierarchical_log_prob() each ran the whole
+        # decoder stack + dense vocab projection, i.e. the dominant cost of the
+        # step was paid twice. The causal shift (position t predicts labels[b,
+        # t+1]) is applied below in the loss, not by re-decoding a shifted slice.
         pos_ctx = self.memory_to_hidden(mem_out)
         task_ctx = corrected_h.unsqueeze(1) if corrected_h.dim() == 2 else corrected_h
         full_h = task_ctx + pos_ctx
-
-        # Pre-compute vocab logits once (used by both LM and decoder aux)
-        _vocab_logits = self.decoder.hidden_to_vocab(full_h)
+        batch, seq_len = full_h.shape[0], full_h.shape[1]
+        flat_h = full_h.reshape(-1, self.d_hidden)
+        if labels is not None and language_ids is not None:
+            lang_shift = torch.zeros_like(language_ids[:, :seq_len])
+            lang_shift[:, :-1] = language_ids[:, 1:seq_len]
+            _dec_out = self.decoder(flat_h, language_ids=lang_shift.reshape(-1))
+        else:
+            _dec_out = self.decoder(flat_h)
+        _vocab_logits = _dec_out["logits"].view(batch, seq_len, self.vocab_size)
 
         module_outputs = {
             "intent": intent,
@@ -376,17 +388,24 @@ class DharaModel(PreTrainedModel):
             aux_losses = self.loss_computer(module_outputs, aux_targets)
 
         if labels is not None:
-            # Reuse precomputed full_h / _vocab_logits from above
-
-            shift_h = full_h[:, :-1, :]
-            shift_labels = labels[:, 1:]
-            flat_h = shift_h.reshape(-1, self.d_hidden)
-            flat_labels = shift_labels.reshape(-1)
-            valid_mask = flat_labels != -100
-            safe_labels = flat_labels.masked_fill(~valid_mask, 0)
-            flat_lang_ids = language_ids[:, 1:].reshape(-1) if language_ids is not None else None
-            log_probs = self.decoder.hierarchical_log_prob(flat_h, safe_labels, language_ids=flat_lang_ids)
-            loss = -log_probs[valid_mask].mean() if valid_mask.any() else log_probs.sum() * 0.0
+            targets = labels[:, :seq_len].clone()
+            targets[:, :-1] = labels[:, 1:]
+            targets[:, -1] = -100
+            flat_targets = targets.reshape(-1)
+            valid_mask = flat_targets != -100
+            safe_labels = flat_targets.masked_fill(~valid_mask, 0)
+            logits_flat = _dec_out["logits"]
+            if self.head_ce == "topk" and "top_indices" in _dec_out:
+                cand = torch.cat([_dec_out["top_indices"], safe_labels.unsqueeze(-1)], dim=-1)
+                cand = cand.clamp(0, self.vocab_size - 1)
+                c_log = logits_flat.gather(-1, cand)
+                lse = torch.logsumexp(c_log, dim=-1)
+                per_pos = logits_flat.gather(-1, safe_labels.unsqueeze(-1)).squeeze(-1)
+                loss = -(per_pos - lse)[valid_mask].mean()
+            else:
+                log_probs = F.log_softmax(logits_flat, dim=-1)
+                per_pos = log_probs.gather(-1, safe_labels.unsqueeze(-1)).squeeze(-1)
+                loss = -per_pos[valid_mask].mean() if valid_mask.any() else per_pos.sum() * 0.0
 
             if aux_losses:
                 aux_total = self.loss_computer.total_loss(aux_losses)

@@ -126,7 +126,10 @@ Input → Tokenizer → Embedding → Memory → Intent → Workspace
 - **Aux Loss**: entity/relation prediction (predict masked entity)
 
 ### 12. HierarchicalSparseDecoder
-- Unchanged (3-level: Semantic → Language → Token, with adaptive top-k)
+- 3-level: Semantic → Language → Token, with adaptive top-k candidate selection
+- **Forward**: computes the full dense `vocab_size × d_hidden` projection (scoring pass); selects the top-k candidates per position using the difficulty-adaptive `top_indices`
+- **Training single-pass eval**: `DharaModel.forward` evaluates the decoder once per micro-batch; the LM loss reuses those logits and applies the causal shift (position t → label t+1) via a target mask. Previously the decoder stack + dense head was evaluated twice per micro-batch
+- **`head_ce` option** (`model.architecture.dhara_v3.head_ce`): `"dense"` (default) = standard full-vocab log-softmax CE. `"topk"` = candidate-set CE computed over the adaptive top-k token indices ∪ target, reducing the loss/backward target set. Honest caveat: the forward still performs the full dense projection; `topk` narrows the *loss* and its gradients. Does not change generation
 
 ## Training Objectives
 

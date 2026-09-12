@@ -51,6 +51,7 @@ model:
       max_events: 8
       adaptive_top_k_min: 32
       adaptive_top_k_max: 128
+      head_ce: topk
       qa_max_passes: 1
       qa_converge_threshold: 0.05
       max_refinement_passes: 1

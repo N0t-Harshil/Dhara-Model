@@ -62,7 +62,7 @@
 ## Testing Score: 4/10
 
 **Strengths:**
-- 26 test files exist in the `tests/` directory with a fully green suite of 287 tests
+- 26 test files exist in the `tests/` directory with a fully green suite of 292 tests
 - Test framework (pytest) is configured via `pytest.ini`
 - Test coverage for data pipeline components: `test_data_pipeline.py`, `test_data_collector.py`, `test_quality.py`
 - Foundation pipeline test (`test_foundation_pipeline.py`) covers the core data flow
@@ -74,6 +74,7 @@
 - `test_data_pipeline.py`
 - `test_evaluation.py`
 - `test_foundation_pipeline.py`
+- `test_head_ce.py`
 - `test_generation.py`
 - `test_integration.py`
 - `test_nslt.py`
@@ -144,7 +145,8 @@
 
 **Strengths:**
 - **O(1) memory architecture** — SSM compression in NSLT and HSSM in Dhara provide constant-memory context encoding regardless of sequence length
-- **Sparse output** — `SparseOutputSynthesizer` avoids materializing the full `[batch, seq_len, vocab_size]` logits tensor; training computes loss via sparse log-probabilities with O(top_k) complexity per position
+- **Sparse output** — `SparseOutputSynthesizer` uses top-k vocabulary projection for candidate selection; the forward pass still computes the full `[batch, seq_len, vocab_size]` projection, and the opt-in `head_ce: topk` narrows the loss/backward target set to the adaptive top-k indices union the target token
+- **Single-decoder evaluation** — `DharaModel.forward` evaluates the hierarchical decoder stack + vocab projection exactly once per micro-batch and reuses those logits for the LM loss (via a causal-shift target mask), roughly halving the dominant per-step cost; dense-mode loss math is unchanged
 - **Streaming dataset loading** — datasets are loaded in streaming mode, avoiding local storage bottlenecks
 - **Sequence packing** — packs multiple samples into single sequences to maximize GPU utilization; typical efficiency >95%
 - **Chunked logit computation** — during inference, logits are computed in chunks of 1024 to manage memory

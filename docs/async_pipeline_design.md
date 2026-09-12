@@ -95,6 +95,22 @@ cancelled or stale slot can never retire a producer permanently. On timeout
 `get()` cancels the slot *before* advancing `next_expected` so the event is
 always delivered to the owner.
 
+### Fork-Safety
+
+The prefetch engine is **thread-based**: producers are daemon threads inside
+the training process, and they hold internal locks while a unit build is in
+flight. Those live locks are why the **pretrain** stage forces
+`dataloader_num_workers=0` (`_build_trainer`, `src/training/pipeline.py`): a
+DataLoader worker *process* created via `fork` inherits the parent's locks as
+they were at fork time. If a prefetch/streaming thread held one of them then,
+the worker's very first batch fetch spins forever on a lock whose owner (a
+parent-process thread) no longer exists in the worker — every worker
+deadlocks and the main thread blocks on the worker queue (observed as a
+progress bar pinned at `0/50000` for hours). Pretrain therefore reads batches
+on the main thread; no worker process ever forks across prefetch-held locks.
+Anyone reintroducing process-based workers alongside async prefetch must avoid
+forking threads that hold locks (spawn context, or hand-off before fork).
+
 ---
 
 ## 3. Dataset-Granular Checkpoint & Resume Correctness
