@@ -200,6 +200,37 @@ class _LoggingDataCollator:
         return self.collator(features)
 
 
+class _TrainHeartbeatCallback(TrainerCallback):
+    """Turn a silent training stall into a visible one.
+
+    HF Trainer's progress bar is the only sign of life, and a stop before the
+    first step (e.g. the dataloader fork-deadlock) shows nothing at all. This
+    logs "step 0 ... awaiting first batch" the moment train() enters the loop,
+    then heartbeats every interval_steps so the log shows elapsed wall time
+    even when the tqdm output is buffered/captured.
+    """
+
+    def __init__(self, interval_steps: int = 100, total_steps: int = 0) -> None:
+        self.interval_steps = max(1, interval_steps)
+        self.total_steps = int(total_steps or 0)
+        self._t0 = 0.0
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        if not state.is_world_process_zero:
+            return
+        self._t0 = time.time()
+        logger.info("[TRAIN] step 0/%d — entering training loop, awaiting first batch...",
+                    self.total_steps)
+
+    def on_step_begin(self, args, state, control, **kwargs):
+        if not state.is_world_process_zero:
+            return
+        if state.global_step % self.interval_steps == 0:
+            logger.info("[TRAIN] step %d/%d heartbeat at %.1fs",
+                        state.global_step, self.total_steps,
+                        time.time() - self._t0)
+
+
 class TrainingPipeline:
     def __init__(self, cfg: Config, dist_setup: Optional[DistributedSetup] = None) -> None:
         self.cfg = cfg
@@ -1452,6 +1483,16 @@ class TrainingPipeline:
         optim_name = self._resolve_optimizer_name(stage_cfg, base_args, overrides)
 
         num_workers = dataloader_num_workers(dataset)
+        if stage_name == "pretrain":
+            # Forking DataLoader worker processes while the async prefetch /
+            # streaming threads are running is a fork()+threading.Lock deadlock:
+            # workers inherit locks held by those threads (which don't exist in
+            # the child), block forever on their very first fetch, and the
+            # trainer silently pins at step 0 (observed: 0/50000 for hours,
+            # main thread futex_wait_queue_me, workers born dead). Read
+            # pretrain batches on the main thread instead, at the cost of some
+            # prefetch head-room — correctness over peak throughput.
+            num_workers = 0
 
 
         # Update FSDP transformer layer for MoE models
@@ -1519,7 +1560,11 @@ class TrainingPipeline:
         )
 
         data_collator = _LoggingDataCollator(DefaultDataCollator())
-        callbacks = [_LoggingCallback(), _NaNSafeCallback(check_every=100)]
+        callbacks = [
+            _LoggingCallback(),
+            _NaNSafeCallback(check_every=100),
+            _TrainHeartbeatCallback(interval_steps=100, total_steps=max_steps or 0),
+        ]
 
         # transformers >= 5.0 removed the `tokenizer` kwarg from
         # Trainer.__init__ in favor of `processing_class`.

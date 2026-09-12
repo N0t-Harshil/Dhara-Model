@@ -440,6 +440,29 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _install_stack_dump_handler() -> None:
+    """Allow a same-owner ``kill -USR1 <pid>`` to dump every thread's Python
+    stack to stderr (the log file) without admin/ptrace rights.
+
+    With faulthandler registered, the SIGUSR1 signal prints each thread's
+    Python stack and the process keeps running — the primary diagnostic for a
+    silent training stall such as the fork()+threading.Lock dataloader
+    deadlock (trainer pinned at step 0 with workers futex-waiting forever).
+    """
+    try:
+        import faulthandler
+        import signal as _signal
+
+        usr1 = getattr(_signal, "SIGUSR1", None)
+        if usr1 is None:
+            logger.info("SIGUSR1 not available on this platform — skipping stack-dump handler")
+            return
+        faulthandler.register(usr1, file=sys.stderr, all_threads=True)
+        logger.info("Stack-dump handler installed: kill -USR1 %d dumps all thread stacks", os.getpid())
+    except Exception as e:  # noqa: BLE001 — best-effort diagnostics
+        logger.warning("Could not install SIGUSR1 stack-dump handler: %s", e)
+
+
 def _setup_signal_handlers() -> None:
     """Install cooperative SIGINT/SIGTERM shutdown.
 
@@ -450,6 +473,7 @@ def _setup_signal_handlers() -> None:
     poll SHUTDOWN.requested().
     """
     SHUTDOWN.install()
+    _install_stack_dump_handler()
 
 
 def main() -> None:
