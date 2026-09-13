@@ -276,6 +276,7 @@ class ModelFactory:
                 loss_weights=getattr(v3, "loss_weights", None),
                 head_ce=v3.head_ce,
                 enable_executive=v3.enable_executive,
+                executive_rl=getattr(v3, "executive_rl", False),
                 enable_world_model=v3.enable_world_model,
                 enable_tools=v3.enable_tools,
                 enable_curiosity=v3.enable_curiosity,
@@ -654,6 +655,7 @@ class ModelFactory:
                     enable_curiosity=getattr(v3, "enable_curiosity", True),
                     loss_weights=getattr(v3, "loss_weights", None),
                     executive_gate_threshold=getattr(v3, "executive_gate_threshold", 0.3),
+                    executive_rl=getattr(v3, "executive_rl", False),
                     qa_max_passes=getattr(v3, "qa_max_passes", 5),
                 )
             setattr(model_config, _DTYPE_CONFIG_ATTR, ModelFactory._resolve_dtype(cfg.model.dtype))

@@ -71,6 +71,7 @@ class DharaConfig(PretrainedConfig):
         max_events: int = 32,
         n_tool_types: int = 4,
         enable_executive: bool = True,
+        executive_rl: bool = False,
         enable_world_model: bool = True,
         enable_tools: bool = True,
         enable_curiosity: bool = True,
@@ -122,6 +123,7 @@ class DharaConfig(PretrainedConfig):
         self.max_events = max_events
         self.n_tool_types = n_tool_types
         self.enable_executive = enable_executive
+        self.executive_rl = executive_rl
         self.enable_world_model = enable_world_model
         self.enable_tools = enable_tools
         self.enable_curiosity = enable_curiosity
@@ -157,6 +159,7 @@ class DharaModel(PreTrainedModel):
         self.d_hidden = c.d_hidden
         self.max_seq_len = c.max_position_embeddings
         self.enable_executive = c.enable_executive
+        self.executive_rl = getattr(c, "executive_rl", False)
         self.enable_world_model = c.enable_world_model
         self.enable_tools = c.enable_tools
         self.enable_aux_losses = c.enable_aux_losses
@@ -416,6 +419,9 @@ class DharaModel(PreTrainedModel):
             if aux_losses:
                 aux_total = self.loss_computer.total_loss(aux_losses)
                 loss = loss + aux_total
+
+            if self.training and self.executive_rl and exec_decision is not None:
+                self.executive.update_from_step(loss, exec_decision.get("gates"))
 
             return CausalLMOutputWithPast(
                 loss=loss,

@@ -80,6 +80,33 @@ def _telemetry_stage_tags(stage_index: int, unit_index: int, n_units: int,
     }
 
 
+def _install_continuous_scheduler(trainer):
+    """Stage transitions call Trainer.train() again, which rebuilds the LR
+    scheduler from scratch inside create_optimizer_and_scheduler (the optimizer
+    object is reused, but the schedule cold-restarts at base_lr+warmup -> a
+    violent loss spike at every stage boundary). Seed each newly-created
+    scheduler with the previous stage's last LR and global step so cosine
+    annealing continues smoothly instead of restarting. First stage / no prior
+    schedule is left untouched; checkpoint resume then overrides anyway.
+    """
+    state = {"prev_lr": None, "prev_step": None}
+    orig = trainer.create_optimizer_and_scheduler
+
+    def seeded_create(self, *args, **kwargs):
+        old_sched = getattr(trainer, "lr_scheduler", None)
+        if old_sched is not None and old_sched.get_last_lr():
+            state["prev_lr"] = float(old_sched.get_last_lr()[0])
+            state["prev_step"] = int(getattr(trainer.state, "global_step", 0))
+        orig(*args, **kwargs)
+        new_sched = getattr(trainer, "lr_scheduler", None)
+        if new_sched is not None and state["prev_lr"] is not None:
+            new_sched.last_epoch = state["prev_step"]
+            new_sched.base_lrs = [state["prev_lr"]]
+
+    trainer.create_optimizer_and_scheduler = MethodType(seeded_create, trainer)
+    return trainer
+
+
 class _FailureJournal:
     """Per-run failure journal. Identical fingerprint on the next launch causes
     the same units to be skipped (deterministic resume) instead of
@@ -1615,7 +1642,7 @@ class TrainingPipeline:
         # Trainer.__init__ in favor of `processing_class`.
         tokenizer_kwarg = trainer_tokenizer_kwarg()
 
-        return self._install_nan_loss_guard(
+        trainer = self._install_nan_loss_guard(
             Trainer(
                 model=self.model,
                 args=training_args,
@@ -1626,6 +1653,8 @@ class TrainingPipeline:
                 **{tokenizer_kwarg: self.tokenizer},
             )
         )
+        _install_continuous_scheduler(trainer)
+        return trainer
 
     def _resolve_optimizer_name(
         self,

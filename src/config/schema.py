@@ -107,6 +107,7 @@ class DharaConfig(BaseModel):
     max_events: int = Field(default=32, ge=1)
     n_tool_types: int = Field(default=4, ge=1)
     enable_executive: bool = True
+    executive_rl: bool = False
     enable_world_model: bool = True
     enable_learning_controller: bool = True
     enable_tools: bool = True

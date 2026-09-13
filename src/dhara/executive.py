@@ -39,9 +39,13 @@ class ModulePerformanceTracker(nn.Module):
     def forward(self, h: torch.Tensor, current_loss: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         perf_pred = self.performance_predictor(h)
         if current_loss is not None:
+            if current_loss.dim() == 0:
+                loss_col = current_loss.detach().reshape(1, 1).expand(perf_pred.shape[0], 1)
+            else:
+                loss_col = current_loss.detach().view(-1, 1)
             lr_input = torch.cat([
                 F.normalize(perf_pred, dim=-1),
-                current_loss.detach().unsqueeze(-1).expand(-1, self.n_modules),
+                loss_col.expand(-1, self.n_modules),
             ], dim=-1)
             lr_adjust = self.lr_adjuster(lr_input)
             val = (self.module_lr * lr_adjust.mean(dim=0)).clamp(0.1, 3.0)
@@ -136,6 +140,27 @@ class ExecutiveController(nn.Module):
         self.module_importance = nn.Parameter(torch.ones(n_modules) / n_modules)
         self.reward_buffer: List[float] = []
         self._log_prob_buffer: List[torch.Tensor] = []  # for REINFORCE
+        self._last_h: Optional[torch.Tensor] = None
+
+    def update_from_step(self, task_loss: torch.Tensor, gates: Optional[Dict[str, torch.Tensor]] = None) -> None:
+        """Post-step learning hook for trainer calls (previous behavior left the
+        reward buffer perpetually empty because forward() was only ever called
+        without task_loss). Feeds the latest scalar loss into the performance
+        tracker and, every 50 steps, applies the REINFORCE update to
+        module_importance. All mutations run on detached values, so the outer
+        backward pass is unaffected.
+        """
+        if task_loss is None or not torch.isfinite(task_loss):
+            return
+        if self._last_h is not None:
+            self.tracker(self._last_h, task_loss.detach())
+        effective_gates = gates if gates is not None else {}
+        reward = self.compute_reward(task_loss, effective_gates)
+        self.reward_buffer.append(reward.mean().item())
+        if len(self.reward_buffer) > 100:
+            self.reward_buffer.pop(0)
+        if len(self.reward_buffer) >= 50:
+            self._reinforce_update()
 
     def compute_reward(
         self,
@@ -248,6 +273,7 @@ class ExecutiveController(nn.Module):
             state = self.state_encoder(torch.cat([pooled, intent_padded], dim=-1))
 
         h = self.norm(state)
+        self._last_h = h
         gates: Dict[str, torch.Tensor] = {}
         for name in MODULE_NAMES:
             gate_net = getattr(self, f"{name}_gate")
