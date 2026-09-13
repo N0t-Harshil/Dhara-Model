@@ -79,7 +79,7 @@
 - **Hardware target:** 4× A100 80GB (320 GB pooled VRAM)
 - **Config:** Pydantic v2 `BaseModel` in `src/config/schema.py`
 - **CLI:** `argparse` in `main.py`, 8 subcommands
-- **Tests:** pytest, 109 tests, all pass
+- **Tests:** pytest, 292 tests across 26 files, all pass
 
 ---
 
