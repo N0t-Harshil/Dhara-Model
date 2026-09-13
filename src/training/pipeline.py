@@ -11,6 +11,7 @@ import shutil
 import threading
 import time
 from pathlib import Path
+from types import MethodType
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -1459,6 +1460,50 @@ class TrainingPipeline:
         logger.info("[TIMER] stage %d metadata resolution: %.1fs (%d/%d resolved)",
                     stage_idx, time.perf_counter() - t0, ok, len(missing))
 
+    def _install_nan_loss_guard(self, trainer, max_consecutive_skips: int = 32):
+        """Substitute a zero loss for non-finite losses so the offending
+        micro-batch is skipped without corrupting weights. bf16 has no
+        GradScaler skip, so a NaN loss propagates into the optimizer step and
+        infects the weights; catching the loss up front means valid micro-batches
+        in the same accumulation window still apply their gradients. Aborts only
+        if the model is hopelessly corrupt (too many skips in a row).
+        """
+        orig = trainer.compute_loss
+        stats = {"consecutive": 0, "total_skipped": 0}
+
+        def guarded_compute_loss(model, inputs, *args, **kwargs):
+            return_outputs = kwargs.get("return_outputs", False)
+            out = orig(model, inputs, *args, **kwargs)
+            if return_outputs:
+                loss = out[0] if isinstance(out, tuple) else getattr(out, "loss", None)
+            else:
+                loss = out
+            if loss is not None and not torch.isfinite(loss).all():
+                stats["consecutive"] += 1
+                stats["total_skipped"] += 1
+                logger.warning(
+                    "[NAN] non-finite loss on micro-batch — skipping (consecutive=%d, total=%d)",
+                    stats["consecutive"], stats["total_skipped"],
+                )
+                if stats["consecutive"] >= max_consecutive_skips:
+                    raise RuntimeError(
+                        f"{stats['consecutive']} consecutive non-finite losses — aborting"
+                    )
+                zero = torch.tensor(
+                    0.0, dtype=loss.dtype, device=loss.device, requires_grad=True
+                )
+                if return_outputs:
+                    if isinstance(out, tuple):
+                        return (zero, out[1])
+                    out.loss = zero
+                    return out
+                return zero
+            stats["consecutive"] = 0
+            return out
+
+        trainer.compute_loss = MethodType(guarded_compute_loss, trainer)
+        return trainer
+
     def _build_trainer(
         self,
         dataset: Dataset,
@@ -1570,14 +1615,16 @@ class TrainingPipeline:
         # Trainer.__init__ in favor of `processing_class`.
         tokenizer_kwarg = trainer_tokenizer_kwarg()
 
-        return Trainer(
-            model=self.model,
-            args=training_args,
-            train_dataset=train_dataset_for_trainer,
-            eval_dataset=eval_dataset,
-            data_collator=data_collator,
-            callbacks=callbacks,
-            **{tokenizer_kwarg: self.tokenizer},
+        return self._install_nan_loss_guard(
+            Trainer(
+                model=self.model,
+                args=training_args,
+                train_dataset=train_dataset_for_trainer,
+                eval_dataset=eval_dataset,
+                data_collator=data_collator,
+                callbacks=callbacks,
+                **{tokenizer_kwarg: self.tokenizer},
+            )
         )
 
     def _resolve_optimizer_name(
