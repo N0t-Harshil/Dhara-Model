@@ -116,7 +116,7 @@ def decoder_loss(decoder_logits: torch.Tensor,
                  decoder_targets: Optional[torch.Tensor],
                  weight: float = 0.01) -> torch.Tensor:
     if decoder_targets is not None:
-        flat_logits = decoder_logits.view(-1, decoder_logits.size(-1))
+        flat_logits = decoder_logits.view(-1, decoder_logits.size(-1)).float()
         flat_targets = decoder_targets.reshape(-1)
         valid = flat_targets != -100
         if valid.any():
@@ -160,12 +160,16 @@ class AuxiliaryLossComputer(nn.Module):
 
         if "memory" in module_outputs:
             mem = module_outputs["memory"]
-            mem_out = mem.get("state", mem) if isinstance(mem, dict) else mem
-            recon = mem.get("reconstruction", mem_out) if isinstance(mem, dict) else mem_out
-            losses["memory"] = memory_reconstruction_loss(
-                mem_out, recon,
-                weight=self.weights.get("memory", 0.01),
-            )
+            mem_ls = mem.get("loss") if isinstance(mem, dict) else None
+            if isinstance(mem_ls, torch.Tensor) and mem_ls.dim() == 0:
+                losses["memory"] = self.weights.get("memory", 0.01) * mem_ls
+            else:
+                mem_out = mem.get("state", mem) if isinstance(mem, dict) else mem
+                recon = mem.get("reconstruction", mem_out) if isinstance(mem, dict) else mem_out
+                losses["memory"] = memory_reconstruction_loss(
+                    mem_out, recon,
+                    weight=self.weights.get("memory", 0.01),
+                )
 
         if "planning" in module_outputs:
             plan = module_outputs["planning"]

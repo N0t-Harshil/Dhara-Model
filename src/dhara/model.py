@@ -397,7 +397,10 @@ class DharaModel(PreTrainedModel):
             flat_targets = targets.reshape(-1)
             valid_mask = flat_targets != -100
             safe_labels = flat_targets.masked_fill(~valid_mask, 0)
-            logits_flat = _dec_out["logits"]
+            # Compute CE in fp32: the bf16 subgraph's only true risk is the
+            # loss-reduction (log_softmax/logsumexp/cumulative sums over the
+            # full sequence normalize in bf16 only).
+            logits_flat = _dec_out["logits"].float()
             if self.head_ce == "topk" and "top_indices" in _dec_out:
                 cand = torch.cat([_dec_out["top_indices"], safe_labels.unsqueeze(-1)], dim=-1)
                 cand = cand.clamp(0, self.vocab_size - 1)

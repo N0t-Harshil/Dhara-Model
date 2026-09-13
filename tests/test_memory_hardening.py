@@ -53,7 +53,10 @@ def test_finite_pending_is_applied():
     p = _pending()
     m.apply_updates(p)
     assert int(m.mem_age.sum().item()) == m.mem_age.numel()
-    assert torch.allclose(m.episodic.episode_buffer, p["pending"]["decayed"])
+    # decayed bases the whole bank first, then compressed lands in the newest
+    # slot (ordering fix: previously copy_(decayed) clobbered the stored entry).
+    assert torch.allclose(m.episodic.episode_buffer[0, 0], p["pending"]["compressed"].squeeze(0))
+    assert torch.allclose(m.episodic.episode_buffer[0, 1:], p["pending"]["decayed"][0, 1:])
     assert torch.allclose(m.mem_priority, p["pending"]["priority"])
 
 
@@ -66,3 +69,25 @@ def test_nan_fragment_skipped_but_finite_fragments_applied():
     assert torch.allclose(m.mem_priority, p["pending"]["priority"])
     assert torch.allclose(m.episodic.episode_buffer[0, 0], p["pending"]["compressed"].squeeze(0))
     assert torch.all(m.episodic.episode_buffer[0, 1:] == 0)
+
+
+def test_memory_aux_uses_real_compression_loss():
+    from src.dhara.losses import AuxiliaryLossComputer
+
+    comp = AuxiliaryLossComputer()
+    weight = comp.weights["memory"]
+    scalar = torch.tensor(0.35)
+    module_outputs = {"memory": {"state": torch.zeros(2, 4, 8), "reconstruction": torch.zeros(2, 4, 8),
+                                 "loss": scalar}}
+    losses = comp(module_outputs, None)
+    assert torch.allclose(losses["memory"], weight * scalar)
+
+
+def test_memory_aux_falls_back_when_no_loss_field():
+    from src.dhara.losses import AuxiliaryLossComputer
+
+    comp = AuxiliaryLossComputer()
+    module_outputs = {"memory": {"state": torch.randn(2, 4, 8), "reconstruction": torch.randn(2, 4, 8)}}
+    losses = comp(module_outputs, None)
+    assert torch.isfinite(losses["memory"])
+    assert losses["memory"].item() >= 0.0

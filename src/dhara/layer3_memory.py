@@ -216,10 +216,10 @@ class MemoryManager(nn.Module):
         if priority is not None:
             if not torch.isfinite(priority).all():
                 priority = None
-        if compressed is not None:
-            self.episodic._apply_store(compressed)
         if decayed is not None:
             self.episodic.episode_buffer.data.copy_(decayed)
+        if compressed is not None:
+            self.episodic._apply_store(compressed)
         if priority is not None:
             self.mem_priority.data.copy_(priority)
         if compressed is not None or decayed is not None or priority is not None:
