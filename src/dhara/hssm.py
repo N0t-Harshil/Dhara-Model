@@ -39,6 +39,18 @@ class HierarchicalSSM(nn.Module):
         B_stacked = torch.stack([proj(x_in) for proj in self.B_proj], dim=0)
         C_stacked = torch.stack([proj(x_in) for proj in self.C_proj], dim=0)
 
+        # Run the recurrent scan in fp32. bf16's small dynamic range and 3-bit
+        # mantissa overflow to inf when the exp decay terms reach the clamp
+        # floor (exp(+80) ~ 5.5e34 already near the bf16 limit and multiplied
+        # again by bb before the cumsum), and 0*inf on the exp_pos factor then
+        # poisons every downstream loss (memory reconstruction CE, intent, ...).
+        state_dtype = h_init.dtype
+        A_stacked = A_stacked.to(torch.float32)
+        B_stacked = B_stacked.to(torch.float32)
+        C_stacked = C_stacked.to(torch.float32)
+        dt = dt.to(torch.float32)
+        h_init = h_init.to(torch.float32)
+
         delta_exp = dt.unsqueeze(0)
         A_bar = torch.exp(delta_exp * A_stacked.unsqueeze(1).unsqueeze(1))
         B_bar = (A_bar - 1.0) / (A_stacked.unsqueeze(1).unsqueeze(1) + 1e-8)
@@ -46,7 +58,9 @@ class HierarchicalSSM(nn.Module):
 
         log_A = delta_exp * A_stacked.unsqueeze(1).unsqueeze(1)
         log_prefix = torch.cumsum(log_A, dim=2)
-        log_prefix = log_prefix.clamp(min=-80.0)
+        # Floor at -30 (exp(30) ~ 1.1e13, safe even in bf16): decay past
+        # e^{-30} is numerically irrelevant and exp(-log_prefix) stays bounded.
+        log_prefix = log_prefix.clamp(min=-30.0)
         exp_pos = torch.exp(log_prefix)
         exp_neg = torch.exp(-log_prefix)
         h_init_lvl = h_init.transpose(0, 1).contiguous().unsqueeze(2)
@@ -54,9 +68,9 @@ class HierarchicalSSM(nn.Module):
         cumulative = torch.cumsum(scaled_bb, dim=2)
         h_lvl_out = exp_pos * (h_init_lvl + cumulative)
 
-        h = h_lvl_out[:, :, -1, :].transpose(0, 1)
+        h = h_lvl_out[:, :, -1, :].transpose(0, 1).to(state_dtype)
         y = torch.einsum("lbtk,lbtk->lbt", C_stacked, h_lvl_out).unsqueeze(-1)
-        y = y.sum(dim=0)
+        y = y.sum(dim=0).to(x_in.dtype)
         y = y * F.silu(x_gate)
         y = self.out_proj(y)
         return residual + y, h
