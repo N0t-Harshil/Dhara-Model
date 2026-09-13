@@ -200,13 +200,30 @@ class MemoryManager(nn.Module):
         if mem_state is None:
             return
         pending = mem_state.get("pending", {})
-        if pending.get("compressed") is not None:
-            self.episodic._apply_store(pending["compressed"])
-        if pending.get("decayed") is not None:
-            self.episodic.episode_buffer.data.copy_(pending["decayed"])
-        if pending.get("priority") is not None:
-            self.mem_priority.data.copy_(pending["priority"])
-        self.mem_age.data.add_(1)
+        compressed = pending.get("compressed")
+        decayed = pending.get("decayed")
+        priority = pending.get("priority")
+        # Reject non-finite writes: a NaN pending entry (e.g. from a numerically
+        # unstable hidden state) would otherwise permanently poison the episodic
+        # bank, mem_age and the persisted checkpoint state. This path only runs
+        # with a user-supplied mem_state (generation/eval), never in pretraining.
+        if compressed is not None:
+            if not torch.isfinite(compressed).all():
+                compressed = None
+        if decayed is not None:
+            if not torch.isfinite(decayed).all():
+                decayed = None
+        if priority is not None:
+            if not torch.isfinite(priority).all():
+                priority = None
+        if compressed is not None:
+            self.episodic._apply_store(compressed)
+        if decayed is not None:
+            self.episodic.episode_buffer.data.copy_(decayed)
+        if priority is not None:
+            self.mem_priority.data.copy_(priority)
+        if compressed is not None or decayed is not None or priority is not None:
+            self.mem_age.data.add_(1)
 
     def forward(self, x: torch.Tensor, mem_state: dict = None) -> tuple:
         if mem_state is None:
