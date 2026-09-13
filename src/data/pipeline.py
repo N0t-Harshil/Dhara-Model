@@ -1964,7 +1964,7 @@ class DataPipeline:
         include: Optional[List[Tuple[str, Optional[str]]]] = None,
         cancel_event=None,
     ) -> Dataset:
-        registry = build_registry()
+        registry = build_registry(exclude=getattr(self.cfg.data, "registry_exclude", None))
         all_infos = registry.all_entries()
         if include:
             include_set = {(p, n or "") for p, n in include}

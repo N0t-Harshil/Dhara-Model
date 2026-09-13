@@ -86,17 +86,29 @@ class DatasetInfo:
 
 
 class DatasetRegistry:
-    def __init__(self) -> None:
+    def __init__(self, exclude: Optional[List[str]] = None) -> None:
         self._entries: Dict[str, DatasetInfo] = {}
         self._fallback_entries: Dict[str, DatasetInfo] = {}
         self._used_fallbacks: Dict[str, str] = {}
         self._counter: int = 0
+        # Dataset path prefixes to drop from the registry entirely (primary
+        # AND fallback). Used e.g. to blacklist the-stack-v2-dedup, whose
+        # rows carry metadata but no `content` column.
+        self._exclude: List[str] = list(exclude or [])
+
+    def _is_excluded(self, path: str) -> bool:
+        return any(path.startswith(p) for p in self._exclude)
 
     def register(self, info: DatasetInfo, fallback_only: bool = False) -> None:
         """Add a dataset entry. With fallback_only=True the entry is only
         resolvable as a fallback chain member (never streamed as a primary
         dataset by all_entries()/by_category()) — used for the fallback
         datasets referenced by primary entries."""
+        if self._is_excluded(info.path):
+            logger.info("Registry exclude %r — skipping %s entry %r",
+                        self._exclude, "fallback-only" if fallback_only else "primary",
+                        f"{info.path}/{info.name or 'default'}")
+            return
         key = f"{info.path}/{info.name or 'default'}/{info.category}/{self._counter}"
         if fallback_only:
             self._fallback_entries[key] = info
@@ -426,8 +438,10 @@ def _register_structured(registry: DatasetRegistry) -> float:
 
 # ── Registry builder ──────────────────────────────────────────────
 
-def build_registry() -> DatasetRegistry:
-    registry = DatasetRegistry()
+def build_registry(exclude: Optional[List[str]] = None) -> DatasetRegistry:
+    if exclude:
+        logger.info("Building registry with excluded paths: %s", exclude)
+    registry = DatasetRegistry(exclude=exclude)
 
     total = 0.0
 

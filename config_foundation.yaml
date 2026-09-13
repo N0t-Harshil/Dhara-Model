@@ -206,6 +206,15 @@ data:
   # settings, so any config change rebuilds automatically.
   use_packed_cache: true
 
+  # bigcode/the-stack-v2-dedup rows are metadata-only (blob_id, content_id,
+  # filename, ...) — the code body lives in the companion gated
+  # the-stack-v2-content store. There is no usable text field, so every
+  # sample is rejected. Exclude it from the staged registry and let the other
+  # code corpora (opc, code-search-net, codeparrot-clean, code-contests)
+  # carry the code stage instead.
+  registry_exclude:
+    - "bigcode/the-stack-v2-dedup"
+
   # ====================================================================
   # Preprocessing
   # ====================================================================

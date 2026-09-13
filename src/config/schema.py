@@ -596,6 +596,10 @@ class DataConfig(BaseModel):
     hf_token: Optional[str] = None
     use_registry: bool = True
     max_samples_per_dataset: Optional[int] = None
+    # Dataset path prefixes excluded entirely from the registry (primary and
+    # fallback). E.g. ["bigcode/the-stack-v2-dedup"] drops a metadata-only
+    # corpus that has no usable text field.
+    registry_exclude: Optional[List[str]] = None
     use_packed_cache: bool = True
     dataset_policies: List[DatasetPolicyConfig] = Field(default_factory=list)
     shard_workers: int = 8

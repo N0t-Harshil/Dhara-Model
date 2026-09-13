@@ -833,7 +833,7 @@ class TrainingPipeline:
 
             if getattr(staging, "mode", "dataset") == "dataset":
                 prev_end = end_step - s.steps
-                registry = build_registry()
+                registry = build_registry(exclude=getattr(self.cfg.data, "registry_exclude", None))
                 units = registry.all_entries()
                 if s.categories:
                     units = [u for u in units if u.category in s.categories]

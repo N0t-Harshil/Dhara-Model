@@ -267,6 +267,24 @@ class TestRegistryFallbackOnly:
         assert "allenai/dolma" not in streamed
         assert "b-mc2/sql-create-context" not in streamed
 
+    def test_registry_exclude_drops_path_prefixes(self):
+        from src.data.registry import build_registry
+
+        registry = build_registry(exclude=["bigcode/the-stack-v2-dedup"])
+        paths = [e.path for e in registry.all_entries()]
+        assert not any(p.startswith("bigcode/the-stack-v2-dedup") for p in paths)
+        assert "OpenCoder-LLM/opc-fineweb-code-corpus" in paths
+        assert "code-search-net/code_search_net" in paths
+        assert "codeparrot/codeparrot-clean" in paths
+        assert "deepmind/code_contests" in paths
+        assert registry.get_by_path_category("bigcode/the-stack-v2-dedup", "code") is None
+
+    def test_registry_exclude_empty_is_noop(self):
+        from src.data.registry import build_registry
+
+        assert build_registry(exclude=None).summary()["total_registered"] == \
+            build_registry().summary()["total_registered"]
+
 
 class _FakeStreamer:
     """Iterable stand-in for ShardedStreamIterator with the ``.stats`` surface
