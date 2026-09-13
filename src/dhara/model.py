@@ -365,6 +365,9 @@ class DharaModel(PreTrainedModel):
             _dec_out = self.decoder(flat_h, language_ids=lang_shift.reshape(-1))
         else:
             _dec_out = self.decoder(flat_h)
+        _dec_out["logits"] = torch.nan_to_num(
+            _dec_out["logits"], nan=0.0, posinf=50.0, neginf=-50.0
+        )
         _vocab_logits = _dec_out["logits"].view(batch, seq_len, self.vocab_size)
 
         module_outputs = {
