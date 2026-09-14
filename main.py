@@ -32,17 +32,22 @@ _skip_gpu_init = _top_cmd == "reserved-training"
 
 
 def _resolve_gpu() -> str | None:
-    """Parse --gpu from CLI, or auto-detect best GPU, return device index string."""
-    existing = os.environ.get("CUDA_VISIBLE_DEVICES")
-    if existing:
-        return None
-    if os.environ.get("LOCAL_RANK"):
-        return None
+    """Parse --gpu from CLI, or auto-detect best GPU, return device index string.
+
+    An explicit --gpu always overrides a pre-existing CUDA_VISIBLE_DEVICES so a
+    multi-GPU host (container images commonly pre-set the var to every GPU)
+    can't silently redirect the run onto different hardware than requested.
+    """
     early = argparse.ArgumentParser(add_help=False)
     early.add_argument("--gpu", type=str, default=None)
+    if os.environ.get("LOCAL_RANK"):
+        return None
     known, _ = early.parse_known_args()
     if known.gpu is not None:
         return str(known.gpu)
+    existing = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if existing:
+        return None
     try:
         out = subprocess.check_output(
             ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
@@ -59,18 +64,16 @@ def _resolve_gpu() -> str | None:
 if not _skip_gpu_init:
     _gpu_selected = _resolve_gpu()
     if _gpu_selected is not None:
-        cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "")
-        if not cvd:
-            os.environ["CUDA_VISIBLE_DEVICES"] = _gpu_selected
-            try:
-                out = subprocess.check_output(
-                    ["nvidia-smi", f"--id={_gpu_selected}", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
-                    encoding="utf-8",
-                )
-                free_mb = out.strip()
-                print(f"[*] Single-GPU: physical GPU {_gpu_selected} ({free_mb}MB free)")
-            except Exception:
-                print(f"[*] Single-GPU: CUDA_VISIBLE_DEVICES={_gpu_selected}")
+        os.environ["CUDA_VISIBLE_DEVICES"] = _gpu_selected
+        try:
+            out = subprocess.check_output(
+                ["nvidia-smi", f"--id={_gpu_selected}", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+                encoding="utf-8",
+            )
+            free_mb = out.strip()
+            print(f"[*] Single-GPU: physical GPU {_gpu_selected} ({free_mb}MB free)")
+        except Exception:
+            print(f"[*] Single-GPU: CUDA_VISIBLE_DEVICES={_gpu_selected}")
 
 import yaml
 import torch
