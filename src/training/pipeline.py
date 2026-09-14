@@ -154,6 +154,10 @@ class _FailureJournal:
 class _LoggingCallback(TrainerCallback):
     def __init__(self):
         self._step_start = 0.0
+        self._model = None
+
+    def set_model(self, model):
+        self._model = model
 
     def on_step_begin(self, args, state, control, **kwargs):
         if state.is_world_process_zero:
@@ -168,14 +172,54 @@ class _LoggingCallback(TrainerCallback):
             lr_val = float(lr) if lr is not None and lr != "N/A" else 0.0
             elapsed = time.time() - self._step_start if self._step_start else 0.0
             logger.info("Step %d | loss=%.4f | lr=%.2e | it/s=%.2f", step, loss_val, lr_val, 1.0 / max(elapsed, 1e-8))
+            self._log_instrumentation(step)
+
+    def _log_instrumentation(self, step):
+        """Append the model's latest auxiliary losses, executive gates and
+        logits/vocab stats to the step log so subsystem learning and head
+        health are observable without separate eval infrastructure."""
+        model = self._model
+        if model is None:
+            return
+        try:
+            aux = getattr(model, "_last_aux_losses", None)
+            exec_meta = getattr(model, "_last_exec_meta", None)
+            lstats = getattr(model, "_last_logits_stats", None)
+            parts = []
+            if aux:
+                parts.append("aux={" + ", ".join(f"{k}={v:.4f}" for k, v in sorted(aux.items())) + "}")
+            if exec_meta:
+                gm = exec_meta.get("gates") or {}
+                parts.append("gates={" + ", ".join(f"{k}={v:.3f}" for k, v in sorted(gm.items())) + "}")
+                if exec_meta.get("confidence") is not None:
+                    parts.append(f"conf={exec_meta['confidence']:.4f}")
+                if exec_meta.get("reward") is not None:
+                    parts.append(f"rew={exec_meta['reward']:.4f}")
+            if lstats:
+                _extra = ""
+                if "label_max" in lstats:
+                    _extra = f" lmax={lstats['label_max']} oov={lstats['label_oov_frac']:.4f} tgt={lstats['target_logit_mean']:.4f}"
+                parts.append(
+                    f"lstats(v={lstats['vocab']} mae={lstats['logit_mean_abs']:.4f} "
+                    f"max={lstats['logit_max']:.4f} clip={lstats['clip50_frac']:.6f}{_extra})"
+                )
+            if parts:
+                logger.info("  %s", " | ".join(parts))
+        except Exception:
+            pass
 
 
 class _NaNSafeCallback(TrainerCallback):
     def __init__(self, check_every: int = 100) -> None:
         self.check_every = max(1, check_every)
         self._last_check = -1
+        self._model = None
+
+    def set_model(self, model):
+        self._model = model
 
     def on_step_end(self, args, state, control, model=None, **kwargs):
+        model = self._model if self._model is not None else model
         if model is None or not state.is_world_process_zero:
             return
         if state.global_step - self._last_check < self.check_every:
@@ -262,6 +306,109 @@ class _PretrainAuxCollator:
             difficulty = torch.tensor([_difficulty_bucket(q) for q in quals], dtype=torch.long)
             batch["aux_targets"] = {"intent": {"task_type": task_type, "difficulty": difficulty}}
         return batch
+
+
+class _RunHealthCallback(TrainerCallback):
+    """Periodic run-health probes: held-out perplexity over a prefix stashed
+    from the first training batch, plus a free-form generation sample. Every
+    failure degrades to a warning so diagnostics can never kill training."""
+
+    def __init__(self, tokenizer, eval_every: int = 500, n_ctx: int = 128,
+                 n_window: int = 384, n_gen: int = 64) -> None:
+        self.tokenizer = tokenizer
+        self.eval_every = max(1, eval_every)
+        self.n_ctx = n_ctx           # context tokens fed before the label window
+        self.n_window = n_window     # total tokens fed to the model (ctx + held-out)
+        self.n_gen = n_gen
+        self._model = None
+
+    def set_model(self, model):
+        self._model = model
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        # Re-stash under a fresh key each run so a resume picks up a fresh batch.
+        model = self._model
+        if model is not None:
+            try:
+                setattr(model, "_run_health_stash", None)
+            except Exception:
+                pass
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if not state.is_world_process_zero:
+            return
+        step = state.global_step
+        if step == 0 or step % self.eval_every != 0:
+            return
+        model = self._model
+        if model is None:
+            return
+        self._eval_heldout_ppl(model, step)
+        self._eval_sample(model, step)
+
+    def _stash(self, model):
+        stash = getattr(model, "_run_health_stash", None)
+        if not isinstance(stash, dict) or "input_ids" not in stash:
+            return None
+        if stash["input_ids"].numel() < self.n_window:
+            return None
+        return stash
+
+    def _eval_heldout_ppl(self, model, step):
+        stash = self._stash(model)
+        if stash is None:
+            logger.warning("[HEALTH] no stashed batch for ppl eval — skipping")
+            return
+        try:
+            device = next(model.parameters()).device
+            ids = stash["input_ids"][:1, : self.n_window].to(device)
+            lang = stash.get("language_ids")
+            if lang is None:
+                lang = stash.get("languages")
+            lang_slice = lang[:1, : self.n_window].to(device) if lang is not None else None
+            labels = ids.clone()
+            labels[:, : self.n_ctx] = -100
+            was_training = model.training
+            model.eval()
+            with torch.no_grad():
+                out = model(ids, labels=labels, language_ids=lang_slice)
+            ce = float(out.loss.detach().float())
+            n_tokens = int((labels != -100).sum().item())
+            ppl = math.exp(min(ce, 80)) if ce < 80 else float("inf")
+            logger.info("  [HEALTH] step=%d held-out ppl=%.3f ce=%.4f tokens=%d",
+                        step, ppl, ce, n_tokens)
+            if was_training:
+                model.train()
+        except Exception as e:
+            logger.warning("[HEALTH] held-out ppl failed at step %d: %s", step, e)
+
+    def _eval_sample(self, model, step):
+        stash = self._stash(model)
+        if stash is None:
+            logger.warning("[HEALTH] no stashed batch for generation — skipping")
+            return
+        try:
+            device = next(model.parameters()).device
+            ids = stash["input_ids"][:1, : self.n_ctx].to(device)
+            was_training = model.training
+            model.eval()
+            old_debate = getattr(model.config, "n_debate_rounds", 1)
+            if int(getattr(model.config, "n_experts", 0) or 0) == 0:
+                model.config.n_debate_rounds = 0
+            with torch.no_grad():
+                out_ids = model.generate(
+                    ids, max_new_tokens=self.n_gen,
+                    temperature=0.6, top_k=40, top_p=0.9,
+                )
+            prefix = self.tokenizer.decode(ids[0], skip_special_tokens=True)
+            text = self.tokenizer.decode(out_ids[0], skip_special_tokens=True)
+            logger.info("  [HEALTH] step=%d prefix[:80]=%r", step, prefix[:80])
+            logger.info("  [HEALTH] step=%d gen[:200]=%r", step, text[:200])
+            if was_training:
+                model.train()
+            model.config.n_debate_rounds = old_debate
+        except Exception as e:
+            logger.warning("[HEALTH] generation failed at step %d: %s", step, e)
 
 
 class _TrainHeartbeatCallback(TrainerCallback):
@@ -1536,6 +1683,17 @@ class TrainingPipeline:
 
         def guarded_compute_loss(self, model, inputs, *args, **kwargs):
             return_outputs = kwargs.get("return_outputs", False)
+            if getattr(model, "_run_health_stash", None) is None and isinstance(inputs, dict) and "input_ids" in inputs:
+                try:
+                    # First batch's prefix feeds the held-out ppl + generation
+                    # probes in _RunHealthCallback. Detached + CPU so it never
+                    # participates in autograd or holds a GPU allocation.
+                    model._run_health_stash = {
+                        k: v.detach().cpu() for k, v in inputs.items()
+                        if k in ("input_ids", "language_ids", "labels")
+                    }
+                except Exception:
+                    model._run_health_stash = None
             out = orig(model, inputs, *args, **kwargs)
             if return_outputs:
                 loss = out[0] if isinstance(out, tuple) else getattr(out, "loss", None)
@@ -1668,10 +1826,13 @@ class TrainingPipeline:
         )
 
         data_collator = _LoggingDataCollator(_PretrainAuxCollator(DefaultDataCollator()))
+        logging_cb = _LoggingCallback()
+        health_cb = _RunHealthCallback(self.tokenizer, eval_every=500)
         callbacks = [
-            _LoggingCallback(),
+            logging_cb,
             _NaNSafeCallback(check_every=100),
             _TrainHeartbeatCallback(interval_steps=100, total_steps=max_steps or 0),
+            health_cb,
         ]
 
         # transformers >= 5.0 removed the `tokenizer` kwarg from
@@ -1689,6 +1850,14 @@ class TrainingPipeline:
                 **{tokenizer_kwarg: self.tokenizer},
             )
         )
+        # HF 5.x never forwards `model` to callback hooks; wire the raw model
+        # directly so the diagnostics in _LoggingCallback / _NaNSafeCallback /
+        # _RunHealthCallback actually observe it.
+        _model_ref = getattr(trainer, "model", self.model)
+        for _cb in callbacks:
+            setter = getattr(_cb, "set_model", None)
+            if setter is not None:
+                setter(_model_ref)
         _install_continuous_scheduler(trainer)
         return trainer
 

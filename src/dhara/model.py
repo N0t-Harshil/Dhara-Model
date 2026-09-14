@@ -293,6 +293,20 @@ class DharaModel(PreTrainedModel):
                 k: v.detach().mean().item() if isinstance(v, torch.Tensor) else v
                 for k, v in exec_decision.items()
             })
+            self._last_exec_meta = None
+            try:
+                with torch.no_grad():
+                    _conf = exec_decision.get("confidence", None)
+                    _depth = exec_decision.get("depth_multiplier", None)
+                    _rew = exec_decision.get("reward", None)
+                    self._last_exec_meta = {
+                        "gates": {k: float(v.detach().float().mean()) for k, v in exec_decision["gates"].items()},
+                        "confidence": float(_conf.detach().float().mean()) if _conf is not None else None,
+                        "depth": float(_depth.detach().float().mean()) if _depth is not None else None,
+                        "reward": float(_rew.detach().float().mean()) if _rew is not None else None,
+                    }
+            except Exception:
+                self._last_exec_meta = None
 
         ws_out = self.workspace(plan, mem_out, z_state)
         workspace_repr = ws_out["workspace"]
@@ -374,6 +388,37 @@ class DharaModel(PreTrainedModel):
         )
         _vocab_logits = _dec_out["logits"].view(batch, seq_len, self.vocab_size)
 
+        # Diagnostics: cheap sampled logits + label stats so the training log
+        # can prove whether the head is healthy (small logits, no clipping, no
+        # out-of-vocab labels) instead of silently saturating.
+        self._last_logits_stats = None
+        try:
+            _samp = _vocab_logits.reshape(-1)[::max(1, _vocab_logits.numel() // 8192)]
+            with torch.no_grad():
+                _samp_f = _samp.float()
+                _stats = {
+                    "vocab": self.vocab_size,
+                    "logit_mean_abs": float(_samp_f.abs().mean()),
+                    "logit_max": float(_samp_f.abs().max()),
+                    "clip50_frac": float((_samp_f.abs() >= 49.9).float().mean()),
+                }
+                if labels is not None:
+                    _vl_4 = _vocab_logits[:, : min(4, seq_len)].reshape(-1, self.vocab_size).float()
+                    _lbl_4 = labels[:, : min(4, seq_len)].reshape(-1)
+                    _mv_4 = _lbl_4 != -100
+                    if _mv_4.any():
+                        _tgt_4 = _vl_4.gather(
+                            -1, _lbl_4[_mv_4].clamp(0, self.vocab_size - 1).unsqueeze(-1)
+                        ).squeeze(-1)
+                        _stats["target_logit_mean"] = float(_tgt_4.mean())
+                        _stats["label_max"] = int(_lbl_4[_mv_4].max().item())
+                        _stats["label_oov_frac"] = float(
+                            (_lbl_4[_mv_4] >= self.vocab_size).float().mean()
+                        )
+                self._last_logits_stats = _stats
+        except Exception:
+            self._last_logits_stats = None
+
         module_outputs = {
             "intent": intent,
             "memory": {"state": mem_out, "reconstruction": mem_out, "loss": mem_meta.get("compression_loss")},
@@ -393,6 +438,17 @@ class DharaModel(PreTrainedModel):
         aux_losses = None
         if self.loss_computer is not None and aux_targets is not None:
             aux_losses = self.loss_computer(module_outputs, aux_targets)
+        # Diagnostics: surface every auxiliary branch's contribution so the
+        # log shows which subsystems are actually learning.
+        self._last_aux_losses = None
+        if aux_losses:
+            try:
+                with torch.no_grad():
+                    self._last_aux_losses = {
+                        k: float(v.detach().float()) for k, v in aux_losses.items()
+                    }
+            except Exception:
+                self._last_aux_losses = None
 
         if labels is not None:
             targets = labels[:, :seq_len].clone()
