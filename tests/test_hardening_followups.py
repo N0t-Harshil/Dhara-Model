@@ -11,7 +11,9 @@
 import pytest
 import torch
 
-from src.training.pipeline import _install_continuous_scheduler
+from src.training.pipeline import TrainingPipeline, _install_continuous_scheduler
+
+_NAN_GUARD = TrainingPipeline._install_nan_loss_guard
 
 
 # ---- Item 3: executive_rl wiring ------------------------------------------
@@ -202,6 +204,29 @@ class _FakeTrainer:
         self.lr_scheduler = _FakeScheduler(lr=8e-5, epoch=0)
 
 
+class _FakeLossTrainer:
+    """Mimics the HF Trainer.compute_loss surface including the dict-merge at
+    trainer.py:3880 that unmasked a MethodType binding bug: when the guard was
+    bound without an explicit `self`, the wrapped trainer swallowed `model` and
+    `inputs` received the DataParallel-wrapped model, so `{**inputs, **kwargs}`
+    raised `TypeError: 'DataParallel' object is not a mapping`."""
+
+    def __init__(self):
+        self.nan = False
+        self.calls = []
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        kwargs = {}
+        if num_items_in_batch is not None:
+            kwargs["num_items_in_batch"] = num_items_in_batch
+        merged = {**inputs, **kwargs}  # mirrors transformers/trainer.py compute_loss
+        self.calls.append((model, merged))
+        out = torch.tensor(float("nan") if self.nan else 0.5)
+        if return_outputs:
+            return (out, {"logits": None})
+        return out
+
+
 def test_scheduler_continuity_seeds_stage_restart():
     trainer = _FakeTrainer()
     _install_continuous_scheduler(trainer)
@@ -214,3 +239,32 @@ def test_scheduler_continuity_seeds_stage_restart():
     trainer.create_optimizer_and_scheduler(50000)
     assert trainer.lr_scheduler.last_epoch == 2600
     assert trainer.lr_scheduler.base_lrs == [5.2e-5]
+
+
+def test_nan_loss_guard_binding_passes_model_and_inputs_not_the_trainer():
+    from unittest.mock import MagicMock
+
+    fake = _FakeLossTrainer()
+    _NAN_GUARD(fake, fake)
+    wrapped = MagicMock()  # stands in for the nn.DataParallel-wrapped model
+    inputs = {"input_ids": torch.tensor([1, 2, 3])}
+
+    out = fake.compute_loss(wrapped, inputs)
+    assert out.item() == 0.5
+    assert fake.calls[-1][0] is wrapped
+    assert fake.calls[-1][1]["input_ids"].equal(inputs["input_ids"])
+
+
+def test_nan_loss_guard_returns_zero_loss_for_nonfinite_batch():
+    from unittest.mock import MagicMock
+
+    fake = _FakeLossTrainer()
+    fake.nan = True
+    _NAN_GUARD(fake, fake)
+
+    zero = fake.compute_loss(MagicMock(), {"input_ids": torch.tensor([1])})
+    assert zero.item() == 0.0
+
+    fake.nan = False
+    out = fake.compute_loss(MagicMock(), {"input_ids": torch.tensor([1])})
+    assert out.item() == 0.5  # skipping resets the consecutive counter

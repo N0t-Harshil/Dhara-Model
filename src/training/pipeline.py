@@ -1498,7 +1498,7 @@ class TrainingPipeline:
         orig = trainer.compute_loss
         stats = {"consecutive": 0, "total_skipped": 0}
 
-        def guarded_compute_loss(model, inputs, *args, **kwargs):
+        def guarded_compute_loss(self, model, inputs, *args, **kwargs):
             return_outputs = kwargs.get("return_outputs", False)
             out = orig(model, inputs, *args, **kwargs)
             if return_outputs:
