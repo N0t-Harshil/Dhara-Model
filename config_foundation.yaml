@@ -52,16 +52,16 @@ model:
       adaptive_top_k_min: 32
       adaptive_top_k_max: 128
       head_ce: topk
-      qa_max_passes: 1
+      qa_max_passes: 3
       qa_converge_threshold: 0.05
       max_refinement_passes: 1
       max_repair_iters: 1
       enable_executive: true
-      enable_world_model: false
+      enable_world_model: true
       enable_learning_controller: false
-      enable_tools: false
-      enable_curiosity: false
-      enable_aux_losses: false
+      enable_tools: true
+      enable_curiosity: true
+      enable_aux_losses: true
       executive_gate_threshold: 0.3
 
     max_position_embeddings: 4096
