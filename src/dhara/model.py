@@ -249,7 +249,13 @@ class DharaModel(PreTrainedModel):
     ) -> CausalLMOutputWithPast:
         batch, seq_len = input_ids.shape
         device = input_ids.device
-        self.workspace.reset(batch)
+        # Training: independent samples per micro-batch -> reset the workspace
+        # so unrelated rows never leak state into each other. Inference
+        # (generate) manages reset once per session in generate() so the
+        # workspace carry participates across decode steps. Cross-batch shape
+        # mismatches re-zero the cache internally regardless.
+        if self.training:
+            self.workspace.reset(batch)
 
         self.memory.apply_updates(mem_state)
 
@@ -274,8 +280,8 @@ class DharaModel(PreTrainedModel):
 
         h_ctx = self.state_to_context(h_pooled)
         z_in = self.memory_to_hidden(h_pooled)
-        reasoning_out = self.reasoning(h_ctx, z_in, n_steps)
-        self.workspace.write("reasoning", reasoning_out)
+        z_state, z_traj = self.reasoning(h_ctx, z_in, n_steps)
+        self.workspace.write("reasoning", z_state)
 
         exec_decision = None
         skip = {}
@@ -288,7 +294,7 @@ class DharaModel(PreTrainedModel):
                 for k, v in exec_decision.items()
             })
 
-        ws_out = self.workspace(plan, mem_out, reasoning_out)
+        ws_out = self.workspace(plan, mem_out, z_state)
         workspace_repr = ws_out["workspace"]
         self.workspace.write("workspace", workspace_repr)
 
@@ -339,17 +345,10 @@ class DharaModel(PreTrainedModel):
 
         # --- Auxiliary outputs: make previously-discarded module results
         # reachable so every loss branch in AuxiliaryLossComputer can fire ---
-        # Trajectory proxy: use the reasoning output expanded to a short
-        # pseudo-trajectory (the real ODE trajectory average is `reasoning_out`;
-        # exposing it as a sequence gives the smoothness loss a signal).
-        if isinstance(reasoning_out, dict):
-            traj = reasoning_out.get("trajectory", reasoning_out.get("z_out", reasoning_out))
-        else:
-            traj = reasoning_out
-        if isinstance(traj, torch.Tensor) and traj.dim() == 2:
-            traj = traj.unsqueeze(1).expand(-1, 5, -1)
-        elif isinstance(traj, torch.Tensor) and traj.dim() == 1:
-            traj = traj.unsqueeze(0).unsqueeze(0).expand(batch, 5, -1)
+        # The reasoning module returns the reached endpoint state AND the
+        # recorded (B, max_steps, d_hidden) trajectory; the smoothness aux loss
+        # now measures the true path instead of a tiled constant.
+        traj = z_traj if torch.is_tensor(z_traj) else z_state
 
         # Single decoder evaluation over the full sequence: the resulting vocab
         # logits back the LM loss AND the aux/entity outputs. Previously both
@@ -363,8 +362,10 @@ class DharaModel(PreTrainedModel):
         batch, seq_len = full_h.shape[0], full_h.shape[1]
         flat_h = full_h.reshape(-1, self.d_hidden)
         if labels is not None and language_ids is not None:
-            lang_shift = torch.zeros_like(language_ids[:, :seq_len])
-            lang_shift[:, :-1] = language_ids[:, 1:seq_len]
+            # Causal language hint: position t sees position t's own language
+            # (the label it predicts is labels[t+1], but feeding the FUTURE
+            # token's language leaked label information into the decoder).
+            lang_shift = language_ids[:, :seq_len].contiguous()
             _dec_out = self.decoder(flat_h, language_ids=lang_shift.reshape(-1))
         else:
             _dec_out = self.decoder(flat_h)
@@ -378,7 +379,7 @@ class DharaModel(PreTrainedModel):
             "memory": {"state": mem_out, "reconstruction": mem_out, "loss": mem_meta.get("compression_loss")},
             "planning": plan,
             "executive": exec_decision,
-            "trajectory": traj if isinstance(traj, torch.Tensor) else reasoning_out,
+            "trajectory": traj,
             "workspace": ws_out,
             "world_model": world_out,
             "specialists": specialist_out,
@@ -447,6 +448,9 @@ class DharaModel(PreTrainedModel):
         self.eval()
         batch = input_ids.shape[0]
         device = input_ids.device
+        # Workspace carry spans the whole decode session (forward no longer
+        # resets in eval mode), so working-state accumulates across tokens.
+        self.workspace.reset(batch)
         generated = input_ids.clone()
         mem_state = None
         finished = torch.zeros(batch, dtype=torch.bool, device=device)

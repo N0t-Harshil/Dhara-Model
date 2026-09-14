@@ -228,6 +228,42 @@ class _LoggingDataCollator:
         return self.collator(features)
 
 
+# Order matches the staged-registry category list (and n_task_types=8).
+_TASK_CATEGORIES = (
+    "code", "docs", "web_text", "wiki",
+    "math", "science", "books", "structured_knowledge",
+)
+_TASK_CATEGORY_ID = {name: i for i, name in enumerate(_TASK_CATEGORIES)}
+_DIFFICULTY_EDGES = (0.2, 0.4, 0.6, 0.8)
+
+
+def _difficulty_bucket(quality) -> int:
+    q = min(max(float(quality), 0.0), 1.0)
+    return min(sum(1 for edge in _DIFFICULTY_EDGES if q > edge), 4)
+
+
+class _PretrainAuxCollator:
+    """Turns signal that DefaultDataCollator silently drops (row-level
+    ``_category`` / ``_avg_quality`` are strings, never tensorized) into
+    ``aux_targets`` supervision, so AuxiliaryLossComputer actually fires during
+    pretraining instead of being permanently inert. task_type is the document
+    category; difficulty is bucketed from the row's quality proxy, giving the
+    intent classifiers and difficulty router a real learnable signal."""
+
+    def __init__(self, base):
+        self.base = base
+
+    def __call__(self, features):
+        batch = self.base(features)
+        cats = [f.get("_category") for f in features]
+        quals = [f.get("_avg_quality") for f in features]
+        if all(isinstance(c, str) for c in cats) and all(isinstance(q, (int, float)) for q in quals):
+            task_type = torch.tensor([_TASK_CATEGORY_ID.get(c, 0) for c in cats], dtype=torch.long)
+            difficulty = torch.tensor([_difficulty_bucket(q) for q in quals], dtype=torch.long)
+            batch["aux_targets"] = {"intent": {"task_type": task_type, "difficulty": difficulty}}
+        return batch
+
+
 class _TrainHeartbeatCallback(TrainerCallback):
     """Turn a silent training stall into a visible one.
 
@@ -1631,7 +1667,7 @@ class TrainingPipeline:
            **({"deepspeed": base_args["deepspeed"]} if base_args.get("deepspeed") else {}),
         )
 
-        data_collator = _LoggingDataCollator(DefaultDataCollator())
+        data_collator = _LoggingDataCollator(_PretrainAuxCollator(DefaultDataCollator()))
         callbacks = [
             _LoggingCallback(),
             _NaNSafeCallback(check_every=100),

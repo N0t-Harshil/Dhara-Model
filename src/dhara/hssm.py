@@ -95,5 +95,8 @@ class HierarchicalSSMStack(nn.Module):
                 layer_state = h
         if not states:
             return x, torch.zeros(x.shape[0], self.layers[0].n_levels, self.layers[0].d_state, device=x.device, dtype=x.dtype)
-        final_state = torch.stack(states, dim=1).mean(dim=1)
+        # Carry the deepest (top-level) layer's state onwards: it holds the
+        # longest-horizon recurrence. Averaging over layers diluted the
+        # high-level state with the per-token low-level states.
+        final_state = states[-1]
         return x, final_state

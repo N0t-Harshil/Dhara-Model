@@ -50,7 +50,10 @@ class TestHeadCe:
             h = captured["h"].view(batch, seq, -1)
             shift_h = h[:, :-1, :].reshape(-1, 32)
             shift_labels = labels[:, 1:].reshape(-1)
-            shift_lang = lang[:, 1:].reshape(-1) if captured["language_ids"] is not None else None
+            # No future leak: slot t's decoder got language[t] (not
+            # language[t+1]) to predict labels[t+1], so the reference must pair
+            # h[:,t] with lang[:,t].
+            shift_lang = lang[:, :-1].reshape(-1) if captured["language_ids"] is not None else None
             valid = shift_labels != -100
             safe = shift_labels.masked_fill(~valid, 0)
             lp = model.decoder.hierarchical_log_prob(shift_h, safe, language_ids=shift_lang)

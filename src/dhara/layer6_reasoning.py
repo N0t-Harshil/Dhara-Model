@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+from typing import Tuple
 
 
 class DomainDynamics(nn.Module):
@@ -40,10 +41,20 @@ class AdaptiveContinuousReasoning(nn.Module):
         self.ode_tick = ODETick(n_domains, d_state, d_hidden)
         self.scale = math.sqrt(d_hidden)
 
-    def forward(self, h_compressed: torch.Tensor, z: torch.Tensor, n_steps: torch.LongTensor = None) -> torch.Tensor:
+    def forward(self, h_compressed: torch.Tensor, z: torch.Tensor, n_steps: torch.LongTensor = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Euler-integrate the reasoning dynamics and return the reached
+        endpoint state and the full trajectory.
+
+        The endpoint (state reached at each sample's last active step) is the
+        natural "after reasoning" representation; trailing updates freeze so
+        early-stopped samples keep their endpoint. The recorded trajectory is
+        returned for the smoothness aux loss (the previous design returned the
+        trajectory MEAN, which flattened the path and made the smoothness loss,
+        fed identical copies, permanently zero).
+        """
         if n_steps is None:
             n_steps = torch.full((z.shape[0],), 8, device=z.device, dtype=torch.long)
-        max_n = n_steps.max().item()
+        max_n = int(n_steps.max().item())
         z_out = z.clone()
         trajectories = []
         for step in range(max_n):
@@ -55,9 +66,8 @@ class AdaptiveContinuousReasoning(nn.Module):
             new_z = z_out + dz / self.scale
             z_out = torch.where(active.unsqueeze(-1), new_z, z_out)
             trajectories.append(z_out.unsqueeze(1))
-        if len(trajectories) > 0:
+        if trajectories:
             z_traj = torch.cat(trajectories, dim=1)
-            steps_f = n_steps.float().unsqueeze(-1).clamp(min=1)
-            active_mask = torch.arange(max_n, device=z.device).unsqueeze(0).unsqueeze(-1) < n_steps.unsqueeze(-1).unsqueeze(-1)
-            z_out = (z_traj * active_mask.float()).sum(dim=1) / steps_f
-        return z_out
+        else:
+            z_traj = z.unsqueeze(1)
+        return z_out, z_traj

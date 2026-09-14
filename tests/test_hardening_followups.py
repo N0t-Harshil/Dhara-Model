@@ -142,9 +142,10 @@ def test_reasoning_unroll_bounded_and_finite_at_max_steps():
     h = torch.randn(2, 16)
     z = torch.randn(2, 32)
     n_steps = torch.full((2,), 32, dtype=torch.long)
-    out = reasoner(h, z, n_steps)
-    assert out.shape == (2, 32)
-    assert torch.isfinite(out).all()
+    z_endpoint, z_traj = reasoner(h, z, n_steps)
+    assert z_endpoint.shape == (2, 32)
+    assert z_traj.shape == (2, 32, 32)
+    assert torch.isfinite(z_endpoint).all() and torch.isfinite(z_traj).all()
 
 
 # ---- Item 5: workspace per-forward isolation -------------------------------
@@ -171,6 +172,22 @@ def test_workspace_resets_between_forwards():
     assert second["workspace"].shape[0] == 3
     assert ws._cached_state.shape[0] == 3
     assert first["workspace"].shape[0] == 2  # first pass output unchanged
+
+
+def test_workspace_carries_across_eval_forwards_until_reset():
+    from src.dhara.workspace import CognitiveWorkspace
+
+    ws = CognitiveWorkspace(d_model=8, d_hidden=16, max_keys=4)
+    plan = {"goal_embeds": torch.randn(1, 4, 8)}
+    ws.reset(1)
+    # No reset between calls (eval / decode): the gated carry must persist.
+    first = ws.update(plan, torch.randn(1, 4, 8), torch.randn(1, 16))
+    second = ws.update(plan, torch.randn(1, 4, 8), torch.randn(1, 16))
+    assert not torch.allclose(second["workspace"], first["workspace"])
+    ws.reset(1)
+    third = ws.update(plan, torch.randn(1, 4, 8), torch.randn(1, 16))
+    assert ws._cached_state is not None
+    assert not torch.allclose(third["workspace"], second["workspace"])
 
 
 # ---- Item 7: LR continuity across stage transitions -------------------------

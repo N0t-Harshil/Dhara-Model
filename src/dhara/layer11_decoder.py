@@ -34,11 +34,13 @@ class LanguageDecoder(nn.Module):
     def forward(self, h: torch.Tensor, language_hint: torch.Tensor = None) -> dict:
         lang_logits = self.language_classifier(h)
         lang_weights = F.softmax(lang_logits, dim=-1)
+        gate = torch.sigmoid(self.language_gate(h))
         if language_hint is not None:
             lang_hint_onehot = F.one_hot(language_hint, num_classes=lang_logits.shape[-1]).float()
-            lang_weights = 0.5 * lang_weights + 0.5 * lang_hint_onehot
+            # Learned-gated hint blend: the model can downweight the raw hint
+            # instead of being forced to a fixed 0.5/0.5 mix.
+            lang_weights = lang_weights * (1 - gate) + lang_hint_onehot * gate
         lang_ctx = torch.matmul(lang_weights, self.language_embeds.weight)
-        gate = torch.sigmoid(self.language_gate(h))
         return {
             "language_logits": lang_logits,
             "language_weights": lang_weights,
@@ -57,7 +59,6 @@ class TokenDecoder(nn.Module):
         self.difficulty_predictor = nn.Linear(d_hidden, 1)
         self.norm = nn.LayerNorm(d_hidden)
         self.sparsity_gate = nn.Linear(d_hidden, 1)
-        self.temperature = nn.Parameter(torch.ones(1))
 
     def forward(self, h: torch.Tensor, language_bias: torch.Tensor = None) -> dict:
         h = self.norm(h)
@@ -65,7 +66,10 @@ class TokenDecoder(nn.Module):
         top_k = self.adaptive_top_k_min + (difficulty * (self.adaptive_top_k_max - self.adaptive_top_k_min)).long()
         top_k = top_k.squeeze(-1).clamp(self.adaptive_top_k_min, self.adaptive_top_k_max)
         sparsity = torch.sigmoid(self.sparsity_gate(h))
-        logits = self.hidden_to_vocab(h) / self.temperature.abs().clamp(min=0.1)
+        logits = self.hidden_to_vocab(h)
+        # No learnable temperature inside the logits: a learned multiplier lets
+        # the model "cheat" by shrinking the scale instead of fitting the
+        # predictions (sampling temperature stays in generate()).
         if language_bias is not None:
             lang_bias_proj = torch.matmul(language_bias, self.hidden_to_vocab.weight.T)
             logits = logits + 0.1 * lang_bias_proj

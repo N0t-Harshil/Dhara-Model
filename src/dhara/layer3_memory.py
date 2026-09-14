@@ -21,6 +21,18 @@ class ForgetGate(nn.Module):
         return memory * (1 - forget_fraction)
 
 
+def _chunk_pool(x: torch.Tensor, chunk: int = 64) -> torch.Tensor:
+    """Pool the sequence into fixed-size chunk means (B, n_chunks, d). Gives the
+    compression AE a real per-chunk reconstruction target instead of a single
+    whole-sequence mean (which carried near-zero information)."""
+    batch, seq_len, d = x.shape
+    n_chunks = seq_len // chunk
+    if n_chunks == 0:
+        return x.mean(dim=1, keepdim=True)
+    usable = n_chunks * chunk
+    return x[:, :usable, :].reshape(batch, n_chunks, chunk, d).mean(dim=2)
+
+
 class CompressionAE(nn.Module):
     def __init__(self, d_model: int, compressed_dim: int = 256):
         super().__init__()
@@ -145,21 +157,42 @@ class EpisodicMemory(nn.Module):
         self.value_proj = nn.Linear(d_model, d_model)
 
     def store(self, x: torch.Tensor) -> torch.Tensor:
-        if x.numel() == 0:
+        """Per-sample episode summary: one vector per batch row (mean over the
+        sequence). Previously the whole batch folded into a single global mean,
+        destroying per-sample identity in the bank."""
+        if x.numel() == 0 or x.dim() < 2:
             return None
-        compressed = x.mean(dim=1).mean(dim=0, keepdim=True)
-        return compressed
+        return x.mean(dim=1)
 
     def _apply_store(self, compressed: torch.Tensor) -> None:
+        """Append compressed rows (1 or B rows) to the bank, ring-buffering the
+        oldest episodes out when full."""
         if compressed is None:
             return
-        count = int(self.episode_count.item())
-        if count < self.max_episodes:
-            self.episode_buffer[0, count] = compressed
+        rows = compressed if compressed.dim() == 2 else compressed.unsqueeze(0)
+        b = rows.shape[0]
+        existing = int(self.episode_count.data.item())
+        if existing + b <= self.max_episodes:
+            self.episode_buffer.data[:, existing:existing + b] = rows.detach()
+            self.episode_count.data += b
         else:
-            self.episode_buffer[:, :-1, :] = self.episode_buffer[:, 1:, :].clone()
-            self.episode_buffer[:, -1, :] = compressed
-        self.episode_count += 1
+            drop = min(b, existing)
+            kept = existing - drop
+            if kept > 0:
+                self.episode_buffer.data[:, :kept] = self.episode_buffer.data[:, drop:existing].clone()
+            self.episode_buffer.data[:, kept:kept + b] = rows.detach()
+            self.episode_count.data = torch.tensor(
+                min(existing + b, self.max_episodes),
+                device=self.episode_count.device, dtype=torch.long,
+            )
+
+    def _commit(self, compressed: torch.Tensor) -> None:
+        """Training-path bank writes: keep the growing bank on the (now
+        single-GPU) job so retrieval/priority/forget train against real
+        episodic content instead of an all-zeros bank."""
+        if compressed is None or not self.training:
+            return
+        self._apply_store(compressed)
 
     def retrieve(self, query: torch.Tensor, top_k: int = 16) -> torch.Tensor:
         count = min(int(self.episode_count.item()), self.max_episodes)
@@ -232,13 +265,18 @@ class MemoryManager(nn.Module):
         sm_out = self.semantic(wm_out)
         lc_out, lc_state = self.long_context(wm_out, mem_state.get("long_context"))
         compressed = self.episodic.store(lc_out)
+        # Commit real per-sample episode summaries during training so the
+        # episodic bank, priority scorer and retriever learn from actual
+        # content rather than an all-zeros bank (previously the bank was only
+        # ever written through mem_state at eval/generate).
+        self.episodic._commit(compressed)
         ep_out = self.episodic.retrieve(lc_out)
 
         importance = torch.sigmoid(self.importance(lc_out.mean(dim=1)))
         ep_buf = self.episodic.episode_buffer.clone()
         m_age = self.mem_age.clone()
         decayed = self.forget_gate(ep_buf, m_age)
-        _, _, compression_loss = self.compressor(lc_out.mean(dim=1))
+        _, _, compression_loss = self.compressor(_chunk_pool(lc_out))
         priority = self.priority_scorer(decayed)
         retrieved = self.retriever(lc_out.mean(dim=1, keepdim=True), decayed, priority)
         fused = self.fusion(torch.cat([wm_out, sm_out, lc_out, ep_out], dim=-1))
