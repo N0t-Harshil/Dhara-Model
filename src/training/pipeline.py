@@ -26,6 +26,17 @@ from transformers import (
     TrainingArguments,
 )
 
+# transformers 5.x registers PrinterCallback (with disable_tqdm=True) or
+# ProgressCallback as the final trainer callback; BOTH write the raw logs dict
+# to stdout on every log, polluting tail -f. We strip whichever one the build
+# registered (see _build_trainer) because _LoggingCallback already prints the
+# clean Step line. DefaultFlowCallback (scheduler) is never touched.
+try:
+    from transformers.trainer_callback import PrinterCallback, ProgressCallback
+    _CONSOLE_CALLBACKS = (PrinterCallback, ProgressCallback)
+except Exception:
+    _CONSOLE_CALLBACKS = ()
+
 from src.alignment.pipeline import AlignmentPipeline
 from src.config.schema import Config
 from src.data.registry import build_registry
@@ -151,6 +162,28 @@ class _FailureJournal:
             logger.warning("Could not persist failure journal: %s", e)
 
 
+def _find_diag_model(model):
+    """Locate the object publishing `_last_*` diagnostics. HF 5.x may wrap the
+    raw module (DataParallel-style, base_model, etc.); the inner DharaModel
+    publishes them, so walk common wrapper attrs a couple of hops."""
+    if model is None:
+        return None
+    seen = set()
+    stack = [model]
+    while stack:
+        cur = stack.pop()
+        if cur is None or id(cur) in seen:
+            continue
+        seen.add(id(cur))
+        if hasattr(cur, "_last_aux_meta"):
+            return cur
+        for _attr in ("module", "base_model", "model", "root"):
+            _nxt = getattr(cur, _attr, None)
+            if _nxt is not None and _nxt is not cur:
+                stack.append(_nxt)
+    return model
+
+
 class _LoggingCallback(TrainerCallback):
     def __init__(self):
         self._step_start = 0.0
@@ -158,9 +191,9 @@ class _LoggingCallback(TrainerCallback):
 
     def set_model(self, model):
         # HF 5.x may wrap the raw model (DataParallel and similar); the module
-        # subclasses publish _last_* diagnostics on the INNER module, so unwrap
-        # here or getattr() below sees nothing.
-        self._model = getattr(model, "module", model)
+        # subclasses publish _last_* diagnostics on the INNER module, so walk
+        # common wrapper attrs and keep whatever actually has them.
+        self._model = _find_diag_model(model)
 
     def on_step_begin(self, args, state, control, **kwargs):
         if state.is_world_process_zero:
@@ -178,15 +211,27 @@ class _LoggingCallback(TrainerCallback):
             elapsed = time.time() - self._step_start if self._step_start else 0.0
             # HF's loss is the batch-size x grad-accum aggregated figure and
             # reads ~16x the true per-micro-batch loss (logged 100 = real ~6.3).
-            # Surface ce + applied aux from the model's own diagnostics so the
-            # step line shows what HF's number hides instead of alarming.
-            true_part = ""
+            # Prefer the model's own ce + applied aux; fall back to loss / batch
+            # scale when model meta is unavailable so the line always shows a
+            # meaningful number. Append the aux status so a dead or wired-off
+            # supervisor is visible instead of a silently missing number.
+            bs = int(getattr(args, "per_device_train_batch_size", 1) or 1)
+            ga = int(getattr(args, "gradient_accumulation_steps", 1) or 1)
+            scale = max(1, bs * ga)
             meta = getattr(self._model, "_last_aux_meta", None) or {}
+            extras = []
             if isinstance(meta, dict) and meta.get("ce") is not None:
-                true_part = " | true(ce+aux)=%.3f" % (float(meta["ce"]) + float(meta.get("applied", 0.0)))
+                extras.append("true=%.3f" % (float(meta["ce"]) + float(meta.get("applied", 0.0))))
+            elif loss_val:
+                extras.append("true=%.3f" % (loss_val / scale))
+            if isinstance(meta, dict) and meta.get("status"):
+                extras.append("aux=%s" % meta["status"])
+            suffix = ""
+            if extras:
+                suffix = " | " + " | ".join(extras)
             logger.info(
                 "Step %d | loss=%.2f | grad_norm=%.2f | lr=%.2e | it/s=%.2f%s",
-                step, loss_val, grad_val, lr_val, 1.0 / max(elapsed, 1e-8), true_part,
+                step, loss_val, grad_val, lr_val, 1.0 / max(elapsed, 1e-8), suffix,
             )
             self._log_instrumentation(step)
 
@@ -199,7 +244,7 @@ class _LoggingCallback(TrainerCallback):
             logger.warning("Instrumentation unavailable: _model not wired (set_model never called).")
             return
         try:
-            model = getattr(model, "module", model)
+            model = _find_diag_model(model)
             aux = getattr(model, "_last_aux_losses", None)
             aux_meta = getattr(model, "_last_aux_meta", None)
             exec_meta = getattr(model, "_last_exec_meta", None)
@@ -1910,6 +1955,17 @@ class TrainingPipeline:
             setter = getattr(_cb, "set_model", None)
             if setter is not None:
                 setter(_model_ref)
+        # Drop whichever raw-logs-to-stdout callback transformers 5.x appended
+        # (PrinterCallback or ProgressCallback); _LoggingCallback prints the
+        # clean Step line so the raw {'loss': ...} dict never pollutes the log.
+        try:
+            _handler = getattr(trainer, "callback_handler", None)
+            if _handler is not None and _CONSOLE_CALLBACKS:
+                _registered = list(getattr(_handler, "callbacks", []) or [])
+                setattr(_handler, "callbacks", [_c for _c in _registered
+                                               if not isinstance(_c, _CONSOLE_CALLBACKS)])
+        except Exception:
+            pass
         # MODEL-DIAG watchdog cadence (in training forwards): ~5 logging windows
         # of gas*logging_steps optimizer steps (~every 250 steps at ga=4 x log=50).
         try:
