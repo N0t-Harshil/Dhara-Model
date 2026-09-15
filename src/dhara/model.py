@@ -449,6 +449,7 @@ class DharaModel(PreTrainedModel):
                     }
             except Exception:
                 self._last_aux_losses = None
+        self._last_aux_meta = None
 
         if labels is not None:
             targets = labels[:, :seq_len].clone()
@@ -475,15 +476,36 @@ class DharaModel(PreTrainedModel):
 
             if aux_losses:
                 aux_total = self.loss_computer.total_loss(aux_losses)
-                # Cap aux_total relative to the current CE loss so an unstable
-                # auxiliary branch can't overwhelm the language-modeling gradient
-                # and cause exponential divergence.  At init CE ~ ln(vocab) ≈ 11;
-                # allowing aux to reach 10x that gives branches room to learn
-                # while preventing the runaway 284 -> 3.9M explosion we saw when
-                # all five subsystems came online simultaneously.
+                # Cap aux_total so an unstable auxiliary branch can't overwhelm
+                # the language-modeling gradient and cause exponential
+                # divergence (284 -> 10.7k -> 212k -> 3.9M with all five
+                # subsystems live).  Two independent bounds: a relative one
+                # (10x the current CE, so branches scale with task difficulty)
+                # AND a hard absolute one (20.0) so the total loss can never
+                # chase CE upward.  Above either bound the clamp's gradient is
+                # 0, so all aux branches freeze while CE keeps its gradient:
+                # the model trains a clean LM baseline until branches settle
+                # back under the cap and start contributing again.
                 ce_floor = loss.detach().abs().clamp(min=0.1)
-                aux_total = aux_total.clamp(max=ce_floor * 10.0)
-                loss = loss + aux_total
+                aux_cap = min(ce_floor * 10.0, 20.0)
+                aux_total_clamped = aux_total.clamp(max=aux_cap)
+                # Diagnostics: publish raw sum, applied (clamped) sum and the
+                # CE floor so the step log can show exactly how the brake
+                # behaved instead of guessing from the total loss.
+                self._last_aux_meta = {
+                    "raw": float(aux_total.detach().float()),
+                    "applied": float(aux_total_clamped.detach().float()),
+                    "ce": float(loss.detach().float()),
+                    "cap": float(aux_cap),
+                }
+                loss = loss + aux_total_clamped
+            else:
+                self._last_aux_meta = {
+                    "raw": 0.0,
+                    "applied": 0.0,
+                    "ce": float(loss.detach().float()),
+                    "cap": 0.0,
+                }
 
             if self.training and self.executive_rl and exec_decision is not None:
                 self.executive.update_from_step(loss, exec_decision.get("gates"))

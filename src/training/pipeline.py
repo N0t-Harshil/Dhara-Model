@@ -157,7 +157,10 @@ class _LoggingCallback(TrainerCallback):
         self._model = None
 
     def set_model(self, model):
-        self._model = model
+        # HF 5.x may wrap the raw model (DataParallel and similar); the module
+        # subclasses publish _last_* diagnostics on the INNER module, so unwrap
+        # here or getattr() below sees nothing.
+        self._model = getattr(model, "module", model)
 
     def on_step_begin(self, args, state, control, **kwargs):
         if state.is_world_process_zero:
@@ -183,10 +186,17 @@ class _LoggingCallback(TrainerCallback):
             logger.warning("Instrumentation unavailable: _model not wired (set_model never called).")
             return
         try:
+            model = getattr(model, "module", model)
             aux = getattr(model, "_last_aux_losses", None)
+            aux_meta = getattr(model, "_last_aux_meta", None)
             exec_meta = getattr(model, "_last_exec_meta", None)
             lstats = getattr(model, "_last_logits_stats", None)
             parts = []
+            if aux_meta:
+                parts.append(
+                    f"aux_sum(raw={aux_meta['raw']:.3f}->applied={aux_meta['applied']:.3f} "
+                    f"cap={aux_meta['cap']:.3f} ce={aux_meta['ce']:.3f})"
+                )
             if aux:
                 parts.append("aux={" + ", ".join(f"{k}={v:.4f}" for k, v in sorted(aux.items())) + "}")
             if exec_meta:
@@ -1858,8 +1868,10 @@ class TrainingPipeline:
         )
         # HF 5.x never forwards `model` to callback hooks; wire the raw model
         # directly so the diagnostics in _LoggingCallback / _NaNSafeCallback /
-        # _RunHealthCallback actually observe it.
+        # _RunHealthCallback actually observe it.  Unwrap any DataParallel-style
+        # wrapper so the INNER module (which publishes _last_* attrs) is seen.
         _model_ref = getattr(trainer, "model", self.model)
+        _model_ref = getattr(_model_ref, "module", _model_ref)
         for _cb in callbacks:
             setter = getattr(_cb, "set_model", None)
             if setter is not None:
