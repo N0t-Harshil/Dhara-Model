@@ -213,6 +213,7 @@ class DharaModel(PreTrainedModel):
             n_semantic_concepts=c.n_semantic_concepts,
         )
         self.loss_computer = AuxiliaryLossComputer(c.loss_weights) if c.enable_aux_losses else None
+        self._diag_count = 0
 
         self._log_architecture()
 
@@ -305,8 +306,9 @@ class DharaModel(PreTrainedModel):
                         "depth": float(_depth.detach().float().mean()) if _depth is not None else None,
                         "reward": float(_rew.detach().float().mean()) if _rew is not None else None,
                     }
-            except Exception:
+            except Exception as e:
                 self._last_exec_meta = None
+                self._last_exec_err = repr(e)
 
         ws_out = self.workspace(plan, mem_out, z_state)
         workspace_repr = ws_out["workspace"]
@@ -416,8 +418,9 @@ class DharaModel(PreTrainedModel):
                             (_lbl_4[_mv_4] >= self.vocab_size).float().mean()
                         )
                 self._last_logits_stats = _stats
-        except Exception:
+        except Exception as e:
             self._last_logits_stats = None
+            self._last_logits_err = repr(e)
 
         module_outputs = {
             "intent": intent,
@@ -447,9 +450,19 @@ class DharaModel(PreTrainedModel):
                     self._last_aux_losses = {
                         k: float(v.detach().float()) for k, v in aux_losses.items()
                     }
-            except Exception:
+            except Exception as e:
                 self._last_aux_losses = None
+                self._last_aux_err = repr(e)
+        # Why aux is (or isn't) active: the collator injects aux_targets only
+        # when every row carries _category + _avg_quality, so this status tells
+        # us whether the supervisor is on, starved of targets, or off entirely.
         self._last_aux_meta = None
+        if self.loss_computer is None:
+            self._last_aux_meta = {"status": "off"}
+        elif aux_targets is None:
+            self._last_aux_meta = {"status": "no_aux_targets"}
+        elif not aux_losses:
+            self._last_aux_meta = {"status": "aux_empty"}
 
         if labels is not None:
             targets = labels[:, :seq_len].clone()
@@ -497,15 +510,20 @@ class DharaModel(PreTrainedModel):
                     "applied": float(aux_total_clamped.detach().float()),
                     "ce": float(loss.detach().float()),
                     "cap": float(aux_cap),
+                    "status": "flowing" if aux_total.detach().float().item() <= aux_cap else "braked",
                 }
                 loss = loss + aux_total_clamped
             else:
+                _prev_status = (self._last_aux_meta or {}).get("status", "no_aux_loss_values")
                 self._last_aux_meta = {
                     "raw": 0.0,
                     "applied": 0.0,
                     "ce": float(loss.detach().float()),
                     "cap": 0.0,
+                    "status": _prev_status,
                 }
+
+            self._emit_diagnostics()
 
             if self.training and self.executive_rl and exec_decision is not None:
                 self.executive.update_from_step(loss, exec_decision.get("gates"))
@@ -519,6 +537,48 @@ class DharaModel(PreTrainedModel):
         # No labels → reuse precomputed full_h / _vocab_logits, sanitized
         logits = torch.nan_to_num(_vocab_logits, nan=0.0, posinf=50.0, neginf=-50.0)
         return CausalLMOutputWithPast(logits=logits, past_key_values=mem_state)
+
+    def _emit_diagnostics(self):
+        """Directly log the latest aux/exec/logits diagnostics from INSIDE the
+        forward pass, every 50 training forwards.  This cannot be masked by
+        callback wiring (HF 5.x model-wrapping, set_model ordering, on_log
+        signatures): if the loss is real, forward ran, and this line appears."""
+        self._diag_count += 1
+        if not (self.training and self._diag_count % 50 == 1):
+            return
+        _aux = getattr(self, "_last_aux_losses", None)
+        _meta = getattr(self, "_last_aux_meta", None)
+        _exec = getattr(self, "_last_exec_meta", None)
+        _stat = getattr(self, "_last_logits_stats", None)
+        _m = ""
+        if _meta:
+            _status = _meta.get("status", "?")
+            if _status in ("flowing", "braked"):
+                _m = (f" aux_sum[raw={_meta['raw']:.3f}->applied={_meta['applied']:.3f} "
+                      f"cap={_meta['cap']:.3f} ce={_meta['ce']:.3f}]")
+            else:
+                _m = f" aux[{_status}]"
+        _a = ""
+        if _aux:
+            _a = " aux{" + ", ".join(f"{k}={v:.3f}" for k, v in sorted(_aux.items())) + "}"
+        _e = ""
+        if _exec:
+            _gm = _exec.get("gates") or {}
+            _e = " gates{" + ", ".join(f"{k}={v:.3f}" for k, v in sorted(_gm.items())) + "}"
+        _s = ""
+        if _stat:
+            _extra = ""
+            if "label_max" in _stat:
+                _extra = (f" lmax={_stat['label_max']} oov={_stat['label_oov_frac']:.4f} "
+                          f"tgt={_stat['target_logit_mean']:.4f}")
+            _s = (f" lstats[v={_stat['vocab']} mae={_stat['logit_mean_abs']:.3f} "
+                  f"max={_stat['logit_max']:.3f} clip={_stat['clip50_frac']:.4f}{_extra}]")
+        _errs = ""
+        for _name in ("_last_aux_err", "_last_exec_err", "_last_logits_err"):
+            _err = getattr(self, _name, None)
+            if _err:
+                _errs += f" {_name}={_err}"
+        logger.info("MODEL-DIAG%s%s%s%s%s", _m, _a, _e, _s, _errs)
 
     def generate(
         self,

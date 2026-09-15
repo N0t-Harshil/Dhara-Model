@@ -193,10 +193,14 @@ class _LoggingCallback(TrainerCallback):
             lstats = getattr(model, "_last_logits_stats", None)
             parts = []
             if aux_meta:
-                parts.append(
-                    f"aux_sum(raw={aux_meta['raw']:.3f}->applied={aux_meta['applied']:.3f} "
-                    f"cap={aux_meta['cap']:.3f} ce={aux_meta['ce']:.3f})"
-                )
+                _st = aux_meta.get("status", "?")
+                if _st in ("flowing", "braked"):
+                    parts.append(
+                        f"aux_sum[{_st}](raw={aux_meta['raw']:.3f}->applied={aux_meta['applied']:.3f} "
+                        f"cap={aux_meta['cap']:.3f} ce={aux_meta['ce']:.3f})"
+                    )
+                else:
+                    parts.append(f"aux_sum[{_st}]")
             if aux:
                 parts.append("aux={" + ", ".join(f"{k}={v:.4f}" for k, v in sorted(aux.items())) + "}")
             if exec_meta:
