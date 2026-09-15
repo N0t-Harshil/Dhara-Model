@@ -488,31 +488,35 @@ class DharaModel(PreTrainedModel):
                 loss = -per_pos[valid_mask].mean() if valid_mask.any() else per_pos.sum() * 0.0
 
             if aux_losses:
-                aux_total = self.loss_computer.total_loss(aux_losses)
-                # Cap aux_total so an unstable auxiliary branch can't overwhelm
-                # the language-modeling gradient and cause exponential
-                # divergence (284 -> 10.7k -> 212k -> 3.9M with all five
-                # subsystems live).  Two independent bounds: a relative one
-                # (10x the current CE, so branches scale with task difficulty)
-                # AND a hard absolute one (20.0) so the total loss can never
-                # chase CE upward.  Above either bound the clamp's gradient is
-                # 0, so all aux branches freeze while CE keeps its gradient:
-                # the model trains a clean LM baseline until branches settle
-                # back under the cap and start contributing again.
+                # Per-branch caps so one runaway branch (memory MSE has grown
+                # raw 8.9 -> 1272 as hidden activations scale) freezes itself
+                # WITHOUT freezing the branches that are still healthy (intent
+                # ~0.05).  The old single total clamp zeroed EVERY branch's
+                # gradient the moment any one pushed the sum past the cap,
+                # silently killing intent/difficulty supervision and leaving
+                # the runaway branch permanently pinned at the cap with zero
+                # gradient to ever fix itself.
                 ce_floor = loss.detach().abs().clamp(min=0.1)
-                aux_cap = min(ce_floor * 10.0, 20.0)
-                aux_total_clamped = aux_total.clamp(max=aux_cap)
+                branch_cap = min(ce_floor * 2.0, 2.0)
+                _capped = {}
+                for _k, _v in aux_losses.items():
+                    _capped[_k] = _v.clamp(max=branch_cap)
+                aux_total = self.loss_computer.total_loss(_capped)
+                # Absolute total safety net (rarely engaged given the tight
+                # per-branch caps above).
+                aux_total_pre = aux_total.detach()
+                aux_total = aux_total.clamp(max=20.0)
                 # Diagnostics: publish raw sum, applied (clamped) sum and the
                 # CE floor so the step log can show exactly how the brake
                 # behaved instead of guessing from the total loss.
                 self._last_aux_meta = {
-                    "raw": float(aux_total.detach().float()),
-                    "applied": float(aux_total_clamped.detach().float()),
+                    "raw": float(self.loss_computer.total_loss(aux_losses).detach().float()),
+                    "applied": float(aux_total.detach().float()),
                     "ce": float(loss.detach().float()),
-                    "cap": float(aux_cap),
-                    "status": "flowing" if aux_total.detach().float().item() <= aux_cap else "braked",
+                    "cap": float(branch_cap),
+                    "status": "flowing" if aux_total_pre.float().item() <= 20.0 else "braked",
                 }
-                loss = loss + aux_total_clamped
+                loss = loss + aux_total
             else:
                 _prev_status = (self._last_aux_meta or {}).get("status", "no_aux_loss_values")
                 self._last_aux_meta = {
