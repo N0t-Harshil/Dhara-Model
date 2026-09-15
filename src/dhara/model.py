@@ -475,6 +475,14 @@ class DharaModel(PreTrainedModel):
 
             if aux_losses:
                 aux_total = self.loss_computer.total_loss(aux_losses)
+                # Cap aux_total relative to the current CE loss so an unstable
+                # auxiliary branch can't overwhelm the language-modeling gradient
+                # and cause exponential divergence.  At init CE ~ ln(vocab) ≈ 11;
+                # allowing aux to reach 10x that gives branches room to learn
+                # while preventing the runaway 284 -> 3.9M explosion we saw when
+                # all five subsystems came online simultaneously.
+                ce_floor = loss.detach().abs().clamp(min=0.1)
+                aux_total = aux_total.clamp(max=ce_floor * 10.0)
                 loss = loss + aux_total
 
             if self.training and self.executive_rl and exec_decision is not None:

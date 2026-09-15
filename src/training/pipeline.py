@@ -180,6 +180,7 @@ class _LoggingCallback(TrainerCallback):
         health are observable without separate eval infrastructure."""
         model = self._model
         if model is None:
+            logger.warning("Instrumentation unavailable: _model not wired (set_model never called).")
             return
         try:
             aux = getattr(model, "_last_aux_losses", None)
@@ -205,8 +206,13 @@ class _LoggingCallback(TrainerCallback):
                 )
             if parts:
                 logger.info("  %s", " | ".join(parts))
+            else:
+                logger.warning(
+                    "Instrumentation empty at step %d (aux=%s exec=%s lstats=%s)",
+                    step, aux is not None, exec_meta is not None, lstats is not None,
+                )
         except Exception:
-            pass
+            logger.warning("Instrumentation failure at step %d", step, exc_info=True)
 
 
 class _NaNSafeCallback(TrainerCallback):
