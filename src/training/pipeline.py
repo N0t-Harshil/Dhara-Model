@@ -174,7 +174,16 @@ class _LoggingCallback(TrainerCallback):
             loss_val = float(loss) if loss is not None and loss != "N/A" else 0.0
             lr_val = float(lr) if lr is not None and lr != "N/A" else 0.0
             elapsed = time.time() - self._step_start if self._step_start else 0.0
-            logger.info("Step %d | loss=%.4f | lr=%.2e | it/s=%.2f", step, loss_val, lr_val, 1.0 / max(elapsed, 1e-8))
+            # HF's loss is the batch-size x grad-accum aggregated figure and
+            # reads ~16x the true per-micro-batch loss (logged 100 = real ~6.3).
+            # Surface ce + applied aux from the model's own diagnostics so the
+            # step line shows what HF's number hides instead of alarming.
+            true_loss = ""
+            meta = getattr(self._model, "_last_aux_meta", None) or {}
+            if isinstance(meta, dict) and meta.get("ce") is not None:
+                true_loss = " | true(ce+aux)=%.4f" % (float(meta["ce"]) + float(meta.get("applied", 0.0)))
+            logger.info("Step %d | loss=%.4f | lr=%.2e | it/s=%.2f%s",
+                        step, loss_val, lr_val, 1.0 / max(elapsed, 1e-8), true_loss)
             self._log_instrumentation(step)
 
     def _log_instrumentation(self, step):
@@ -313,19 +322,34 @@ class _PretrainAuxCollator:
     ``aux_targets`` supervision, so AuxiliaryLossComputer actually fires during
     pretraining instead of being permanently inert. task_type is the document
     category; difficulty is bucketed from the row's quality proxy, giving the
-    intent classifiers and difficulty router a real learnable signal."""
+    intent classifiers and difficulty router a real learnable signal.
+
+    Rows missing ``_category`` / ``_avg_quality`` (some data segments carry no
+    row metadata) previously dropped aux_targets for the whole batch, silently
+    zeroing intent/difficulty loss mid-run; they are coalesced to a neutral
+    fallback so the supervisor can never die between data segments."""
+
+    _FALLBACK_CATEGORY = "web_text"
+    _FALLBACK_QUALITY = 0.4
 
     def __init__(self, base):
         self.base = base
 
     def __call__(self, features):
         batch = self.base(features)
-        cats = [f.get("_category") for f in features]
-        quals = [f.get("_avg_quality") for f in features]
-        if all(isinstance(c, str) for c in cats) and all(isinstance(q, (int, float)) for q in quals):
-            task_type = torch.tensor([_TASK_CATEGORY_ID.get(c, 0) for c in cats], dtype=torch.long)
-            difficulty = torch.tensor([_difficulty_bucket(q) for q in quals], dtype=torch.long)
-            batch["aux_targets"] = {"intent": {"task_type": task_type, "difficulty": difficulty}}
+        cats = []
+        quals = []
+        for f in features:
+            cat = f.get("_category")
+            qual = f.get("_avg_quality")
+            cats.append(cat if isinstance(cat, str) else self._FALLBACK_CATEGORY)
+            quals.append(qual if isinstance(qual, (int, float)) else self._FALLBACK_QUALITY)
+        task_type = torch.tensor(
+            [_TASK_CATEGORY_ID.get(c, _TASK_CATEGORY_ID[self._FALLBACK_CATEGORY]) for c in cats],
+            dtype=torch.long,
+        )
+        difficulty = torch.tensor([_difficulty_bucket(q) for q in quals], dtype=torch.long)
+        batch["aux_targets"] = {"intent": {"task_type": task_type, "difficulty": difficulty}}
         return batch
 
 

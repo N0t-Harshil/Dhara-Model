@@ -46,10 +46,20 @@ class CompressionAE(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> tuple:
-        encoded = self.encoder(x)
-        decoded = self.decoder(encoded)
-        compression_loss = F.mse_loss(decoded, x.detach(), reduction="mean")
-        return decoded, decoded.detach() + (decoded - decoded.detach()), compression_loss
+        # The chunk-pooled target's magnitude drifts upward as pretraining grows
+        # the hidden-state scale, so a raw MSE target (R^2 in magnitude) raced
+        # ~1e1 -> ~2e5 and no finite AE update could ever satisfy it. Normalize
+        # per-chunk to unit scale so the AE learns the content shape (a stationary
+        # target) and the loss stays O(1); decoded is returned in the original
+        # raw scale by denormalizing with the stored per-chunk stats.
+        mu = x.mean(dim=-1, keepdim=True)
+        sd = x.std(dim=-1, keepdim=True).clamp(min=1e-4)
+        target = (x - mu) / sd
+        encoded = self.encoder(target)
+        decoded_norm = self.decoder(encoded)
+        compression_loss = F.mse_loss(decoded_norm, target.detach(), reduction="mean")
+        decoded = decoded_norm * sd + mu
+        return decoded, decoded, compression_loss
 
 
 class PriorityScorer(nn.Module):

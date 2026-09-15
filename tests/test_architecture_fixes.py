@@ -53,16 +53,24 @@ def test_pretrain_aux_collator_adds_intent_targets():
     assert targets["difficulty"].shape == (3,)
 
 
-def test_pretrain_aux_collator_skips_without_signal():
-    from src.training.pipeline import _PretrainAuxCollator
+def test_pretrain_aux_collator_falls_back_without_signal():
+    from src.training.pipeline import _PretrainAuxCollator, _TASK_CATEGORY_ID
 
     class _Base:
         def __call__(self, features):
-            return {"input_ids": torch.zeros(1, 8, dtype=torch.long)}
+            return {"input_ids": torch.zeros(2, 8, dtype=torch.long)}
 
-    features = [{"input_ids": torch.zeros(8, dtype=torch.long)}]
+    features = [{}, {"_category": "code", "_avg_quality": 0.5}]
     batch = _PretrainAuxCollator(_Base())(features)
-    assert "aux_targets" not in batch
+
+    # Missing metadata must NOT silently drop supervision: it coalesces to the
+    # neutral fallback so the intent/difficulty classifiers keep training.
+    targets = batch["aux_targets"]["intent"]
+    fallback_id = _TASK_CATEGORY_ID[_PretrainAuxCollator._FALLBACK_CATEGORY]
+    assert elements_equal(targets["task_type"], [fallback_id, 0])
+    assert targets["difficulty"].tolist() == [1, 2]
+    assert targets["task_type"].shape == (2,)
+    assert targets["difficulty"].shape == (2,)
 
 
 def elements_equal(t, vals):
