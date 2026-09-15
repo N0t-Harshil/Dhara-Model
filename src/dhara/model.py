@@ -548,7 +548,12 @@ class DharaModel(PreTrainedModel):
         callback wiring (HF 5.x model-wrapping, set_model ordering, on_log
         signatures): if the loss is real, forward ran, and this line appears."""
         self._diag_count += 1
-        if not (self.training and self._diag_count % 50 == 1):
+        # Watchdog cadence (in training forwards), set by the trainer wiring:
+        # ~5 logging windows (~every 250 optimizer steps at ga=4 x log=50). The
+        # every-50-step on_log line is the primary signal; this forward-printed
+        # line only stays alive so diagnostics survive callback/wiring failures.
+        cadence = max(1, int(getattr(self, "_diag_cadence", 1000)))
+        if not (self.training and self._diag_count % cadence == 1):
             return
         _aux = getattr(self, "_last_aux_losses", None)
         _meta = getattr(self, "_last_aux_meta", None)

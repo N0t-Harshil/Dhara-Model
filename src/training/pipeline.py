@@ -171,19 +171,23 @@ class _LoggingCallback(TrainerCallback):
             step = state.global_step
             loss = logs.get("loss", logs.get("train_loss", "N/A"))
             lr = logs.get("learning_rate", "N/A")
+            grad = logs.get("grad_norm", "N/A")
             loss_val = float(loss) if loss is not None and loss != "N/A" else 0.0
             lr_val = float(lr) if lr is not None and lr != "N/A" else 0.0
+            grad_val = float(grad) if grad is not None and grad != "N/A" else 0.0
             elapsed = time.time() - self._step_start if self._step_start else 0.0
             # HF's loss is the batch-size x grad-accum aggregated figure and
             # reads ~16x the true per-micro-batch loss (logged 100 = real ~6.3).
             # Surface ce + applied aux from the model's own diagnostics so the
             # step line shows what HF's number hides instead of alarming.
-            true_loss = ""
+            true_part = ""
             meta = getattr(self._model, "_last_aux_meta", None) or {}
             if isinstance(meta, dict) and meta.get("ce") is not None:
-                true_loss = " | true(ce+aux)=%.4f" % (float(meta["ce"]) + float(meta.get("applied", 0.0)))
-            logger.info("Step %d | loss=%.4f | lr=%.2e | it/s=%.2f%s",
-                        step, loss_val, lr_val, 1.0 / max(elapsed, 1e-8), true_loss)
+                true_part = " | true(ce+aux)=%.3f" % (float(meta["ce"]) + float(meta.get("applied", 0.0)))
+            logger.info(
+                "Step %d | loss=%.2f | grad_norm=%.2f | lr=%.2e | it/s=%.2f%s",
+                step, loss_val, grad_val, lr_val, 1.0 / max(elapsed, 1e-8), true_part,
+            )
             self._log_instrumentation(step)
 
     def _log_instrumentation(self, step):
@@ -1857,8 +1861,9 @@ class TrainingPipeline:
            bf16=use_bf16,
            optim=optim_name,
            lr_scheduler_type=getattr(stage_cfg, "lr_scheduler_type", "cosine"),
-           report_to=self.cfg.output.experiment_tracking.provider if self.cfg.output.experiment_tracking.enabled else "none",
-           remove_unused_columns=False,
+            report_to=self.cfg.output.experiment_tracking.provider if self.cfg.output.experiment_tracking.enabled else "none",
+            disable_tqdm=True,
+            remove_unused_columns=False,
            load_best_model_at_end=False,
            ignore_data_skip=overrides.get("ignore_data_skip", self.cfg.training.ignore_data_skip),
            dataloader_num_workers=num_workers,
@@ -1876,7 +1881,7 @@ class TrainingPipeline:
         callbacks = [
             logging_cb,
             _NaNSafeCallback(check_every=100),
-            _TrainHeartbeatCallback(interval_steps=100, total_steps=max_steps or 0),
+            _TrainHeartbeatCallback(interval_steps=500, total_steps=max_steps or 0),
             health_cb,
         ]
 
@@ -1905,6 +1910,13 @@ class TrainingPipeline:
             setter = getattr(_cb, "set_model", None)
             if setter is not None:
                 setter(_model_ref)
+        # MODEL-DIAG watchdog cadence (in training forwards): ~5 logging windows
+        # of gas*logging_steps optimizer steps (~every 250 steps at ga=4 x log=50).
+        try:
+            _diag_cadence = max(1, int(gas or 1) * max(1, int(self.cfg.training.logging_steps) or 1) * 5)
+            setattr(_model_ref, "_diag_cadence", _diag_cadence)
+        except Exception:
+            pass
         _install_continuous_scheduler(trainer)
         return trainer
 
