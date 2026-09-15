@@ -221,8 +221,9 @@ class _LoggingCallback(TrainerCallback):
             if parts:
                 logger.info("  %s", " | ".join(parts))
             else:
-                logger.warning(
-                    "Instrumentation empty at step %d (aux=%s exec=%s lstats=%s)",
+                logger.debug(
+                    "Step instrumentation empty at step %d (aux=%s exec=%s lstats=%s) "
+                    "- MODEL-DIAG from model.forward is the source of truth",
                     step, aux is not None, exec_meta is not None, lstats is not None,
                 )
         except Exception:
